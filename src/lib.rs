@@ -1,0 +1,456 @@
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
+const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
+const GUEST_USER: &str = "fwos";
+const SSH_WAIT: Duration = Duration::from_secs(240);
+const QEMU_MEMORY_MIB: &str = "4096";
+const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE.fd";
+
+/// A QEMU guest started by Workstation tooling.
+pub struct Guest {
+    child: Child,
+    port: u16,
+    key_path: PathBuf,
+    serial_log: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct Error {
+    message: String,
+}
+
+impl Error {
+    fn from_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn from_io(context: &str, err: io::Error) -> Self {
+        Self {
+            message: format!("{context}: {err}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Guest {
+    /// Build a qcow2 from Fedora bootc if needed, boot it under QEMU, wait until SSH works.
+    pub fn boot_fedora_bootc() -> Result<Self, Error> {
+        ensure_kvm_usable()?;
+        ensure_ovmf()?;
+
+        let cache = cache_dir()?;
+        let key_path = cache.join("id_ed25519");
+        let pub_path = cache.join("id_ed25519.pub");
+        let disk_path = cache.join("disk.qcow2");
+        ensure_ssh_key(&key_path, &pub_path)?;
+        ensure_qcow2(&disk_path, &pub_path)?;
+
+        let port = free_localhost_port()?;
+        let work = instance_dir()?;
+        let overlay = work.join("overlay.qcow2");
+        let serial_log = work.join("serial.log");
+        create_overlay(&disk_path, &overlay)?;
+
+        let child = start_qemu(&overlay, port, &serial_log)?;
+        let mut guest = Self {
+            child,
+            port,
+            key_path,
+            serial_log,
+        };
+        if let Err(err) = guest.wait_for_ssh() {
+            let _ = guest.child.kill();
+            let _ = guest.child.wait();
+            return Err(err);
+        }
+        Ok(guest)
+    }
+
+    /// Run `command` over SSH; return stdout.
+    pub fn ssh(&self, command: &str) -> Result<String, Error> {
+        ssh_output(&self.key_path, self.port, command)
+    }
+
+    pub fn ssh_port(&self) -> u16 {
+        self.port
+    }
+
+    fn wait_for_ssh(&mut self) -> Result<(), Error> {
+        let deadline = Instant::now() + SSH_WAIT;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| Error::from_io("waiting for QEMU", e))?
+            {
+                let serial = read_serial(&self.serial_log);
+                return Err(Error::from_message(format!(
+                    "QEMU exited before SSH was up (status {status}). serial log:\n{serial}"
+                )));
+            }
+            let ssh_err = match ssh_output(&self.key_path, self.port, "true") {
+                Ok(_) => return Ok(()),
+                Err(err) => err,
+            };
+            if Instant::now() >= deadline {
+                let serial = read_serial(&self.serial_log);
+                return Err(Error::from_message(format!(
+                    "SSH to 127.0.0.1:{} as {GUEST_USER} did not come up within {}s. last ssh error: {ssh_err}. serial log:\n{serial}",
+                    self.port,
+                    SSH_WAIT.as_secs()
+                )));
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(dir) = self.serial_log.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn ensure_kvm_usable() -> Result<(), Error> {
+    match File::open("/dev/kvm") {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(Error::from_message(
+            "KVM is not available at /dev/kvm; Workstation tooling needs KVM to boot a guest",
+        )),
+        Err(err) => Err(Error::from_message(format!(
+            "cannot open /dev/kvm ({err}); add this user to the kvm group or run on a host with KVM"
+        ))),
+    }
+}
+
+fn ensure_ovmf() -> Result<(), Error> {
+    if Path::new(OVMF_CODE).exists() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "OVMF firmware not found at {OVMF_CODE}"
+        )))
+    }
+}
+
+fn cache_dir() -> Result<PathBuf, Error> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .ok_or_else(|| Error::from_message("HOME is unset; cannot place cache"))?;
+    let dir = base.join("fwos-dev").join("fedora-bootc-44");
+    fs::create_dir_all(&dir).map_err(|e| Error::from_io("creating cache dir", e))?;
+    Ok(dir)
+}
+
+fn instance_dir() -> Result<PathBuf, Error> {
+    let dir = std::env::temp_dir().join(format!(
+        "fwos-dev-guest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).map_err(|e| Error::from_io("creating guest work dir", e))?;
+    Ok(dir)
+}
+
+fn ensure_ssh_key(private: &Path, public: &Path) -> Result<(), Error> {
+    if private.exists() && public.exists() {
+        return Ok(());
+    }
+    let status = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(private)
+        .status()
+        .map_err(|e| Error::from_io("running ssh-keygen", e))?;
+    if !status.success() {
+        return Err(Error::from_message(format!(
+            "ssh-keygen failed with {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
+    if disk.exists() && disk.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(());
+    }
+    build_qcow2(disk, public_key)
+}
+
+fn build_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
+    let pubkey =
+        fs::read_to_string(public_key).map_err(|e| Error::from_io("reading SSH public key", e))?;
+    let pubkey = pubkey.trim();
+    if pubkey.is_empty() {
+        return Err(Error::from_message("SSH public key is empty"));
+    }
+
+    let out_dir = disk
+        .parent()
+        .ok_or_else(|| Error::from_message("disk path has no parent"))?
+        .join("bib-output");
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)
+            .map_err(|e| Error::from_io("clearing image-builder output", e))?;
+    }
+    fs::create_dir_all(&out_dir).map_err(|e| Error::from_io("creating image-builder output", e))?;
+
+    let config_dir = disk
+        .parent()
+        .ok_or_else(|| Error::from_message("disk path has no parent"))?
+        .join("bib-config");
+    fs::create_dir_all(&config_dir)
+        .map_err(|e| Error::from_io("creating image-builder config dir", e))?;
+    let config_path = config_dir.join("config.toml");
+    let config = format!(
+        "[[customizations.user]]\nname = \"{GUEST_USER}\"\nkey = \"{pubkey}\"\ngroups = [\"wheel\"]\n"
+    );
+    fs::write(&config_path, config)
+        .map_err(|e| Error::from_io("writing image-builder config", e))?;
+
+    let (uid, gid) = current_uid_gid()?;
+    pull_image(FEDORA_BOOTC)?;
+    pull_image(IMAGE_BUILDER)?;
+
+    let output = Command::new("sudo")
+        .args([
+            "podman",
+            "run",
+            "--rm",
+            "--privileged",
+            "--pull=newer",
+            "--security-opt",
+            "label=type:unconfined_t",
+            "-v",
+        ])
+        .arg(format!("{}:/config.toml:ro", config_path.display()))
+        .arg("-v")
+        .arg(format!("{}:/output", out_dir.display()))
+        .args([
+            "-v",
+            "/var/lib/containers/storage:/var/lib/containers/storage",
+            IMAGE_BUILDER,
+            "--type",
+            "qcow2",
+            "--rootfs",
+            "ext4",
+            "--use-librepo=True",
+            "--progress",
+            "verbose",
+            "--config",
+            "/config.toml",
+            "--chown",
+        ])
+        .arg(format!("{uid}:{gid}"))
+        .arg(FEDORA_BOOTC)
+        .output()
+        .map_err(|e| Error::from_io("running image-builder (podman)", e))?;
+    if !output.status.success() {
+        return Err(Error::from_message(format!(
+            "image-builder failed with {} while converting {FEDORA_BOOTC} to qcow2\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let produced = out_dir.join("qcow2").join("disk.qcow2");
+    if !produced.exists() {
+        return Err(Error::from_message(format!(
+            "image-builder succeeded but {} is missing",
+            produced.display()
+        )));
+    }
+    fs::rename(&produced, disk).map_err(|e| Error::from_io("moving qcow2 into cache", e))?;
+    Ok(())
+}
+
+fn pull_image(image: &str) -> Result<(), Error> {
+    let output = Command::new("sudo")
+        .args(["podman", "pull", image])
+        .output()
+        .map_err(|e| Error::from_io("running podman pull", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman pull {image} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn current_uid_gid() -> Result<(u32, u32), Error> {
+    let uid = id_flag("-u")?;
+    let gid = id_flag("-g")?;
+    Ok((uid, gid))
+}
+
+fn id_flag(flag: &str) -> Result<u32, Error> {
+    let output = Command::new("id")
+        .arg(flag)
+        .output()
+        .map_err(|e| Error::from_io("running id", e))?;
+    if !output.status.success() {
+        return Err(Error::from_message(format!("id {flag} failed")));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| Error::from_message("id output was not UTF-8"))?
+        .trim()
+        .parse()
+        .map_err(|_| Error::from_message("id output was not a number"))
+}
+
+fn create_overlay(base: &Path, overlay: &Path) -> Result<(), Error> {
+    let status = Command::new("qemu-img")
+        .args(["create", "-f", "qcow2", "-F", "qcow2", "-b"])
+        .arg(base)
+        .arg(overlay)
+        .status()
+        .map_err(|e| Error::from_io("running qemu-img", e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "qemu-img create overlay failed with {status}"
+        )))
+    }
+}
+
+fn free_localhost_port() -> Result<u16, Error> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| Error::from_io("binding ephemeral port", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| Error::from_io("reading ephemeral port", e))?
+        .port();
+    Ok(port)
+}
+
+fn start_qemu(overlay: &Path, port: u16, serial_log: &Path) -> Result<Child, Error> {
+    let serial = File::create(serial_log).map_err(|e| Error::from_io("creating serial log", e))?;
+    let child = Command::new("qemu-system-x86_64")
+        .args([
+            "-machine",
+            "q35,accel=kvm",
+            "-cpu",
+            "host",
+            "-smp",
+            "2",
+            "-m",
+            QEMU_MEMORY_MIB,
+            "-bios",
+            OVMF_CODE,
+            "-drive",
+        ])
+        .arg(format!("file={},if=virtio,format=qcow2", overlay.display()))
+        .args([
+            "-netdev",
+            &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"),
+        ])
+        .args(["-device", "virtio-net-pci,netdev=net0"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-display", "none"])
+        .arg("-serial")
+        .arg("stdio")
+        .stdout(Stdio::from(
+            serial
+                .try_clone()
+                .map_err(|e| Error::from_io("cloning serial log", e))?,
+        ))
+        .stderr(Stdio::from(serial))
+        .spawn()
+        .map_err(|e| Error::from_io("starting QEMU", e))?;
+    Ok(child)
+}
+
+fn ssh_output(key: &Path, port: u16, command: &str) -> Result<String, Error> {
+    let output = Command::new("ssh")
+        .args(["-i"])
+        .arg(key)
+        .args([
+            "-p",
+            &port.to_string(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "ConnectTimeout=5",
+        ])
+        .arg(format!("{GUEST_USER}@127.0.0.1"))
+        .arg(command)
+        .output()
+        .map_err(|e| Error::from_io("running ssh", e))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(Error::from_message(format!(
+            "ssh {command:?} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn read_serial(path: &Path) -> String {
+    let mut buf = Vec::new();
+    match File::open(path).and_then(|mut f| f.read_to_end(&mut buf)) {
+        Ok(_) => {
+            const KEEP: usize = 8000;
+            let tail = if buf.len() > KEEP {
+                &buf[buf.len() - KEEP..]
+            } else {
+                buf.as_slice()
+            };
+            String::from_utf8_lossy(tail).into_owned()
+        }
+        Err(err) => format!("(could not read serial log: {err})"),
+    }
+}
+
+/// Ensure the Fedora bootc qcow2 exists in the cache (for the CLI `build` command).
+pub fn build_fedora_bootc_disk() -> Result<PathBuf, Error> {
+    let cache = cache_dir()?;
+    let key_path = cache.join("id_ed25519");
+    let pub_path = cache.join("id_ed25519.pub");
+    let disk_path = cache.join("disk.qcow2");
+    ensure_ssh_key(&key_path, &pub_path)?;
+    ensure_qcow2(&disk_path, &pub_path)?;
+    Ok(disk_path)
+}
+
+/// Path to the cached SSH private key used to log into guests.
+pub fn cached_ssh_key() -> Result<PathBuf, Error> {
+    Ok(cache_dir()?.join("id_ed25519"))
+}
