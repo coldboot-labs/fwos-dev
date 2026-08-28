@@ -1,6 +1,7 @@
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
 const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
+const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -20,6 +22,7 @@ pub struct Guest {
     port: u16,
     key_path: PathBuf,
     serial_log: PathBuf,
+    monitor: PathBuf,
 }
 
 #[derive(Debug)]
@@ -80,13 +83,15 @@ impl Guest {
         let work = instance_dir()?;
         let overlay = work.join("overlay.qcow2");
         let serial_log = work.join("serial.log");
+        let monitor = work.join("monitor.sock");
         create_overlay(disk_path, &overlay)?;
-        let child = start_qemu(&overlay, port, &serial_log)?;
+        let child = start_qemu(&overlay, port, &serial_log, &monitor)?;
         let mut guest = Self {
             child,
             port,
             key_path: key_path.to_path_buf(),
             serial_log,
+            monitor,
         };
         if let Err(err) = guest.wait_for_ssh() {
             let _ = guest.child.kill();
@@ -103,6 +108,37 @@ impl Guest {
 
     pub fn ssh_port(&self) -> u16 {
         self.port
+    }
+
+    pub fn reboot(&mut self) -> Result<(), Error> {
+        let before = self
+            .ssh("cat /proc/sys/kernel/random/boot_id")
+            .map_err(|e| Error::from_message(format!("reading boot_id before reset: {e}")))?;
+        let before = before.trim().to_string();
+        let mut mon = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        mon.write_all(b"system_reset\n")
+            .map_err(|e| Error::from_io("sending system_reset", e))?;
+        let _ = mon.flush();
+        let drop_deadline = Instant::now() + Duration::from_secs(60);
+        while self.ssh("true").is_ok() {
+            if Instant::now() >= drop_deadline {
+                return Err(Error::from_message(
+                    "QEMU system_reset did not drop SSH within 60s",
+                ));
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        self.wait_for_ssh()?;
+        let after = self
+            .ssh("cat /proc/sys/kernel/random/boot_id")
+            .map_err(|e| Error::from_message(format!("reading boot_id after reset: {e}")))?;
+        if after.trim() == before {
+            return Err(Error::from_message(
+                "SSH came back after system_reset but boot_id did not change",
+            ));
+        }
+        Ok(())
     }
 
     fn wait_for_ssh(&mut self) -> Result<(), Error> {
@@ -201,6 +237,30 @@ fn host_image_dir() -> Result<PathBuf, Error> {
     ))
 }
 
+fn src_dir() -> Result<PathBuf, Error> {
+    if let Some(dir) = std::env::var_os("FWOS_SRC_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.join("Cargo.toml").is_file() {
+            return Ok(dir);
+        }
+        return Err(Error::from_message(format!(
+            "FWOS_SRC_DIR {} has no Cargo.toml",
+            dir.display()
+        )));
+    }
+    let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fwos-src");
+    if sibling.join("Cargo.toml").is_file() {
+        return sibling
+            .canonicalize()
+            .map_err(|e| Error::from_io("resolving fwos-src dir", e));
+    }
+    Err(Error::from_message(
+        "fwos-src checkout not found; clone coldboot-labs/fwos-src next to fwos-dev or set FWOS_SRC_DIR",
+    ))
+}
+
 fn instance_dir() -> Result<PathBuf, Error> {
     let dir = std::env::temp_dir().join(format!(
         "fwos-dev-guest-{}-{}",
@@ -239,14 +299,75 @@ fn ensure_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> 
 }
 
 fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result<(), Error> {
-    if disk.exists()
-        && disk.metadata().map(|m| m.len() > 0).unwrap_or(false)
-        && !source_newer_than(image_dir, disk)?
-    {
+    let src = src_dir()?;
+    let binary = build_host_program(&src)?;
+    build_host_program_image(&src, &binary)?;
+    let stale = !disk.exists()
+        || disk.metadata().map(|m| m.len() == 0).unwrap_or(true)
+        || source_newer_than(image_dir, disk)?
+        || file_newer_than(&binary, disk)?;
+    if !stale {
         return Ok(());
     }
     build_host_container(image_dir)?;
     build_qcow2(disk, public_key, HOST_IMAGE_TAG, false)
+}
+
+fn file_newer_than(file: &Path, disk: &Path) -> Result<bool, Error> {
+    let file_mtime = file
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(|e| Error::from_io("reading host-program mtime", e))?;
+    let disk_mtime = disk
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(|e| Error::from_io("reading disk mtime", e))?;
+    Ok(file_mtime > disk_mtime)
+}
+
+fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(src)
+        .output()
+        .map_err(|e| Error::from_io("running cargo build", e))?;
+    if !output.status.success() {
+        return Err(Error::from_message(format!(
+            "cargo build of fwos-fwd-setup failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let binary = src.join("target/release/fwos-fwd-setup");
+    if !binary.is_file() {
+        return Err(Error::from_message(format!(
+            "cargo build did not produce {}",
+            binary.display()
+        )));
+    }
+    Ok(binary)
+}
+
+fn build_host_program_image(src: &Path, binary: &Path) -> Result<(), Error> {
+    let context = binary
+        .parent()
+        .ok_or_else(|| Error::from_message("host-program path has no parent"))?;
+    let dockerfile = src.join("Containerfile");
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", HOST_PROGRAM_TAG, "-f"])
+        .arg(&dockerfile)
+        .arg(context)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for fwos-fwd-setup", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of fwos-fwd-setup failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 fn source_newer_than(image_dir: &Path, disk: &Path) -> Result<bool, Error> {
@@ -462,7 +583,13 @@ fn free_localhost_port() -> Result<u16, Error> {
     Ok(port)
 }
 
-fn start_qemu(overlay: &Path, port: u16, serial_log: &Path) -> Result<Child, Error> {
+fn start_qemu(
+    overlay: &Path,
+    port: u16,
+    serial_log: &Path,
+    monitor: &Path,
+) -> Result<Child, Error> {
+    let _ = fs::remove_file(monitor);
     let serial = File::create(serial_log).map_err(|e| Error::from_io("creating serial log", e))?;
     let child = Command::new("qemu-system-x86_64")
         .args([
@@ -485,6 +612,10 @@ fn start_qemu(overlay: &Path, port: u16, serial_log: &Path) -> Result<Child, Err
         ])
         .args(["-device", "virtio-net-pci,netdev=net0"])
         .args(["-device", "virtio-rng-pci"])
+        .args([
+            "-monitor",
+            &format!("unix:{},server,nowait", monitor.display()),
+        ])
         .args(["-display", "none"])
         .arg("-serial")
         .arg("stdio")

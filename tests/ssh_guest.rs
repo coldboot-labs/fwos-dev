@@ -53,10 +53,53 @@ fn ssh_into_booted_fwos_host_image() {
         .ssh("ip -o link show")
         .expect("link list in the Host netns");
     assert!(
-        links.lines().any(|l| {
-            let name = l.split(':').nth(1).map(str::trim).unwrap_or("");
-            name.starts_with("enp") || name.starts_with("eth")
-        }),
+        has_ethernet(&links),
         "expected a virtio-net NIC in the Host netns, got:\n{links}"
     );
+}
+
+fn has_ethernet(links: &str) -> bool {
+    links.lines().any(|l| {
+        let name = l.split(':').nth(1).map(str::trim).unwrap_or("");
+        name.starts_with("enp") || name.starts_with("eth")
+    })
+}
+
+fn assert_empty_fwd_and_mgmt(guest: &Guest) {
+    let list = guest
+        .ssh("ip netns list")
+        .expect("ip netns list from the Host netns");
+    for name in ["fwd", "mgmt"] {
+        assert!(
+            list.lines()
+                .any(|l| l.split_whitespace().next() == Some(name)),
+            "expected named netns {name}, got:\n{list}"
+        );
+        let links = guest
+            .ssh(&format!("sudo -n ip netns exec {name} ip -o link show"))
+            .unwrap_or_else(|e| panic!("ip netns exec {name}: {e}"));
+        let names: Vec<&str> = links
+            .lines()
+            .filter_map(|l| l.split(':').nth(1).map(str::trim))
+            .collect();
+        assert_eq!(names, ["lo"], "{name} must contain only lo, got:\n{links}");
+    }
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    assert!(
+        has_ethernet(&host),
+        "virtio-net must remain in the Host netns, got:\n{host}"
+    );
+    assert!(
+        !host.contains("veth"),
+        "no veth on first boot, got:\n{host}"
+    );
+}
+
+#[test]
+fn first_boot_creates_empty_fwd_and_mgmt() {
+    let _guard = guest_lock();
+    let mut guest = Guest::boot_host_image().expect("host image guest must boot under QEMU");
+    assert_empty_fwd_and_mgmt(&guest);
+    guest.reboot().expect("guest must come back after reboot");
+    assert_empty_fwd_and_mgmt(&guest);
 }

@@ -2,7 +2,7 @@
 
 Workstation tooling: build the host image into a qcow2 and run a QEMU guest. It is never installed on the appliance.
 
-Requires a Fedora Workstation with rootful Podman, KVM, QEMU, and OVMF. The host-image git checkout must sit next to this repo (`../fwos-image`) or `FWOS_IMAGE_DIR` must point at it.
+Requires a Fedora Workstation with rootful Podman, KVM, QEMU, and OVMF. Check out `fwos-image` and `fwos-src` next to this repo (`../fwos-image`, `../fwos-src`), or set `FWOS_IMAGE_DIR` and `FWOS_SRC_DIR`.
 
 ```
 fwos-dev build   # qcow2 from the host image (cached)
