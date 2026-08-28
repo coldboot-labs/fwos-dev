@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
+const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -51,27 +52,40 @@ impl std::error::Error for Error {}
 impl Guest {
     /// Build a qcow2 from Fedora bootc if needed, boot it under QEMU, wait until SSH works.
     pub fn boot_fedora_bootc() -> Result<Self, Error> {
-        ensure_kvm_usable()?;
-        ensure_ovmf()?;
-
-        let cache = cache_dir()?;
+        let cache = cache_dir("fedora-bootc-44")?;
         let key_path = cache.join("id_ed25519");
         let pub_path = cache.join("id_ed25519.pub");
         let disk_path = cache.join("disk.qcow2");
         ensure_ssh_key(&key_path, &pub_path)?;
-        ensure_qcow2(&disk_path, &pub_path)?;
+        ensure_qcow2(&disk_path, &pub_path, FEDORA_BOOTC, true)?;
+        Self::boot_disk(&disk_path, &key_path)
+    }
 
+    /// Build a qcow2 from the FWOS host image if needed, boot it under QEMU, wait until SSH works.
+    pub fn boot_host_image() -> Result<Self, Error> {
+        let cache = cache_dir("fwos-host")?;
+        let key_path = cache.join("id_ed25519");
+        let pub_path = cache.join("id_ed25519.pub");
+        let disk_path = cache.join("disk.qcow2");
+        ensure_ssh_key(&key_path, &pub_path)?;
+        let image_dir = host_image_dir()?;
+        ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
+        Self::boot_disk(&disk_path, &key_path)
+    }
+
+    fn boot_disk(disk_path: &Path, key_path: &Path) -> Result<Self, Error> {
+        ensure_kvm_usable()?;
+        ensure_ovmf()?;
         let port = free_localhost_port()?;
         let work = instance_dir()?;
         let overlay = work.join("overlay.qcow2");
         let serial_log = work.join("serial.log");
-        create_overlay(&disk_path, &overlay)?;
-
+        create_overlay(disk_path, &overlay)?;
         let child = start_qemu(&overlay, port, &serial_log)?;
         let mut guest = Self {
             child,
             port,
-            key_path,
+            key_path: key_path.to_path_buf(),
             serial_log,
         };
         if let Err(err) = guest.wait_for_ssh() {
@@ -153,14 +167,38 @@ fn ensure_ovmf() -> Result<(), Error> {
     }
 }
 
-fn cache_dir() -> Result<PathBuf, Error> {
+fn cache_dir(name: &str) -> Result<PathBuf, Error> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .ok_or_else(|| Error::from_message("HOME is unset; cannot place cache"))?;
-    let dir = base.join("fwos-dev").join("fedora-bootc-44");
+    let dir = base.join("fwos-dev").join(name);
     fs::create_dir_all(&dir).map_err(|e| Error::from_io("creating cache dir", e))?;
     Ok(dir)
+}
+
+fn host_image_dir() -> Result<PathBuf, Error> {
+    if let Some(dir) = std::env::var_os("FWOS_IMAGE_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.join("Containerfile").is_file() {
+            return Ok(dir);
+        }
+        return Err(Error::from_message(format!(
+            "FWOS_IMAGE_DIR {} has no Containerfile",
+            dir.display()
+        )));
+    }
+    let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fwos-image");
+    if sibling.join("Containerfile").is_file() {
+        return sibling
+            .canonicalize()
+            .map_err(|e| Error::from_io("resolving host-image dir", e));
+    }
+    Err(Error::from_message(
+        "host-image checkout not found; clone coldboot-labs/fwos-image next to fwos-dev or set FWOS_IMAGE_DIR",
+    ))
 }
 
 fn instance_dir() -> Result<PathBuf, Error> {
@@ -193,14 +231,85 @@ fn ensure_ssh_key(private: &Path, public: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn ensure_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
+fn ensure_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> Result<(), Error> {
     if disk.exists() && disk.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(());
     }
-    build_qcow2(disk, public_key)
+    build_qcow2(disk, public_key, image_ref, pull)
 }
 
-fn build_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
+fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result<(), Error> {
+    if disk.exists()
+        && disk.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && !source_newer_than(image_dir, disk)?
+    {
+        return Ok(());
+    }
+    build_host_container(image_dir)?;
+    build_qcow2(disk, public_key, HOST_IMAGE_TAG, false)
+}
+
+fn source_newer_than(image_dir: &Path, disk: &Path) -> Result<bool, Error> {
+    let disk_mtime = disk
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(|e| Error::from_io("reading disk mtime", e))?;
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for rel in ["Containerfile", "overlay"] {
+        let p = image_dir.join(rel);
+        if p.exists() {
+            let t = newest_mtime(&p)?;
+            if t > newest {
+                newest = t;
+            }
+        }
+    }
+    Ok(newest > disk_mtime)
+}
+
+fn newest_mtime(path: &Path) -> Result<std::time::SystemTime, Error> {
+    let meta = path
+        .metadata()
+        .map_err(|e| Error::from_io(&format!("stat {}", path.display()), e))?;
+    let mut newest = meta
+        .modified()
+        .map_err(|e| Error::from_io(&format!("mtime {}", path.display()), e))?;
+    if meta.is_dir() {
+        for entry in fs::read_dir(path)
+            .map_err(|e| Error::from_io(&format!("read_dir {}", path.display()), e))?
+        {
+            let entry = entry.map_err(|e| Error::from_io("read_dir entry", e))?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let t = newest_mtime(&entry.path())?;
+            if t > newest {
+                newest = t;
+            }
+        }
+    }
+    Ok(newest)
+}
+
+fn build_host_container(image_dir: &Path) -> Result<(), Error> {
+    pull_image(FEDORA_BOOTC)?;
+    let output = Command::new("sudo")
+        .args(["podman", "build", "--pull=missing", "-t", HOST_IMAGE_TAG])
+        .arg(image_dir)
+        .output()
+        .map_err(|e| Error::from_io("running podman build", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of the host image failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn build_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> Result<(), Error> {
     let pubkey =
         fs::read_to_string(public_key).map_err(|e| Error::from_io("reading SSH public key", e))?;
     let pubkey = pubkey.trim();
@@ -232,7 +341,9 @@ fn build_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
         .map_err(|e| Error::from_io("writing image-builder config", e))?;
 
     let (uid, gid) = current_uid_gid()?;
-    pull_image(FEDORA_BOOTC)?;
+    if pull {
+        pull_image(image_ref)?;
+    }
     pull_image(IMAGE_BUILDER)?;
 
     let output = Command::new("sudo")
@@ -265,12 +376,12 @@ fn build_qcow2(disk: &Path, public_key: &Path) -> Result<(), Error> {
             "--chown",
         ])
         .arg(format!("{uid}:{gid}"))
-        .arg(FEDORA_BOOTC)
+        .arg(image_ref)
         .output()
         .map_err(|e| Error::from_io("running image-builder (podman)", e))?;
     if !output.status.success() {
         return Err(Error::from_message(format!(
-            "image-builder failed with {} while converting {FEDORA_BOOTC} to qcow2\nstdout:\n{}\nstderr:\n{}",
+            "image-builder failed with {} while converting {image_ref} to qcow2\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
@@ -439,18 +550,19 @@ fn read_serial(path: &Path) -> String {
     }
 }
 
-/// Ensure the Fedora bootc qcow2 exists in the cache (for the CLI `build` command).
-pub fn build_fedora_bootc_disk() -> Result<PathBuf, Error> {
-    let cache = cache_dir()?;
+/// Ensure the host-image qcow2 exists in the cache (for the CLI `build` command).
+pub fn build_host_image_disk() -> Result<PathBuf, Error> {
+    let cache = cache_dir("fwos-host")?;
     let key_path = cache.join("id_ed25519");
     let pub_path = cache.join("id_ed25519.pub");
     let disk_path = cache.join("disk.qcow2");
     ensure_ssh_key(&key_path, &pub_path)?;
-    ensure_qcow2(&disk_path, &pub_path)?;
+    let image_dir = host_image_dir()?;
+    ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
     Ok(disk_path)
 }
 
-/// Path to the cached SSH private key used to log into guests.
+/// Path to the cached SSH private key used to log into the host-image guest.
 pub fn cached_ssh_key() -> Result<PathBuf, Error> {
-    Ok(cache_dir()?.join("id_ed25519"))
+    Ok(cache_dir("fwos-host")?.join("id_ed25519"))
 }

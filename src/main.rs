@@ -3,7 +3,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("build") => match fwos_dev::build_fedora_bootc_disk() {
+        Some("build") => match fwos_dev::build_host_image_disk() {
             Ok(path) => {
                 println!("{}", path.display());
                 ExitCode::SUCCESS
@@ -13,7 +13,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("run") => match fwos_dev::Guest::boot_fedora_bootc() {
+        Some("run") => match fwos_dev::Guest::boot_host_image() {
             Ok(guest) => match fwos_dev::cached_ssh_key() {
                 Ok(key) => {
                     println!("guest is up. SSH into the Host netns:");
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         Some("help") | Some("--help") | Some("-h") | None => {
             eprintln!("Workstation tooling (not installed on the appliance).\n");
             eprintln!("Usage: fwos-dev <build|run>");
-            eprintln!("  build  Convert Fedora bootc to a qcow2 (cached)");
+            eprintln!("  build  Convert the host image to a qcow2 (cached)");
             eprintln!("  run    Boot that qcow2 under QEMU and wait until SSH works");
             ExitCode::SUCCESS
         }
