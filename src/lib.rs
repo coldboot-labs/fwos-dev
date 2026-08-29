@@ -62,7 +62,7 @@ impl Guest {
         let disk_path = cache.join("disk.qcow2");
         ensure_ssh_key(&key_path, &pub_path)?;
         ensure_qcow2(&disk_path, &pub_path, FEDORA_BOOTC, true)?;
-        Self::boot_disk(&disk_path, &key_path)
+        Self::boot_disk(&disk_path, &key_path, 0)
     }
 
     /// Build a qcow2 from the FWOS host image if needed, boot it under QEMU, wait until SSH works.
@@ -74,10 +74,22 @@ impl Guest {
         ensure_ssh_key(&key_path, &pub_path)?;
         let image_dir = host_image_dir()?;
         ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
-        Self::boot_disk(&disk_path, &key_path)
+        Self::boot_disk(&disk_path, &key_path, 0)
     }
 
-    fn boot_disk(disk_path: &Path, key_path: &Path) -> Result<Self, Error> {
+    /// Same as `boot_host_image`, with a second virtio-net (no SSH forward).
+    pub fn boot_host_image_two_nics() -> Result<Self, Error> {
+        let cache = cache_dir("fwos-host")?;
+        let key_path = cache.join("id_ed25519");
+        let pub_path = cache.join("id_ed25519.pub");
+        let disk_path = cache.join("disk.qcow2");
+        ensure_ssh_key(&key_path, &pub_path)?;
+        let image_dir = host_image_dir()?;
+        ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
+        Self::boot_disk(&disk_path, &key_path, 1)
+    }
+
+    fn boot_disk(disk_path: &Path, key_path: &Path, extra_nics: u8) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let port = free_localhost_port()?;
@@ -86,7 +98,7 @@ impl Guest {
         let serial_log = work.join("serial.log");
         let monitor = work.join("monitor.sock");
         create_overlay(disk_path, &overlay)?;
-        let child = start_qemu(&overlay, port, &serial_log, &monitor)?;
+        let child = start_qemu(&overlay, port, &serial_log, &monitor, extra_nics)?;
         let mut guest = Self {
             child,
             port,
@@ -646,29 +658,37 @@ fn start_qemu(
     port: u16,
     serial_log: &Path,
     monitor: &Path,
+    extra_nics: u8,
 ) -> Result<Child, Error> {
     let _ = fs::remove_file(monitor);
     let serial = File::create(serial_log).map_err(|e| Error::from_io("creating serial log", e))?;
-    let child = Command::new("qemu-system-x86_64")
-        .args([
-            "-machine",
-            "q35,accel=kvm",
-            "-cpu",
-            "host",
-            "-smp",
-            "2",
-            "-m",
-            QEMU_MEMORY_MIB,
-            "-bios",
-            OVMF_CODE,
-            "-drive",
-        ])
-        .arg(format!("file={},if=virtio,format=qcow2", overlay.display()))
-        .args([
-            "-netdev",
-            &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"),
-        ])
-        .args(["-device", "virtio-net-pci,netdev=net0"])
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args([
+        "-machine",
+        "q35,accel=kvm",
+        "-cpu",
+        "host",
+        "-smp",
+        "2",
+        "-m",
+        QEMU_MEMORY_MIB,
+        "-bios",
+        OVMF_CODE,
+        "-drive",
+    ])
+    .arg(format!("file={},if=virtio,format=qcow2", overlay.display()))
+    .args([
+        "-netdev",
+        &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"),
+    ])
+    .args(["-device", "virtio-net-pci,netdev=net0"]);
+    for i in 0..extra_nics {
+        let id = format!("net{}", i + 1);
+        let net = format!("10.0.{}.0/24", i + 3);
+        cmd.args(["-netdev", &format!("user,id={id},net={net}")])
+            .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
+    }
+    let child = cmd
         .args(["-device", "virtio-rng-pci"])
         .args([
             "-monitor",

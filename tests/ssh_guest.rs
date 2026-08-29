@@ -162,3 +162,128 @@ EOF
     let ssh_ok = guest.ssh("true").expect("SSH into Host netns after netd is up");
     assert_eq!(ssh_ok, "");
 }
+
+fn ethernet_names(links: &str) -> Vec<String> {
+    links
+        .lines()
+        .filter_map(|l| l.split(':').nth(1).map(str::trim))
+        .filter(|name| name.starts_with("enp") || name.starts_with("eth"))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn apply_desired(guest: &Guest, json: &str) -> String {
+    let script = format!(
+        r#"python3 - <<'PY'
+import json, socket, sys
+body = {json_literal}
+s = socket.socket(socket.AF_UNIX)
+s.connect("/var/lib/fwos/netd.sock")
+s.sendall(json.dumps(body).encode())
+s.shutdown(socket.SHUT_WR)
+print(s.recv(65536).decode(), end="")
+PY"#,
+        json_literal = json
+    );
+    guest
+        .ssh(&script)
+        .unwrap_or_else(|e| panic!("JSON apply on netd socket: {e}"))
+}
+
+fn assert_traffic_placed(guest: &Guest, ssh_nic: &str, traffic_nic: &str) {
+    let fwd = guest
+        .ssh("sudo -n ip netns exec fwd ip -o link show")
+        .expect("fwd links");
+    let fwd_nics = ethernet_names(&fwd);
+    assert_eq!(
+        fwd_nics,
+        vec![traffic_nic.to_string()],
+        "exactly one Traffic NIC in fwd, got:\n{fwd}"
+    );
+    let addrs = guest
+        .ssh(&format!(
+            "sudo -n ip netns exec fwd ip -o addr show dev {traffic_nic}"
+        ))
+        .expect("traffic addresses");
+    assert!(
+        addrs.contains("192.0.2.1/24"),
+        "Traffic NIC must have 192.0.2.1/24, got:\n{addrs}"
+    );
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let host_nics = ethernet_names(&host);
+    assert!(
+        host_nics.iter().any(|n| n == ssh_nic),
+        "SSH NIC {ssh_nic} must stay in the Host netns, got:\n{host}"
+    );
+    assert!(
+        !host_nics.iter().any(|n| n == traffic_nic),
+        "Traffic NIC {traffic_nic} must not remain in the Host netns, got:\n{host}"
+    );
+    assert!(!host.contains("veth"), "no veth extra hop, got:\n{host}");
+    let nft = guest
+        .ssh("sudo -n ip netns exec fwd nft list ruleset")
+        .expect("nft in fwd");
+    let nft_l = nft.to_ascii_lowercase();
+    assert!(
+        nft_l.contains("masquerade"),
+        "NAT44 masquerade missing in fwd nft, got:\n{nft}"
+    );
+    assert!(
+        nft_l.contains("drop"),
+        "WAN inbound drop missing in fwd nft, got:\n{nft}"
+    );
+    assert!(
+        nft_l.contains("accept"),
+        "LAN outbound allow missing in fwd nft, got:\n{nft}"
+    );
+}
+
+#[test]
+fn json_places_a_traffic_nic() {
+    let _guard = guest_lock();
+    let mut guest =
+        Guest::boot_host_image_two_nics().expect("two-NIC host image guest must boot under QEMU");
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let nics = ethernet_names(&host);
+    assert_eq!(
+        nics.len(),
+        2,
+        "expected two virtio-net NICs in the Host netns, got:\n{host}"
+    );
+    let route = guest
+        .ssh("ip -o route show default")
+        .expect("default route (SSH NIC)");
+    let ssh_nic = nics
+        .iter()
+        .find(|n| route.contains(*n as &str))
+        .cloned()
+        .unwrap_or_else(|| panic!("default route must name the SSH NIC, got route={route} nics={nics:?}"));
+    let traffic_nic = nics
+        .iter()
+        .find(|n| *n != &ssh_nic)
+        .cloned()
+        .expect("second NIC is the Traffic NIC");
+
+    let json = format!(
+        r#"{{"interfaces":[{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}]}}"#
+    );
+    let reply = apply_desired(&guest, &json);
+    assert!(
+        reply.contains("\"ok\": true") || reply.contains("\"ok\":true"),
+        "first apply must succeed, got:\n{reply}"
+    );
+    assert_traffic_placed(&guest, &ssh_nic, &traffic_nic);
+
+    let reply2 = apply_desired(&guest, &json);
+    assert!(
+        reply2.contains("\"ok\": true") || reply2.contains("\"ok\":true"),
+        "second apply must be idempotent, got:\n{reply2}"
+    );
+    assert_traffic_placed(&guest, &ssh_nic, &traffic_nic);
+
+    guest.reboot().expect("guest must come back after reboot");
+    assert_traffic_placed(&guest, &ssh_nic, &traffic_nic);
+    guest
+        .ssh("true")
+        .expect("SSH into Host netns after reboot");
+}
