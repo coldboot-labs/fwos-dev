@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
 const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
 const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
+const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -261,6 +262,30 @@ fn src_dir() -> Result<PathBuf, Error> {
     ))
 }
 
+fn builtin_addons_dir() -> Result<PathBuf, Error> {
+    if let Some(dir) = std::env::var_os("FWOS_ADDONS_DIR") {
+        let dir = PathBuf::from(dir);
+        if dir.join("netd").join("Containerfile").is_file() {
+            return Ok(dir);
+        }
+        return Err(Error::from_message(format!(
+            "FWOS_ADDONS_DIR {} has no netd/Containerfile",
+            dir.display()
+        )));
+    }
+    let sibling = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fwos-builtin-addons");
+    if sibling.join("netd").join("Containerfile").is_file() {
+        return sibling
+            .canonicalize()
+            .map_err(|e| Error::from_io("resolving fwos-builtin-addons dir", e));
+    }
+    Err(Error::from_message(
+        "fwos-builtin-addons checkout not found; clone coldboot-labs/fwos-builtin-addons next to fwos-dev or set FWOS_ADDONS_DIR",
+    ))
+}
+
 fn instance_dir() -> Result<PathBuf, Error> {
     let dir = std::env::temp_dir().join(format!(
         "fwos-dev-guest-{}-{}",
@@ -302,10 +327,21 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
     let src = src_dir()?;
     let binary = build_host_program(&src)?;
     build_host_program_image(&src, &binary)?;
+    let netd = src.join("target/release/netd");
+    if !netd.is_file() {
+        return Err(Error::from_message(format!(
+            "cargo build did not produce {}",
+            netd.display()
+        )));
+    }
+    let addons = builtin_addons_dir()?;
+    build_netd_image(&addons, &netd)?;
     let stale = !disk.exists()
         || disk.metadata().map(|m| m.len() == 0).unwrap_or(true)
         || source_newer_than(image_dir, disk)?
-        || file_newer_than(&binary, disk)?;
+        || file_newer_than(&binary, disk)?
+        || file_newer_than(&netd, disk)?
+        || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?;
     if !stale {
         return Ok(());
     }
@@ -346,6 +382,28 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
         )));
     }
     Ok(binary)
+}
+
+fn build_netd_image(addons: &Path, binary: &Path) -> Result<(), Error> {
+    let context = binary
+        .parent()
+        .ok_or_else(|| Error::from_message("netd path has no parent"))?;
+    let dockerfile = addons.join("netd").join("Containerfile");
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", NETD_IMAGE_TAG, "-f"])
+        .arg(&dockerfile)
+        .arg(context)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for netd", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of netd failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 fn build_host_program_image(src: &Path, binary: &Path) -> Result<(), Error> {

@@ -103,3 +103,62 @@ fn first_boot_creates_empty_fwd_and_mgmt() {
     guest.reboot().expect("guest must come back after reboot");
     assert_empty_fwd_and_mgmt(&guest);
 }
+
+#[test]
+fn netd_is_up_in_fwd() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_host_image().expect("host image guest must boot under QEMU");
+    assert_empty_fwd_and_mgmt(&guest);
+
+    let sock = guest
+        .ssh("test -S /var/lib/fwos/netd.sock && echo yes || echo no")
+        .expect("probe netd socket on /var");
+    assert_eq!(
+        sock.trim(),
+        "yes",
+        "netd unix socket must exist at /var/lib/fwos/netd.sock"
+    );
+
+    let report = guest
+        .ssh(
+            r#"
+set -e
+found=
+extra=
+while read -r pid; do
+  [ -n "$pid" ] || continue
+  comm=$(tr -d '\0' < /proc/$pid/comm)
+  cap=$(awk '/^CapEff:/ {print $2}' /proc/$pid/status)
+  has=0
+  [ "$((0x${cap} & 4096))" -ne 0 ] && has=1
+  echo "pid=$pid comm=$comm CapEff=$cap net_admin=$has"
+  if [ "$comm" = netd ]; then
+    found=1
+    [ "$has" -eq 1 ] || echo NETD_NO_CAP
+  elif [ "$has" -eq 1 ]; then
+    extra="$extra $comm"
+  fi
+done <<EOF
+$(sudo -n ip netns pids fwd)
+EOF
+[ -n "$found" ] && echo FOUND_NETD || echo MISSING_NETD
+[ -z "$extra" ] && echo NO_EXTRA_CAP || echo EXTRA_CAP:$extra
+"#,
+        )
+        .expect("list processes in fwd");
+    assert!(
+        report.contains("FOUND_NETD"),
+        "netd must be running in fwd, got:\n{report}"
+    );
+    assert!(
+        !report.contains("NETD_NO_CAP"),
+        "netd in fwd must have CAP_NET_ADMIN, got:\n{report}"
+    );
+    assert!(
+        report.contains("NO_EXTRA_CAP"),
+        "only netd in fwd may have CAP_NET_ADMIN, got:\n{report}"
+    );
+
+    let ssh_ok = guest.ssh("true").expect("SSH into Host netns after netd is up");
+    assert_eq!(ssh_ok, "");
+}
