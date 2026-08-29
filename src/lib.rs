@@ -143,9 +143,21 @@ impl Guest {
             thread::sleep(Duration::from_millis(500));
         }
         self.wait_for_ssh()?;
-        let after = self
-            .ssh("cat /proc/sys/kernel/random/boot_id")
-            .map_err(|e| Error::from_message(format!("reading boot_id after reset: {e}")))?;
+        // sshd may move into mgmt as soon as SSH is back; retry the boot_id read.
+        let id_deadline = Instant::now() + Duration::from_secs(60);
+        let after = loop {
+            match self.ssh("cat /proc/sys/kernel/random/boot_id") {
+                Ok(s) => break s,
+                Err(err) => {
+                    if Instant::now() >= id_deadline {
+                        return Err(Error::from_message(format!(
+                            "reading boot_id after reset: {err}"
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        };
         if after.trim() == before {
             return Err(Error::from_message(
                 "SSH came back after system_reset but boot_id did not change",
@@ -727,6 +739,10 @@ fn ssh_output(key: &Path, port: u16, command: &str) -> Result<String, Error> {
             "IdentitiesOnly=yes",
             "-o",
             "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=2",
+            "-o",
+            "ServerAliveCountMax=5",
         ])
         .arg(format!("{GUEST_USER}@127.0.0.1"))
         .arg(command)
