@@ -65,8 +65,8 @@ fn published_disk_image_has_no_network_ssh_before_bootstrap() {
         .expect("published Disk image guest must boot under QEMU");
     let serial = guest.serial();
     assert!(
-        serial.contains("login:"),
-        "published guest is observed on serial, not Host-netns SSH; serial:\n{serial}"
+        serial.contains("FWOS Bootstrap console"),
+        "published guest is observed on the Bootstrap console, not Host-netns SSH; serial:\n{serial}"
     );
     let mut banner = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -91,8 +91,8 @@ fn published_guest_serial_and_https_without_ssh() {
         .expect("published Disk image guest must boot under QEMU");
     let serial = guest.serial();
     assert!(
-        serial.contains("login:"),
-        "tests observe published guests on serial; serial:\n{serial}"
+        serial.contains("FWOS Bootstrap console"),
+        "tests observe published guests on the Bootstrap console; serial:\n{serial}"
     );
     guest
         .serial_write("\n")
@@ -101,13 +101,13 @@ fn published_guest_serial_and_https_without_ssh() {
     for _ in 0..5 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         last = guest.serial();
-        if last.matches("login:").count() >= 2 {
+        if last.matches("FWOS Bootstrap console").count() >= 2 {
             break;
         }
     }
     assert!(
-        last.matches("login:").count() >= 2,
-        "serial write must reach the console (second login prompt); serial:\n{last}"
+        last.matches("FWOS Bootstrap console").count() >= 2,
+        "serial write must reach the Bootstrap console; serial:\n{last}"
     );
 
     let mut page = String::new();
@@ -148,6 +148,89 @@ fn published_guest_serial_and_https_without_ssh() {
             guest.serial()
         );
     }
+}
+
+#[test]
+fn published_guest_bootstrap_console_on_serial() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image()
+        .expect("published Disk image guest must boot under QEMU");
+    let serial = guest.serial();
+    let lower = serial.to_ascii_lowercase();
+    assert!(
+        !lower.contains("login:"),
+        "Appliance CLI owns serial; no Host shell login, serial:\n{serial}"
+    );
+    assert!(
+        lower.contains("bootstrap"),
+        "first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let nic = serial_ethernet_name(&serial).unwrap_or_else(|| {
+        panic!("Bootstrap console must list Host-netns NICs, serial:\n{serial}")
+    });
+
+    guest
+        .serial_write(&format!("static {nic} 192.168.200.50/24\n"))
+        .expect("set ephemeral addressing on serial");
+    let mut last = serial;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if last.contains("https://192.168.200.50/") {
+            break;
+        }
+    }
+    assert!(
+        last.contains("192.168.200.50"),
+        "ephemeral static addressing is not Desired state; serial:\n{last}"
+    );
+    assert!(
+        last.contains("https://192.168.200.50/"),
+        "Bootstrap console must print how to reach the UI, serial:\n{last}"
+    );
+
+    guest
+        .serial_write("echo SHELL_RAN\n")
+        .expect("probe Host shell");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after = guest.serial();
+    assert!(
+        after.contains("unknown command"),
+        "Bootstrap console must reject a shell command, serial:\n{after}"
+    );
+    assert!(
+        !after.lines().any(|l| l.trim() == "SHELL_RAN"),
+        "serial must not be a Host shell, serial:\n{after}"
+    );
+
+    let mut banner = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(ident) = guest.ssh_ident() {
+            banner = Some(ident);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if let Some(ident) = banner {
+        panic!(
+            "published guest must not answer SSH, got banner {ident}; serial:\n{}",
+            guest.serial()
+        );
+    }
+}
+
+fn serial_ethernet_name(serial: &str) -> Option<String> {
+    serial
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_'))
+        .find(|tok| {
+            let nic = tok.starts_with("enp")
+                || tok.starts_with("ens")
+                || tok.starts_with("eno")
+                || tok.starts_with("eth");
+            nic && tok.chars().any(|c| c.is_ascii_digit())
+        })
+        .map(str::to_string)
 }
 
 fn has_ethernet(links: &str) -> bool {
@@ -543,7 +626,7 @@ fn json_places_management_nic() {
         .expect("SSH after reboot with sshd in mgmt");
 }
 
-const APPLIANCE_CLI: &str = "/usr/lib/fwos/addons/cli/usr/bin/fwos";
+const APPLIANCE_CLI: &str = "/usr/bin/fwos";
 // WireGuard test vector (docs.wireguard.com).
 const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
 
@@ -630,8 +713,8 @@ fn cli_applies_full_desired_state() {
         "Appliance CLI missing at {APPLIANCE_CLI}, got:\n{present}"
     );
     assert!(
-        present.contains("ADDON"),
-        "Appliance CLI must not be a Host program at /usr/bin/fwos, got:\n{present}"
+        present.contains("HOST"),
+        "Appliance CLI must be a Host program at /usr/bin/fwos, got:\n{present}"
     );
 
     let session = guest

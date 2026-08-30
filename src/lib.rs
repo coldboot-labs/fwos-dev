@@ -21,11 +21,11 @@ const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
 const QEMU_MEMORY_MIB: &str = "4096";
 const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE.fd";
-const SERIAL_LOGIN: &str = "login:";
+const SERIAL_BOOTSTRAP: &str = "FWOS Bootstrap console";
 
 enum BootWait {
     Ssh,
-    SerialLogin,
+    SerialBootstrap,
 }
 
 /// A QEMU guest started by Workstation tooling.
@@ -105,7 +105,7 @@ impl Guest {
     /// Published Disk image: no injected SSH key, no default password. Observe via serial.
     pub fn boot_published_host_image() -> Result<Self, Error> {
         let disk_path = build_published_host_image_disk()?;
-        Self::boot_disk(&disk_path, None, 0, BootWait::SerialLogin)
+        Self::boot_disk(&disk_path, None, 0, BootWait::SerialBootstrap)
     }
 
     fn boot_disk(
@@ -145,7 +145,7 @@ impl Guest {
         };
         let ready = match wait {
             BootWait::Ssh => guest.wait_for_ssh(),
-            BootWait::SerialLogin => guest.wait_for_serial(SERIAL_LOGIN),
+            BootWait::SerialBootstrap => guest.wait_for_serial(SERIAL_BOOTSTRAP),
         };
         if let Err(err) = ready {
             let _ = guest.child.kill();
