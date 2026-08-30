@@ -3,13 +3,31 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("build") => match fwos_dev::build_host_image_disk() {
-            Ok(path) => {
-                println!("{}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("fwos-dev build: {err}");
+        Some("build") => match args.next().as_deref() {
+            None => match fwos_dev::build_host_image_disk() {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("fwos-dev build: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+            Some("published") => match fwos_dev::build_published_host_image_disk() {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("fwos-dev build: {err}");
+                    ExitCode::FAILURE
+                }
+            },
+            Some(other) => {
+                eprintln!(
+                    "fwos-dev build: unknown target {other:?}. Try fwos-dev build or fwos-dev build published"
+                );
                 ExitCode::FAILURE
             }
         },
@@ -39,9 +57,10 @@ fn main() -> ExitCode {
         },
         Some("help") | Some("--help") | Some("-h") | None => {
             eprintln!("Workstation tooling (not installed on the appliance).\n");
-            eprintln!("Usage: fwos-dev <build|run>");
-            eprintln!("  build  Convert the host image to a qcow2 (cached)");
-            eprintln!("  run    Boot that qcow2 under QEMU and wait until SSH works");
+            eprintln!("Usage: fwos-dev <build|build published|run>");
+            eprintln!("  build            Injected-key Disk image (test seam, cached)");
+            eprintln!("  build published  Disk image with no SSH key and no password");
+            eprintln!("  run              Boot the injected-key Disk image under QEMU");
             ExitCode::SUCCESS
         }
         Some(other) => {

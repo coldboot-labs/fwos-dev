@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,12 +20,18 @@ const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
 const QEMU_MEMORY_MIB: &str = "4096";
 const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE.fd";
+const SERIAL_LOGIN: &str = "login:";
+
+enum BootWait {
+    Ssh,
+    SerialLogin,
+}
 
 /// A QEMU guest started by Workstation tooling.
 pub struct Guest {
     child: Child,
     port: u16,
-    key_path: PathBuf,
+    key_path: Option<PathBuf>,
     serial_log: PathBuf,
     monitor: PathBuf,
 }
@@ -66,7 +72,7 @@ impl Guest {
         let disk_path = cache.join("disk.qcow2");
         ensure_ssh_key(&key_path, &pub_path)?;
         ensure_qcow2(&disk_path, &pub_path, FEDORA_BOOTC, true)?;
-        Self::boot_disk(&disk_path, &key_path, 0)
+        Self::boot_disk(&disk_path, Some(&key_path), 0, BootWait::Ssh)
     }
 
     /// Build a qcow2 from the FWOS host image if needed, boot it under QEMU, wait until SSH works.
@@ -77,8 +83,8 @@ impl Guest {
         let disk_path = cache.join("disk.qcow2");
         ensure_ssh_key(&key_path, &pub_path)?;
         let image_dir = host_image_dir()?;
-        ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
-        Self::boot_disk(&disk_path, &key_path, 0)
+        ensure_host_qcow2(&disk_path, Some(&pub_path), &image_dir)?;
+        Self::boot_disk(&disk_path, Some(&key_path), 0, BootWait::Ssh)
     }
 
     /// Same as `boot_host_image`, with a second virtio-net (no SSH forward).
@@ -89,11 +95,22 @@ impl Guest {
         let disk_path = cache.join("disk.qcow2");
         ensure_ssh_key(&key_path, &pub_path)?;
         let image_dir = host_image_dir()?;
-        ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
-        Self::boot_disk(&disk_path, &key_path, 1)
+        ensure_host_qcow2(&disk_path, Some(&pub_path), &image_dir)?;
+        Self::boot_disk(&disk_path, Some(&key_path), 1, BootWait::Ssh)
     }
 
-    fn boot_disk(disk_path: &Path, key_path: &Path, extra_nics: u8) -> Result<Self, Error> {
+    /// Published Disk image: no injected SSH key, no default password. Observe via serial.
+    pub fn boot_published_host_image() -> Result<Self, Error> {
+        let disk_path = build_published_host_image_disk()?;
+        Self::boot_disk(&disk_path, None, 0, BootWait::SerialLogin)
+    }
+
+    fn boot_disk(
+        disk_path: &Path,
+        key_path: Option<&Path>,
+        extra_nics: u8,
+        wait: BootWait,
+    ) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let port = free_localhost_port()?;
@@ -106,11 +123,15 @@ impl Guest {
         let mut guest = Self {
             child,
             port,
-            key_path: key_path.to_path_buf(),
+            key_path: key_path.map(Path::to_path_buf),
             serial_log,
             monitor,
         };
-        if let Err(err) = guest.wait_for_ssh() {
+        let ready = match wait {
+            BootWait::Ssh => guest.wait_for_ssh(),
+            BootWait::SerialLogin => guest.wait_for_serial(SERIAL_LOGIN),
+        };
+        if let Err(err) = ready {
             let _ = guest.child.kill();
             let _ = guest.child.wait();
             return Err(err);
@@ -120,11 +141,32 @@ impl Guest {
 
     /// Run `command` over SSH; return stdout.
     pub fn ssh(&self, command: &str) -> Result<String, Error> {
-        ssh_output(&self.key_path, self.port, command)
+        let key = self
+            .key_path
+            .as_ref()
+            .ok_or_else(|| Error::from_message("published Disk image has no injected SSH key"))?;
+        ssh_output(key, self.port, command)
     }
 
     pub fn ssh_port(&self) -> u16 {
         self.port
+    }
+
+    /// Serial console log (how a published guest is observed).
+    pub fn serial(&self) -> String {
+        read_serial_all(&self.serial_log)
+    }
+
+    /// SSH identification string if port 22 answers the SSH protocol.
+    pub fn ssh_ident(&self) -> Option<String> {
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf[..n]);
+        let line = text.lines().next().unwrap_or("").trim();
+        line.starts_with("SSH-").then(|| line.to_string())
     }
 
     pub fn reboot(&mut self) -> Result<(), Error> {
@@ -171,6 +213,10 @@ impl Guest {
     }
 
     fn wait_for_ssh(&mut self) -> Result<(), Error> {
+        let key = self
+            .key_path
+            .as_ref()
+            .ok_or_else(|| Error::from_message("wait_for_ssh requires an injected SSH key"))?;
         let deadline = Instant::now() + SSH_WAIT;
         loop {
             if let Some(status) = self
@@ -183,7 +229,7 @@ impl Guest {
                     "QEMU exited before SSH was up (status {status}). serial log:\n{serial}"
                 )));
             }
-            let ssh_err = match ssh_output(&self.key_path, self.port, "true") {
+            let ssh_err = match ssh_output(key, self.port, "true") {
                 Ok(_) => return Ok(()),
                 Err(err) => err,
             };
@@ -192,6 +238,33 @@ impl Guest {
                 return Err(Error::from_message(format!(
                     "SSH to 127.0.0.1:{} as {GUEST_USER} did not come up within {}s. last ssh error: {ssh_err}. serial log:\n{serial}",
                     self.port,
+                    SSH_WAIT.as_secs()
+                )));
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    fn wait_for_serial(&mut self, needle: &str) -> Result<(), Error> {
+        let deadline = Instant::now() + SSH_WAIT;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| Error::from_io("waiting for QEMU", e))?
+            {
+                let serial = read_serial(&self.serial_log);
+                return Err(Error::from_message(format!(
+                    "QEMU exited before serial {needle:?} (status {status}). serial log:\n{serial}"
+                )));
+            }
+            let serial = read_serial_all(&self.serial_log);
+            if serial.contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::from_message(format!(
+                    "serial {needle:?} did not appear within {}s. serial log:\n{serial}",
                     SSH_WAIT.as_secs()
                 )));
             }
@@ -348,10 +421,14 @@ fn ensure_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> 
     if disk.exists() && disk.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(());
     }
-    build_qcow2(disk, public_key, image_ref, pull)
+    build_qcow2(disk, Some(public_key), None, image_ref, pull)
 }
 
-fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result<(), Error> {
+fn ensure_host_qcow2(
+    disk: &Path,
+    public_key: Option<&Path>,
+    image_dir: &Path,
+) -> Result<(), Error> {
     let src = src_dir()?;
     let binary = build_host_program(&src)?;
     build_host_program_image(&src, &binary)?;
@@ -388,12 +465,21 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
         || file_newer_than(&addons.join("kea").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("kea").join("run-dhcp4"), disk)?
         || file_newer_than(&addons.join("kea").join("run-dhcp6"), disk)?
-        || file_newer_than(&addons.join("unbound").join("Containerfile"), disk)?;
+        || file_newer_than(&addons.join("unbound").join("Containerfile"), disk)?
+        || optional_newer(&image_dir.join("bib.toml"), disk)?;
     if !stale {
         return Ok(());
     }
     build_host_container(image_dir)?;
-    build_qcow2(disk, public_key, HOST_IMAGE_TAG, false)
+    build_qcow2(disk, public_key, Some(image_dir), HOST_IMAGE_TAG, false)
+}
+
+fn optional_newer(file: &Path, disk: &Path) -> Result<bool, Error> {
+    if file.exists() {
+        file_newer_than(file, disk)
+    } else {
+        Ok(false)
+    }
 }
 
 fn file_newer_than(file: &Path, disk: &Path) -> Result<bool, Error> {
@@ -596,14 +682,13 @@ fn build_host_container(image_dir: &Path) -> Result<(), Error> {
     }
 }
 
-fn build_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> Result<(), Error> {
-    let pubkey =
-        fs::read_to_string(public_key).map_err(|e| Error::from_io("reading SSH public key", e))?;
-    let pubkey = pubkey.trim();
-    if pubkey.is_empty() {
-        return Err(Error::from_message("SSH public key is empty"));
-    }
-
+fn build_qcow2(
+    disk: &Path,
+    public_key: Option<&Path>,
+    image_dir: Option<&Path>,
+    image_ref: &str,
+    pull: bool,
+) -> Result<(), Error> {
     let out_dir = disk
         .parent()
         .ok_or_else(|| Error::from_message("disk path has no parent"))?
@@ -621,9 +706,31 @@ fn build_qcow2(disk: &Path, public_key: &Path, image_ref: &str, pull: bool) -> R
     fs::create_dir_all(&config_dir)
         .map_err(|e| Error::from_io("creating image-builder config dir", e))?;
     let config_path = config_dir.join("config.toml");
-    let config = format!(
-        "[[customizations.user]]\nname = \"{GUEST_USER}\"\nkey = \"{pubkey}\"\ngroups = [\"wheel\"]\n"
-    );
+    let config = match public_key {
+        Some(public_key) => {
+            let pubkey = fs::read_to_string(public_key)
+                .map_err(|e| Error::from_io("reading SSH public key", e))?;
+            let pubkey = pubkey.trim();
+            if pubkey.is_empty() {
+                return Err(Error::from_message("SSH public key is empty"));
+            }
+            format!(
+                "[[customizations.user]]\nname = \"{GUEST_USER}\"\nkey = \"{pubkey}\"\ngroups = [\"wheel\"]\n"
+            )
+        }
+        None => {
+            let path = image_dir
+                .map(|d| d.join("bib.toml"))
+                .filter(|p| p.is_file())
+                .ok_or_else(|| {
+                    Error::from_message(
+                        "published Disk image needs bib.toml in the host-image checkout (no users, no SSH key)",
+                    )
+                })?;
+            fs::read_to_string(&path)
+                .map_err(|e| Error::from_io("reading published bib.toml", e))?
+        }
+    };
     fs::write(&config_path, config)
         .map_err(|e| Error::from_io("writing image-builder config", e))?;
 
@@ -844,12 +951,22 @@ fn ssh_output(key: &Path, port: u16, command: &str) -> Result<String, Error> {
 }
 
 fn read_serial(path: &Path) -> String {
+    tail_bytes(path, 8000)
+}
+
+fn read_serial_all(path: &Path) -> String {
+    match fs::read(path) {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(err) => format!("(could not read serial log: {err})"),
+    }
+}
+
+fn tail_bytes(path: &Path, keep: usize) -> String {
     let mut buf = Vec::new();
     match File::open(path).and_then(|mut f| f.read_to_end(&mut buf)) {
         Ok(_) => {
-            const KEEP: usize = 8000;
-            let tail = if buf.len() > KEEP {
-                &buf[buf.len() - KEEP..]
+            let tail = if buf.len() > keep {
+                &buf[buf.len() - keep..]
             } else {
                 buf.as_slice()
             };
@@ -867,7 +984,16 @@ pub fn build_host_image_disk() -> Result<PathBuf, Error> {
     let disk_path = cache.join("disk.qcow2");
     ensure_ssh_key(&key_path, &pub_path)?;
     let image_dir = host_image_dir()?;
-    ensure_host_qcow2(&disk_path, &pub_path, &image_dir)?;
+    ensure_host_qcow2(&disk_path, Some(&pub_path), &image_dir)?;
+    Ok(disk_path)
+}
+
+/// Published Disk image: no injected SSH key, no default password.
+pub fn build_published_host_image_disk() -> Result<PathBuf, Error> {
+    let cache = cache_dir("fwos-host")?;
+    let disk_path = cache.join("published.qcow2");
+    let image_dir = host_image_dir()?;
+    ensure_host_qcow2(&disk_path, None, &image_dir)?;
     Ok(disk_path)
 }
 

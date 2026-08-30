@@ -58,6 +58,32 @@ fn ssh_into_booted_fwos_host_image() {
     );
 }
 
+#[test]
+fn published_disk_image_has_no_network_ssh_before_bootstrap() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image()
+        .expect("published Disk image guest must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("login:"),
+        "published guest is observed on serial, not Host-netns SSH; serial:\n{serial}"
+    );
+    let mut banner = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Some(ident) = guest.ssh_ident() {
+            banner = Some(ident);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if let Some(ident) = banner {
+        panic!(
+            "published Disk image must not accept network SSH before Bootstrap, got banner {ident}; serial:\n{serial}"
+        );
+    }
+}
+
 fn has_ethernet(links: &str) -> bool {
     links.lines().any(|l| {
         let name = l.split(':').nth(1).map(str::trim).unwrap_or("");
