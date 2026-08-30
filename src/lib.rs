@@ -12,6 +12,7 @@ const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
 const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
 const CLI_IMAGE_TAG: &str = "localhost/fwos-cli:dev";
+const UI_IMAGE_TAG: &str = "localhost/fwos-ui:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -369,6 +370,7 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
         )));
     }
     build_cli_image(&addons, &cli)?;
+    build_ui_image(&addons)?;
     let stale = !disk.exists()
         || disk.metadata().map(|m| m.len() == 0).unwrap_or(true)
         || source_newer_than(image_dir, disk)?
@@ -376,7 +378,9 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
         || file_newer_than(&netd, disk)?
         || file_newer_than(&cli, disk)?
         || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?
-        || file_newer_than(&addons.join("cli").join("Containerfile"), disk)?;
+        || file_newer_than(&addons.join("cli").join("Containerfile"), disk)?
+        || file_newer_than(&addons.join("ui").join("Containerfile"), disk)?
+        || file_newer_than(&addons.join("ui").join("fwos-ui"), disk)?;
     if !stale {
         return Ok(());
     }
@@ -417,6 +421,26 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
         )));
     }
     Ok(binary)
+}
+
+fn build_ui_image(addons: &Path) -> Result<(), Error> {
+    let context = addons.join("ui");
+    let dockerfile = context.join("Containerfile");
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", UI_IMAGE_TAG, "-f"])
+        .arg(&dockerfile)
+        .arg(&context)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for ui", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of ui failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 fn build_cli_image(addons: &Path, binary: &Path) -> Result<(), Error> {

@@ -583,3 +583,227 @@ fn cli_applies_full_desired_state() {
     wait_until_mgmt(&guest, &ssh_nic, "reboot");
     assert_full_desired(&guest, &traffic_nic);
 }
+
+fn py_exec(guest: &Guest, script: &str) -> Result<String, String> {
+    let hex = hex_encode(script);
+    guest
+        .ssh(&format!(
+            "python3 -c 'exec(bytes.fromhex(\"{hex}\").decode())'"
+        ))
+        .map_err(|e| e.to_string())
+}
+
+fn guest_ipv4(guest: &Guest, nic: &str) -> String {
+    let out = guest
+        .ssh(&format!(
+            "ip -4 -o addr show dev {nic} | awk '{{print $4}}' | cut -d/ -f1 | head -1"
+        ))
+        .expect("IPv4 on NIC");
+    let ip = out.trim().to_string();
+    assert!(!ip.is_empty(), "expected IPv4 on {nic}, got:\n{out}");
+    ip
+}
+
+fn assert_https_ui(guest: &Guest, ip: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..60 {
+        match py_exec(
+            guest,
+            &format!(
+                r#"
+import ssl, urllib.request, sys
+ctx = ssl._create_unverified_context()
+try:
+    body = urllib.request.urlopen("https://{ip}/", context=ctx, timeout=5).read().decode()
+    print(body)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+"#
+            ),
+        ) {
+            Ok(page) => {
+                last = page;
+                break;
+            }
+            Err(e) => last = e,
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let page = last;
+    if !page.to_ascii_lowercase().contains("html")
+        && !page.to_ascii_lowercase().contains("hostname")
+    {
+        panic!("HTTPS UI at https://{ip}/: {page}");
+    }
+    let http = py_exec(
+        guest,
+        &format!(
+            r#"
+import urllib.request, sys
+try:
+    urllib.request.urlopen("http://{ip}/", timeout=2)
+    print("HTTP_OK")
+except Exception:
+    print("HTTP_FAIL")
+"#
+        ),
+    )
+    .unwrap_or_else(|_| "HTTP_FAIL".into());
+    assert!(
+        http.contains("HTTP_FAIL"),
+        "UI must not serve HTTP, got:\n{http}"
+    );
+    page
+}
+
+fn assert_ui_bind_filter(guest: &Guest) {
+    let listeners = guest
+        .ssh("cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4==\"0A\" {print $2}'")
+        .expect("listen sockets");
+    // 00000000:01BB is 0.0.0.0:443; 00000000:0050 is :80.
+    assert!(
+        !listeners.to_ascii_uppercase().contains("00000000:01BB"),
+        "UI must not listen on 0.0.0.0:443, got:\n{listeners}"
+    );
+    assert!(
+        !listeners.to_ascii_uppercase().contains("00000000:0050"),
+        "UI must not listen on 0.0.0.0:80, got:\n{listeners}"
+    );
+    let addrs = guest
+        .ssh("ip -o addr show")
+        .expect("addresses while UI is up");
+    for line in addrs.lines() {
+        for tok in line.split_whitespace() {
+            let ip = tok.split('/').next().unwrap_or("");
+            if ip.starts_with("100.64.") || ip.starts_with("100.65.") || ip.starts_with("100.127.")
+            {
+                panic!("CGNAT address present while asserting bind filter: {line}");
+            }
+        }
+    }
+}
+
+#[test]
+fn https_ui_completes_bootstrap() {
+    let _guard = guest_lock();
+    let guest =
+        Guest::boot_host_image_two_nics().expect("two-NIC host image guest must boot under QEMU");
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let nics = ethernet_names(&host);
+    assert_eq!(nics.len(), 2, "expected two virtio-net NICs, got:\n{host}");
+    let route = guest
+        .ssh("ip -o route show default")
+        .expect("default route (SSH NIC)");
+    let ssh_nic = nics
+        .iter()
+        .find(|n| route.contains(*n as &str))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("default route must name the SSH NIC, got route={route} nics={nics:?}")
+        });
+    let traffic_nic = nics
+        .iter()
+        .find(|n| *n != &ssh_nic)
+        .cloned()
+        .expect("second NIC is the Traffic NIC");
+    let ip = guest_ipv4(&guest, &ssh_nic);
+
+    let page = assert_https_ui(&guest, &ip);
+    assert!(
+        page.to_ascii_lowercase().contains("hostname")
+            && page.to_ascii_lowercase().contains("admin"),
+        "bootstrap UI must offer hostname and admin, got:\n{page}"
+    );
+    let lower = page.to_ascii_lowercase();
+    assert!(
+        !lower.contains("wireguard") && !lower.contains("qdisc") && !lower.contains("addon"),
+        "v1 UI must not offer WG/qdisc/addons, got:\n{page}"
+    );
+    assert_ui_bind_filter(&guest);
+
+    let host_ns = guest
+        .ssh(&host_cmd("readlink /proc/self/ns/net"))
+        .expect("host netns");
+    let session = guest
+        .ssh("readlink /proc/self/ns/net")
+        .expect("SSH session netns");
+    assert_eq!(
+        session.trim(),
+        host_ns.trim(),
+        "before Bootstrap, SSH reaches the UI in the Host netns"
+    );
+
+    let post = format!(
+        r#"
+import ssl, urllib.request, urllib.parse, sys
+ctx = ssl._create_unverified_context()
+body = urllib.parse.urlencode({{
+  "hostname": "fwos-box",
+  "admin": "alice",
+  "password": "secret12",
+  "mgmt": "{ssh_nic}",
+  "wan": "{traffic_nic}",
+  "wan_addr": "192.0.2.1/24",
+  "wan_addr6": "2001:db8::1/64",
+  "wan_pd": "2001:db8:1::/48",
+  "lan_prefix": "192.168.1.0/24",
+  "dhcp_pool": "192.168.1.100-192.168.1.200",
+}}).encode()
+req = urllib.request.Request("https://{ip}/bootstrap", data=body, method="POST")
+try:
+    print(urllib.request.urlopen(req, context=ctx, timeout=30).read().decode())
+except Exception as e:
+    print("POST_ERR", e)
+"#
+    );
+    let _ = py_exec(&guest, &post);
+    wait_until_mgmt(&guest, &ssh_nic, "ui-bootstrap");
+    assert_mgmt_placed(&guest, &ssh_nic, &traffic_nic);
+
+    let mut hn = String::new();
+    for _ in 0..30 {
+        hn = guest.ssh("hostname").unwrap_or_default();
+        if hn.contains("fwos-box") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        hn.contains("fwos-box"),
+        "wizard must set hostname, got:\n{hn}"
+    );
+    let admin = guest
+        .ssh("getent passwd alice || true")
+        .expect("admin user");
+    assert!(
+        admin.starts_with("alice:"),
+        "wizard must create admin, got:\n{admin}"
+    );
+    let toml = guest
+        .ssh("cat /var/lib/fwos/desired.toml")
+        .expect("Desired state after wizard");
+    assert!(
+        toml.contains("192.168.1.0/24")
+            && toml.contains("192.168.1.100-192.168.1.200")
+            && toml.contains("2001:db8::1/64")
+            && toml.contains("2001:db8:1::/48"),
+        "LAN prefix, DHCP pool, WAN v6 and PD must be Desired state, got:\n{toml}"
+    );
+    let nft = guest
+        .ssh("sudo -n ip netns exec fwd nft list ruleset")
+        .expect("nft after wizard");
+    let nft_l = nft.to_ascii_lowercase();
+    assert!(
+        nft_l.contains("masquerade") && nft_l.contains("drop"),
+        "default policy missing after wizard, got:\n{nft}"
+    );
+
+    let mgmt_ip = guest_ipv4(&guest, &ssh_nic);
+    let page2 = assert_https_ui(&guest, &mgmt_ip);
+    assert!(
+        page2.to_ascii_lowercase().contains("hostname"),
+        "same UI must still serve HTTPS in mgmt, got:\n{page2}"
+    );
+    guest.ssh("true").expect("injected-key SSH after wizard");
+}
