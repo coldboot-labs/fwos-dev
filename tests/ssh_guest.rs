@@ -450,3 +450,136 @@ fn json_places_management_nic() {
         .ssh("true")
         .expect("SSH after reboot with sshd in mgmt");
 }
+
+const APPLIANCE_CLI: &str = "/usr/lib/fwos/addons/cli/usr/bin/fwos";
+// WireGuard test vector (docs.wireguard.com).
+const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
+
+fn apply_cli(guest: &Guest, body: &str) -> String {
+    let hex = hex_encode(body);
+    guest
+        .ssh(&format!(
+            "python3 -c 'open(\"/tmp/fwos-apply\",\"wb\").write(bytes.fromhex(\"{hex}\"))' && {APPLIANCE_CLI} apply /tmp/fwos-apply"
+        ))
+        .unwrap_or_else(|e| panic!("Appliance CLI apply: {e}"))
+}
+
+fn assert_full_desired(guest: &Guest, traffic_nic: &str) {
+    let fwd_links = guest
+        .ssh("sudo -n ip netns exec fwd ip -o link show")
+        .expect("fwd links");
+    assert!(
+        fwd_links.contains("wg0"),
+        "WireGuard wg0 must be in fwd, got:\n{fwd_links}"
+    );
+    let nft = guest
+        .ssh("sudo -n ip netns exec fwd nft list ruleset")
+        .expect("nft in fwd");
+    assert!(
+        nft.contains("203.0.113.50"),
+        "extra nft rule missing in fwd, got:\n{nft}"
+    );
+    let routes = guest
+        .ssh("sudo -n ip netns exec fwd ip -o route show")
+        .expect("fwd routes");
+    assert!(
+        routes.contains("198.51.100.0/24"),
+        "static route missing in fwd, got:\n{routes}"
+    );
+    let qdisc = guest
+        .ssh(&format!(
+            "sudo -n ip netns exec fwd tc qdisc show dev {traffic_nic}"
+        ))
+        .expect("qdisc on Traffic NIC");
+    let q = qdisc.to_ascii_lowercase();
+    assert!(
+        q.contains("fq_codel") || q.contains("cake"),
+        "qdisc CAKE or FQ-CoDel missing on {traffic_nic}, got:\n{qdisc}"
+    );
+}
+
+#[test]
+fn cli_applies_full_desired_state() {
+    let _guard = guest_lock();
+    let mut guest =
+        Guest::boot_host_image_two_nics().expect("two-NIC host image guest must boot under QEMU");
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let nics = ethernet_names(&host);
+    assert_eq!(nics.len(), 2, "expected two virtio-net NICs, got:\n{host}");
+    let route = guest
+        .ssh("ip -o route show default")
+        .expect("default route (SSH NIC)");
+    let ssh_nic = nics
+        .iter()
+        .find(|n| route.contains(*n as &str))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("default route must name the SSH NIC, got route={route} nics={nics:?}")
+        });
+    let traffic_nic = nics
+        .iter()
+        .find(|n| *n != &ssh_nic)
+        .cloned()
+        .expect("second NIC is the Traffic NIC");
+
+    let place = format!(
+        r#"{{"interfaces":[{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}},{{"name":"{ssh_nic}","placement":"mgmt"}}]}}"#
+    );
+    let apply_status = apply_desired_result(&guest, &place);
+    wait_until_mgmt(&guest, &ssh_nic, &format!("{apply_status:?}"));
+
+    let present = guest
+        .ssh(&format!(
+            "test -x {APPLIANCE_CLI} && echo yes || echo no; test -e /usr/bin/fwos && echo HOST || echo ADDON"
+        ))
+        .expect("probe Appliance CLI path");
+    assert!(
+        present.contains("yes"),
+        "Appliance CLI missing at {APPLIANCE_CLI}, got:\n{present}"
+    );
+    assert!(
+        present.contains("ADDON"),
+        "Appliance CLI must not be a Host program at /usr/bin/fwos, got:\n{present}"
+    );
+
+    let session = guest
+        .ssh("readlink /proc/self/ns/net")
+        .expect("SSH session netns");
+    let mgmt_ns = guest
+        .ssh("sudo -n ip netns exec mgmt readlink /proc/self/ns/net")
+        .expect("mgmt netns");
+    assert_eq!(
+        session.trim(),
+        mgmt_ns.trim(),
+        "CLI must be invoked from mgmt (SSH session)"
+    );
+
+    let full = format!(
+        r#"{{"interfaces":[{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}},{{"name":"{ssh_nic}","placement":"mgmt"}}],"wireguard":[{{"name":"wg0","private_key":"{WG_PRIVATE}","listen_port":51820,"addresses":["10.13.13.1/24"]}}],"routes":[{{"to":"198.51.100.0/24","via":"192.0.2.254"}}],"nft_extra":["ip saddr 203.0.113.50 drop"],"qdiscs":[{{"dev":"{traffic_nic}","kind":"fq_codel"}}]}}"#
+    );
+    let reply = apply_cli(&guest, &full);
+    assert!(
+        reply.contains("\"ok\": true") || reply.contains("\"ok\":true"),
+        "CLI apply must succeed, got:\n{reply}"
+    );
+    assert_full_desired(&guest, &traffic_nic);
+
+    let toml = guest
+        .ssh("cat /var/lib/fwos/desired.toml")
+        .expect("Desired state TOML");
+    assert!(
+        toml.contains("wg0") && toml.contains("198.51.100.0/24") && toml.contains("fq_codel"),
+        "TOML on /var must match the socket apply, got:\n{toml}"
+    );
+    let toml_reply = guest
+        .ssh(&format!("{APPLIANCE_CLI} apply /var/lib/fwos/desired.toml"))
+        .expect("CLI apply of break-glass TOML");
+    assert!(
+        toml_reply.contains("\"ok\": true") || toml_reply.contains("\"ok\":true"),
+        "CLI must apply TOML Desired state, got:\n{toml_reply}"
+    );
+
+    guest.reboot().expect("guest must come back after reboot");
+    wait_until_mgmt(&guest, &ssh_nic, "reboot");
+    assert_full_desired(&guest, &traffic_nic);
+}

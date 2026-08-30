@@ -11,6 +11,7 @@ const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
 const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
 const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
+const CLI_IMAGE_TAG: &str = "localhost/fwos-cli:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -360,12 +361,22 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
     }
     let addons = builtin_addons_dir()?;
     build_netd_image(&addons, &netd)?;
+    let cli = src.join("target/release/fwos");
+    if !cli.is_file() {
+        return Err(Error::from_message(format!(
+            "cargo build did not produce {}",
+            cli.display()
+        )));
+    }
+    build_cli_image(&addons, &cli)?;
     let stale = !disk.exists()
         || disk.metadata().map(|m| m.len() == 0).unwrap_or(true)
         || source_newer_than(image_dir, disk)?
         || file_newer_than(&binary, disk)?
         || file_newer_than(&netd, disk)?
-        || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?;
+        || file_newer_than(&cli, disk)?
+        || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?
+        || file_newer_than(&addons.join("cli").join("Containerfile"), disk)?;
     if !stale {
         return Ok(());
     }
@@ -406,6 +417,28 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
         )));
     }
     Ok(binary)
+}
+
+fn build_cli_image(addons: &Path, binary: &Path) -> Result<(), Error> {
+    let context = binary
+        .parent()
+        .ok_or_else(|| Error::from_message("cli path has no parent"))?;
+    let dockerfile = addons.join("cli").join("Containerfile");
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", CLI_IMAGE_TAG, "-f"])
+        .arg(&dockerfile)
+        .arg(context)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for cli", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of cli failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 fn build_netd_image(addons: &Path, binary: &Path) -> Result<(), Error> {
