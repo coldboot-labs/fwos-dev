@@ -13,6 +13,8 @@ const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
 const CLI_IMAGE_TAG: &str = "localhost/fwos-cli:dev";
 const UI_IMAGE_TAG: &str = "localhost/fwos-ui:dev";
+const KEA_IMAGE_TAG: &str = "localhost/fwos-kea:dev";
+const UNBOUND_IMAGE_TAG: &str = "localhost/fwos-unbound:dev";
 const IMAGE_BUILDER: &str = "quay.io/centos-bootc/bootc-image-builder:latest";
 const GUEST_USER: &str = "fwos";
 const SSH_WAIT: Duration = Duration::from_secs(240);
@@ -371,6 +373,8 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
     }
     build_cli_image(&addons, &cli)?;
     build_ui_image(&addons)?;
+    build_vendor_image(&addons.join("kea"), KEA_IMAGE_TAG)?;
+    build_vendor_image(&addons.join("unbound"), UNBOUND_IMAGE_TAG)?;
     let stale = !disk.exists()
         || disk.metadata().map(|m| m.len() == 0).unwrap_or(true)
         || source_newer_than(image_dir, disk)?
@@ -380,7 +384,11 @@ fn ensure_host_qcow2(disk: &Path, public_key: &Path, image_dir: &Path) -> Result
         || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("cli").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("ui").join("Containerfile"), disk)?
-        || file_newer_than(&addons.join("ui").join("fwos-ui"), disk)?;
+        || file_newer_than(&addons.join("ui").join("fwos-ui"), disk)?
+        || file_newer_than(&addons.join("kea").join("Containerfile"), disk)?
+        || file_newer_than(&addons.join("kea").join("run-dhcp4"), disk)?
+        || file_newer_than(&addons.join("kea").join("run-dhcp6"), disk)?
+        || file_newer_than(&addons.join("unbound").join("Containerfile"), disk)?;
     if !stale {
         return Ok(());
     }
@@ -421,6 +429,25 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
         )));
     }
     Ok(binary)
+}
+
+fn build_vendor_image(dir: &Path, tag: &str) -> Result<(), Error> {
+    let dockerfile = dir.join("Containerfile");
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", tag, "-f"])
+        .arg(&dockerfile)
+        .arg(dir)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for vendor addon", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of {tag} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 fn build_ui_image(addons: &Path) -> Result<(), Error> {

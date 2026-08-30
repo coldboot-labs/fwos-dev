@@ -807,3 +807,170 @@ except Exception as e:
     );
     guest.ssh("true").expect("injected-key SSH after wizard");
 }
+
+fn fwd_comms(guest: &Guest) -> String {
+    guest
+        .ssh(
+            r#"
+while read -r pid; do
+  [ -n "$pid" ] || continue
+  tr -d '\0' < /proc/$pid/comm
+  echo
+done <<EOF
+$(sudo -n ip netns pids fwd)
+EOF
+"#,
+        )
+        .unwrap_or_default()
+}
+
+fn wait_kea_in_fwd(guest: &Guest) {
+    let mut last = String::from("(no probe)");
+    for _ in 0..60 {
+        last = fwd_comms(guest);
+        if last.contains("kea-dhcp4") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let diag = guest
+        .ssh(
+            r#"
+echo '--- files ---'
+ls -l /var/lib/fwos/kea /var/lib/fwos/unbound 2>&1 || true
+echo '--- units ---'
+systemctl is-active fwos-kea-dhcp4.service fwos-kea-dhcp6.service fwos-unbound.service fwos-lan-services-wait.service 2>&1 || true
+systemctl status fwos-kea-dhcp4.service --no-pager -l 2>&1 | tail -40 || true
+journalctl -u fwos-kea-dhcp4.service --no-pager -n 40 2>&1 || true
+systemctl status fwos-unbound.service --no-pager -l 2>&1 | tail -20 || true
+echo '--- lan ---'
+sudo -n ip netns exec fwd ip -o addr show 2>&1 || true
+echo '--- toml ---'
+grep -E 'dhcp|lan_prefix|wan_pd' /var/lib/fwos/desired.toml 2>&1 || true
+"#,
+        )
+        .unwrap_or_else(|e| format!("diag ssh: {e}"));
+    panic!("Kea not running in fwd within 60s after DHCP pool set, comms:\n{last}\n{diag}");
+}
+
+#[test]
+fn lan_dhcp_pool_starts_kea_and_unbound() {
+    let _guard = guest_lock();
+    let guest =
+        Guest::boot_host_image_two_nics().expect("two-NIC host image guest must boot under QEMU");
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let nics = ethernet_names(&host);
+    let route = guest
+        .ssh("ip -o route show default")
+        .expect("default route (SSH NIC)");
+    let ssh_nic = nics
+        .iter()
+        .find(|n| route.contains(*n as &str))
+        .cloned()
+        .unwrap_or_else(|| panic!("SSH NIC from default route, got {route} {nics:?}"));
+    let traffic_nic = nics
+        .iter()
+        .find(|n| *n != &ssh_nic)
+        .cloned()
+        .expect("Traffic NIC");
+
+    let json = format!(
+        r#"{{"interfaces":[{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}},{{"name":"{ssh_nic}","placement":"mgmt"}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wan_pd":"2001:db8:1::/48"}}"#
+    );
+    let apply_status = apply_desired_result(&guest, &json);
+    wait_until_mgmt(&guest, &ssh_nic, &format!("{apply_status:?}"));
+    wait_kea_in_fwd(&guest);
+
+    let comms = fwd_comms(&guest);
+    assert!(
+        comms.contains("kea-dhcp4"),
+        "kea-dhcp4 must run in fwd, got:\n{comms}"
+    );
+    assert!(
+        comms.contains("kea-dhcp6"),
+        "kea-dhcp6 must run in fwd, got:\n{comms}"
+    );
+    assert!(
+        comms.contains("unbound"),
+        "Unbound must run in fwd, got:\n{comms}"
+    );
+    assert!(
+        !comms.contains("radvd"),
+        "IPv6 RA must not be a radvd product, got:\n{comms}"
+    );
+
+    let mgmt_comms = guest
+        .ssh(
+            r#"
+while read -r pid; do
+  [ -n "$pid" ] || continue
+  tr -d '\0' < /proc/$pid/comm
+  echo
+done <<EOF
+$(sudo -n ip netns pids mgmt)
+EOF
+"#,
+        )
+        .unwrap_or_default();
+    assert!(
+        !mgmt_comms.contains("kea-dhcp") && !mgmt_comms.contains("unbound"),
+        "Kea/Unbound must not run in mgmt, got:\n{mgmt_comms}"
+    );
+    let host_comms = guest
+        .ssh(
+            r#"
+host=$(readlink /proc/1/ns/net)
+for p in /proc/[0-9]*; do
+  [ -r "$p/ns/net" ] || continue
+  ns=$(readlink "$p/ns/net" 2>/dev/null) || continue
+  [ "$ns" = "$host" ] || continue
+  tr -d '\0' < "$p/comm"
+  echo
+done
+"#,
+        )
+        .unwrap_or_default();
+    assert!(
+        !host_comms.contains("kea-dhcp") && !host_comms.contains("unbound"),
+        "Kea/Unbound must not run in the Host netns, got:\n{host_comms}"
+    );
+
+    let kea4 = guest
+        .ssh("cat /var/lib/fwos/kea/kea-dhcp4.conf")
+        .expect("generated Kea DHCPv4 config");
+    assert!(
+        kea4.contains("192.168.1.100") && kea4.contains("192.168.1.200"),
+        "Kea DHCPv4 config must match the pool, got:\n{kea4}"
+    );
+    let kea6 = guest
+        .ssh("cat /var/lib/fwos/kea/kea-dhcp6.conf")
+        .expect("generated Kea DHCPv6 config");
+    assert!(
+        kea6.contains("2001:db8:1::100") && kea6.contains("2001:db8:1::1ff"),
+        "Kea DHCPv6 config must match the PD pool, got:\n{kea6}"
+    );
+    let unbound = guest
+        .ssh("cat /var/lib/fwos/unbound/unbound.conf")
+        .expect("generated Unbound config");
+    assert!(
+        unbound.to_ascii_lowercase().contains("interface") && unbound.contains("192.168.1."),
+        "Unbound config must serve the LAN, got:\n{unbound}"
+    );
+    assert!(
+        !kea4.to_ascii_lowercase().contains("http-host")
+            && !unbound.to_ascii_lowercase().contains("control-interface"),
+        "Kea/Unbound must have no public operator API"
+    );
+
+    let lan = guest
+        .ssh("sudo -n ip netns exec fwd ip -o addr show")
+        .expect("fwd addrs");
+    assert!(
+        lan.contains("192.168.1.1"),
+        "LAN prefix must be programmed in fwd, got:\n{lan}"
+    );
+    assert!(
+        lan.contains("2001:db8:1::") || lan.to_ascii_lowercase().contains("2001:db8"),
+        "IPv6 prefix from PD must be on the LAN in fwd (netd RA path), got:\n{lan}"
+    );
+}
