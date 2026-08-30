@@ -84,6 +84,72 @@ fn published_disk_image_has_no_network_ssh_before_bootstrap() {
     }
 }
 
+#[test]
+fn published_guest_serial_and_https_without_ssh() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image()
+        .expect("published Disk image guest must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("login:"),
+        "tests observe published guests on serial; serial:\n{serial}"
+    );
+    guest
+        .serial_write("\n")
+        .expect("tests must write the guest serial console");
+    let mut last = String::new();
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if last.matches("login:").count() >= 2 {
+            break;
+        }
+    }
+    assert!(
+        last.matches("login:").count() >= 2,
+        "serial write must reach the console (second login prompt); serial:\n{last}"
+    );
+
+    let mut page = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("hostname")
+                    || page.to_ascii_lowercase().contains("html")
+                {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let lower = page.to_ascii_lowercase();
+    assert!(
+        lower.contains("hostname") || lower.contains("html") || lower.contains("admin"),
+        "Workstation must reach the UI over HTTPS, last={err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut banner = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(ident) = guest.ssh_ident() {
+            banner = Some(ident);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if let Some(ident) = banner {
+        panic!(
+            "published guest must not answer SSH, got banner {ident}; serial:\n{}",
+            guest.serial()
+        );
+    }
+}
+
 fn has_ethernet(links: &str) -> bool {
     links.lines().any(|l| {
         let name = l.split(':').nth(1).map(str::trim).unwrap_or("");

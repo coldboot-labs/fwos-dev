@@ -4,6 +4,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,8 +32,10 @@ enum BootWait {
 pub struct Guest {
     child: Child,
     port: u16,
+    https_port: u16,
     key_path: Option<PathBuf>,
     serial_log: PathBuf,
+    serial: Mutex<UnixStream>,
     monitor: PathBuf,
 }
 
@@ -114,17 +117,30 @@ impl Guest {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let port = free_localhost_port()?;
+        let https_port = free_localhost_port()?;
         let work = instance_dir()?;
         let overlay = work.join("overlay.qcow2");
         let serial_log = work.join("serial.log");
+        let serial_sock = work.join("serial.sock");
         let monitor = work.join("monitor.sock");
         create_overlay(disk_path, &overlay)?;
-        let child = start_qemu(&overlay, port, &serial_log, &monitor, extra_nics)?;
+        let child = start_qemu(
+            &overlay,
+            port,
+            https_port,
+            &serial_log,
+            &serial_sock,
+            &monitor,
+            extra_nics,
+        )?;
+        let serial = connect_serial(&serial_sock, &serial_log)?;
         let mut guest = Self {
             child,
             port,
+            https_port,
             key_path: key_path.map(Path::to_path_buf),
             serial_log,
+            serial: Mutex::new(serial),
             monitor,
         };
         let ready = match wait {
@@ -152,9 +168,70 @@ impl Guest {
         self.port
     }
 
+    pub fn https_port(&self) -> u16 {
+        self.https_port
+    }
+
     /// Serial console log (how a published guest is observed).
     pub fn serial(&self) -> String {
         read_serial_all(&self.serial_log)
+    }
+
+    /// Write bytes to the guest serial console.
+    pub fn serial_write(&self, data: &str) -> Result<(), Error> {
+        let mut serial = self
+            .serial
+            .lock()
+            .map_err(|_| Error::from_message("serial lock poisoned"))?;
+        serial
+            .write_all(data.as_bytes())
+            .map_err(|e| Error::from_io("writing guest serial", e))?;
+        serial
+            .flush()
+            .map_err(|e| Error::from_io("flushing guest serial", e))?;
+        Ok(())
+    }
+
+    /// GET `path` on the guest UI over HTTPS from the Workstation (self-signed).
+    pub fn https_get(&self, path: &str) -> Result<String, Error> {
+        let url = format!("https://10.0.2.15{path}");
+        let connect = format!("10.0.2.15:443:127.0.0.1:{}", self.https_port);
+        let output = Command::new("curl")
+            .args([
+                "-sk",
+                "--max-time",
+                "8",
+                "--http1.1",
+                "-H",
+                "Connection: close",
+                "--connect-to",
+                &connect,
+                "-o",
+                "-",
+                "-w",
+                "\nhttp_code=%{http_code}",
+                &url,
+            ])
+            .output()
+            .map_err(|e| Error::from_io("running curl", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (body, code) = match stdout.rsplit_once("http_code=") {
+            Some((body, rest)) => (body.to_string(), rest.trim().parse::<u16>().ok()),
+            None => (stdout.into_owned(), None),
+        };
+        // Python ssl http.server often omits TLS close_notify; curl then exits
+        // 56 (CURLE_RECV_ERROR) after a complete 200. HTTP status is the result.
+        if code == Some(200) {
+            Ok(body)
+        } else {
+            Err(Error::from_message(format!(
+                "curl {url} failed with {} http_code={}: {}\n{}",
+                output.status,
+                code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                String::from_utf8_lossy(&output.stderr).trim(),
+                body.trim()
+            )))
+        }
     }
 
     /// SSH identification string if port 22 answers the SSH protocol.
@@ -859,12 +936,16 @@ fn free_localhost_port() -> Result<u16, Error> {
 fn start_qemu(
     overlay: &Path,
     port: u16,
+    https_port: u16,
     serial_log: &Path,
+    serial_sock: &Path,
     monitor: &Path,
     extra_nics: u8,
 ) -> Result<Child, Error> {
     let _ = fs::remove_file(monitor);
-    let serial = File::create(serial_log).map_err(|e| Error::from_io("creating serial log", e))?;
+    let _ = fs::remove_file(serial_sock);
+    let qemu_err = serial_log.with_file_name("qemu.stderr");
+    let err = File::create(&qemu_err).map_err(|e| Error::from_io("creating qemu stderr", e))?;
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
@@ -882,7 +963,9 @@ fn start_qemu(
     .arg(format!("file={},if=virtio,format=qcow2", overlay.display()))
     .args([
         "-netdev",
-        &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"),
+        &format!(
+            "user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22,hostfwd=tcp:127.0.0.1:{https_port}-:443"
+        ),
     ])
     .args(["-device", "virtio-net-pci,netdev=net0"]);
     for i in 0..extra_nics {
@@ -899,16 +982,46 @@ fn start_qemu(
         ])
         .args(["-display", "none"])
         .arg("-serial")
-        .arg("stdio")
-        .stdout(Stdio::from(
-            serial
-                .try_clone()
-                .map_err(|e| Error::from_io("cloning serial log", e))?,
-        ))
-        .stderr(Stdio::from(serial))
+        .arg(format!("unix:{},server=on,wait=off", serial_sock.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err))
         .spawn()
         .map_err(|e| Error::from_io("starting QEMU", e))?;
     Ok(child)
+}
+
+fn connect_serial(sock: &Path, log: &Path) -> Result<UnixStream, Error> {
+    File::create(log).map_err(|e| Error::from_io("creating serial log", e))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let stream = loop {
+        match UnixStream::connect(sock) {
+            Ok(s) => break s,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(Error::from_io("connecting guest serial", err));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut reader = stream
+        .try_clone()
+        .map_err(|e| Error::from_io("cloning serial stream", e))?;
+    let log_path = log.to_path_buf();
+    let _ = reader.set_read_timeout(None);
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut f| f.write_all(&buf[..n]));
+        }
+    });
+    Ok(stream)
 }
 
 fn ssh_output(key: &Path, port: u16, command: &str) -> Result<String, Error> {
