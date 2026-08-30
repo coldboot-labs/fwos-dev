@@ -974,3 +974,171 @@ done
         "IPv6 prefix from PD must be on the LAN in fwd (netd RA path), got:\n{lan}"
     );
 }
+
+fn wait_until_sshd_in_mgmt(guest: &Guest, apply_status: &str) {
+    let mut last = String::from("(no probe)");
+    for _ in 0..180 {
+        let session = match guest.ssh("readlink /proc/self/ns/net") {
+            Ok(s) => s,
+            Err(e) => {
+                last = format!("ssh: {e}");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let host_ns = guest
+            .ssh(&host_cmd("readlink /proc/self/ns/net"))
+            .unwrap_or_default();
+        let mgmt_ns = guest
+            .ssh("sudo -n ip netns exec mgmt readlink /proc/self/ns/net")
+            .unwrap_or_default();
+        let fwd_ns = guest
+            .ssh("sudo -n ip netns exec fwd readlink /proc/self/ns/net")
+            .unwrap_or_default();
+        last = format!("session={session:?} host={host_ns:?} mgmt={mgmt_ns:?} fwd={fwd_ns:?}");
+        if !session.is_empty()
+            && !mgmt_ns.is_empty()
+            && session.trim() == mgmt_ns.trim()
+            && session.trim() != host_ns.trim()
+            && session.trim() != fwd_ns.trim()
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!(
+        "sshd not in mgmt within 180s on stick; apply={apply_status}; last={last}; {}",
+        apply_diag(guest)
+    );
+}
+
+fn assert_stick(guest: &Guest, parent: &str) {
+    let wan = format!("{parent}.10");
+    let lan = format!("{parent}.20");
+    let fwd = guest
+        .ssh("sudo -n ip netns exec fwd ip -o link show")
+        .expect("fwd links");
+    assert!(
+        ethernet_names(&fwd).iter().any(|n| n == parent),
+        "stick parent {parent} must be in fwd, got:\n{fwd}"
+    );
+    assert!(
+        fwd.contains(&wan) && fwd.contains(&lan),
+        "WAN/LAN VLANs must exist in fwd, got:\n{fwd}"
+    );
+    let details = guest
+        .ssh("sudo -n ip netns exec fwd ip -d link show")
+        .expect("fwd link details");
+    assert!(
+        details.contains("802.1Q") && details.contains("id 10") && details.contains("id 20"),
+        "WAN/LAN must be 802.1Q on the parent, got:\n{details}"
+    );
+    let mgmt = guest
+        .ssh("sudo -n ip netns exec mgmt ip -o link show")
+        .expect("mgmt links");
+    assert!(
+        !ethernet_names(&mgmt).iter().any(|n| n == parent),
+        "stick parent must not move to mgmt, got:\n{mgmt}"
+    );
+    assert!(
+        mgmt.contains("veth") || mgmt.contains("m1mgmt") || mgmt.contains("m0mgmt"),
+        "mgmt must have a veth from the stick exception, got:\n{mgmt}"
+    );
+    let host = guest
+        .ssh(&host_cmd("ip -o link show"))
+        .expect("Host netns links");
+    assert!(
+        !ethernet_names(&host).iter().any(|n| n == parent),
+        "Host netns must not keep the stick parent, got:\n{host}"
+    );
+    assert!(
+        host.contains("veth") || host.contains("h0mgmt"),
+        "Host netns must have a veth to mgmt, got:\n{host}"
+    );
+    let nft = guest
+        .ssh("sudo -n ip netns exec fwd nft list ruleset")
+        .expect("nft in fwd");
+    let nft_l = nft.to_ascii_lowercase();
+    assert!(
+        nft_l.contains("dnat"),
+        "stick mgmt ports must be DNATed to mgmt, got:\n{nft}"
+    );
+    assert!(
+        nft.contains(" 22") || nft.contains("22,") || nft_l.contains("dport 22"),
+        "DNAT must include ssh, got:\n{nft}"
+    );
+    assert!(
+        nft_l.contains("masquerade"),
+        "NAT44 masquerade missing in fwd nft, got:\n{nft}"
+    );
+    assert!(
+        nft_l.contains("drop"),
+        "WAN inbound drop missing in fwd nft, got:\n{nft}"
+    );
+    assert!(
+        nft.contains(&wan),
+        "LAN↔WAN policy must name WAN VLAN {wan} in fwd nft, got:\n{nft}"
+    );
+    assert!(
+        !nft_l.contains("oifname \"f0mgmt\" masquerade")
+            && !nft_l.contains("oifname \"m1mgmt\" masquerade"),
+        "LAN↔WAN must not masquerade via the mgmt path, got:\n{nft}"
+    );
+
+    let session_ns = guest
+        .ssh("readlink /proc/self/ns/net")
+        .expect("SSH session netns");
+    let host_ns = guest
+        .ssh(&host_cmd("readlink /proc/self/ns/net"))
+        .expect("host netns inode");
+    let mgmt_ns = guest
+        .ssh("sudo -n ip netns exec mgmt readlink /proc/self/ns/net")
+        .expect("mgmt netns inode");
+    let fwd_ns = guest
+        .ssh("sudo -n ip netns exec fwd readlink /proc/self/ns/net")
+        .expect("fwd netns inode");
+    assert_eq!(
+        session_ns.trim(),
+        mgmt_ns.trim(),
+        "injected-key SSH must land in mgmt, session={session_ns} mgmt={mgmt_ns}"
+    );
+    assert_ne!(
+        session_ns.trim(),
+        host_ns.trim(),
+        "sshd must not remain in the Host netns"
+    );
+    assert_ne!(
+        session_ns.trim(),
+        fwd_ns.trim(),
+        "sshd must not run in fwd on the stick"
+    );
+}
+
+#[test]
+fn stick_exception_keeps_sshd_out_of_fwd() {
+    let _guard = guest_lock();
+    let mut guest =
+        Guest::boot_host_image().expect("one-virtio-net host image guest must boot under QEMU");
+    let host = guest.ssh("ip -o link show").expect("Host netns links");
+    let nics = ethernet_names(&host);
+    assert_eq!(
+        nics.len(),
+        1,
+        "expected one virtio-net NIC in the Host netns, got:\n{host}"
+    );
+    let parent = nics[0].clone();
+
+    let json = format!(
+        r#"{{"interfaces":[{{"name":"{parent}","placement":"fwd","role":"stick"}},{{"name":"{parent}.10","placement":"fwd","role":"wan","parent":"{parent}","vlan":10,"addresses":["192.0.2.1/24"]}},{{"name":"{parent}.20","placement":"fwd","role":"lan","parent":"{parent}","vlan":20,"addresses":["192.168.1.1/24"]}}]}}"#
+    );
+    let apply_status = apply_desired_result(&guest, &json);
+    wait_until_sshd_in_mgmt(&guest, &format!("{apply_status:?}"));
+    assert_stick(&guest, &parent);
+
+    guest.reboot().expect("guest must come back after reboot");
+    wait_until_sshd_in_mgmt(&guest, "reboot");
+    assert_stick(&guest, &parent);
+    guest
+        .ssh("true")
+        .expect("injected-key SSH after stick reboot");
+}
