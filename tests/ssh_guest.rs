@@ -525,6 +525,228 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     assert_no_ssh(&guest, "after Bootstrap");
 }
 
+#[test]
+fn published_serial_cli_applies_full_desired_state() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let payload = format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    );
+    https_bootstrap(&guest, &payload);
+    serial_login_admin(&guest, "alice", "secret12");
+
+    let full = format!(
+        r#"{{"hostname":"fwos-box","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wireguard":[{{"name":"wg0","private_key":"{WG_PRIVATE}","listen_port":51820,"addresses":["10.13.13.1/24"]}}],"routes":[{{"to":"198.51.100.0/24","via":"192.0.2.254"}}],"nft_extra":["ip saddr 203.0.113.50 drop"],"qdiscs":[{{"dev":"{traffic_nic}","kind":"fq_codel"}}]}}"#
+    );
+    let after_apply = serial_cmd(&guest, &format!("apply {full}\n"), 90, |t| {
+        t.contains("\"ok\": true") || t.contains("\"ok\":true")
+    });
+    assert!(
+        after_apply.contains("\"ok\": true") || after_apply.contains("\"ok\":true"),
+        "Appliance CLI on serial must apply full Desired state via netd, serial:\n{after_apply}"
+    );
+
+    let shown = serial_cmd(&guest, "show\n", 20, |t| {
+        t.contains("name = \"wg0\"")
+            && t.contains("198.51.100.0/24")
+            && t.contains("203.0.113.50")
+            && t.contains("fq_codel")
+    });
+    assert!(
+        shown.contains("name = \"wg0\"")
+            && shown.contains("198.51.100.0/24")
+            && shown.contains("203.0.113.50")
+            && shown.contains("fq_codel"),
+        "show must round-trip TOML on /var (WG, extra nft, static routes), serial:\n{shown}"
+    );
+
+    let after_toml = serial_cmd(&guest, "apply /var/lib/fwos/desired.toml\n", 90, |t| {
+        t.contains("\"ok\": true") || t.contains("\"ok\":true")
+    });
+    assert!(
+        after_toml.contains("\"ok\": true") || after_toml.contains("\"ok\":true"),
+        "Appliance CLI must apply break-glass TOML from /var, serial:\n{after_toml}"
+    );
+
+    let after_update = serial_cmd(&guest, "update\n", 15, |t| t.contains("update.sock"));
+    assert!(
+        after_update.contains("update.sock"),
+        "CLI must be a client of the Host update unix socket and error if it is missing, serial:\n{after_update}"
+    );
+    assert!(
+        !after_update.to_ascii_lowercase().contains("reboot")
+            && !after_update.to_ascii_lowercase().contains("staged"),
+        "stage/reboot land in later tickets; missing socket must not stage, serial:\n{after_update}"
+    );
+
+    guest
+        .serial_write("echo SHELL_RAN\n")
+        .expect("probe Host shell");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after_shell = guest.serial();
+    let shell_tail = serial_tail(&after_shell, 2000);
+    assert!(
+        shell_tail.contains("unknown command"),
+        "serial must stay the admin Appliance CLI, serial:\n{after_shell}"
+    );
+    assert!(
+        !shell_tail.lines().any(|l| l.trim() == "SHELL_RAN"),
+        "serial must not be a Host shell, serial:\n{after_shell}"
+    );
+    assert_no_ssh(&guest, "after serial apply");
+}
+
+fn https_bootstrap(guest: &Guest, payload: &str) {
+    let mut page = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("hostname")
+                    && page.to_ascii_lowercase().contains("admin")
+                {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        page.to_ascii_lowercase().contains("hostname"),
+        "Workstation must reach the HTTPS wizard, last={err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut post = String::from("(no POST)");
+    let mut post_ok = false;
+    for _ in 0..90 {
+        match guest.https_exchange("POST", "/api/bootstrap", Some(payload), 90) {
+            Ok((200, body)) => {
+                post = body;
+                if post.contains("\"ok\"") {
+                    post_ok = true;
+                    break;
+                }
+            }
+            Ok((409, body)) => {
+                post = body;
+                post_ok = true;
+                break;
+            }
+            Ok((code, body)) => post = format!("http_code={code} {body}"),
+            Err(e) => post = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        post_ok,
+        "HTTPS wizard POST must complete Bootstrap, last={post}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut after = String::new();
+    for _ in 0..180 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                after = body;
+                if after.contains("\"bootstrapped\"") && after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        after.contains("\"bootstrapped\"") && after.contains("true"),
+        "after Bootstrap, UI status must report bootstrapped; got:\n{after}; serial:\n{}",
+        guest.serial()
+    );
+}
+
+fn serial_login_admin(guest: &Guest, user: &str, password: &str) {
+    let mut last = guest.serial();
+    for _ in 0..60 {
+        let _ = guest.serial_write("\n");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if last.contains("FWOS Appliance CLI") {
+            break;
+        }
+    }
+    assert!(
+        last.contains("FWOS Appliance CLI"),
+        "after Bootstrap, serial must be the admin Appliance CLI; serial:\n{last}"
+    );
+    guest
+        .serial_write(&format!("{user}\n"))
+        .expect("admin name on Appliance CLI");
+    let mut saw_password = false;
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if serial_tail(&last, 2000)
+            .to_ascii_lowercase()
+            .contains("password")
+        {
+            saw_password = true;
+            break;
+        }
+        let _ = guest.serial_write(&format!("{user}\n"));
+    }
+    assert!(
+        saw_password,
+        "Appliance CLI must prompt for the admin password, serial:\n{last}"
+    );
+    guest
+        .serial_write(&format!("{password}\n"))
+        .expect("admin password on Appliance CLI");
+    let mut logged_in = false;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        let tail = serial_tail(&last, 3000);
+        if tail.contains("fwos>") {
+            logged_in = true;
+            break;
+        }
+    }
+    assert!(
+        logged_in,
+        "admin must authenticate into the Appliance CLI, serial:\n{last}"
+    );
+}
+
+fn serial_cmd(guest: &Guest, cmd: &str, secs: u64, pred: impl Fn(&str) -> bool) -> String {
+    let from = guest.serial().len();
+    guest
+        .serial_write(cmd)
+        .unwrap_or_else(|e| panic!("serial {cmd:?}: {e}"));
+    let mut last = guest.serial();
+    for _ in 0..secs {
+        last = guest.serial();
+        let new = if last.len() > from { &last[from..] } else { "" };
+        if pred(new) {
+            return new.to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if last.len() > from {
+        last[from..].to_string()
+    } else {
+        last
+    }
+}
+
 fn assert_no_ssh(guest: &Guest, when: &str) {
     let mut banner = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
