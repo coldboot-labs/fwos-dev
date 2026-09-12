@@ -24,9 +24,19 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            Some("installer") => match fwos_dev::build_installer_iso() {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("fwos-dev build: {err}");
+                    ExitCode::FAILURE
+                }
+            },
             Some(other) => {
                 eprintln!(
-                    "fwos-dev build: unknown target {other:?}. Try fwos-dev build or fwos-dev build published"
+                    "fwos-dev build: unknown target {other:?}. Try fwos-dev build, fwos-dev build published, or fwos-dev build installer"
                 );
                 ExitCode::FAILURE
             }
@@ -57,9 +67,10 @@ fn main() -> ExitCode {
         },
         Some("help") | Some("--help") | Some("-h") | None => {
             eprintln!("Workstation tooling (not installed on the appliance).\n");
-            eprintln!("Usage: fwos-dev <build|build published|run>");
+            eprintln!("Usage: fwos-dev <build|build published|build installer|run>");
             eprintln!("  build            Injected-key Disk image (test seam, cached)");
             eprintln!("  build published  Disk image with no SSH key and no password");
+            eprintln!("  build installer  Anaconda Installer ISO from the same Host image");
             eprintln!("  run              Boot the injected-key Disk image under QEMU");
             ExitCode::SUCCESS
         }

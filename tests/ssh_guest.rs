@@ -1947,3 +1947,58 @@ fn stick_exception_keeps_sshd_out_of_fwd() {
         .ssh("true")
         .expect("injected-key SSH after stick reboot");
 }
+
+#[test]
+fn installer_writes_host_image_onto_empty_disk() {
+    let _guard = guest_lock();
+    let guest = Guest::install_from_iso()
+        .expect("Installer must write the Host image onto an empty virt disk");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "installed guest is observed on serial as a published Disk image guest; serial:\n{serial}"
+    );
+    let lower = serial.to_ascii_lowercase();
+    assert!(
+        !lower.contains("login:"),
+        "Appliance CLI owns serial after First install; serial:\n{serial}"
+    );
+
+    let mut page = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("hostname") {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let lower = page.to_ascii_lowercase();
+    assert!(
+        lower.contains("hostname") && lower.contains("admin"),
+        "Workstation must reach the UI over HTTPS after First install, last={err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+    assert_no_ssh(&guest, "after Installer First install");
+}
+
+#[test]
+fn installer_asks_which_disk_when_more_than_one() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_installer_two_disks()
+        .expect("Installer with two writable disks must start under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Installer: pick a disk to wipe"),
+        "more than one writable disk: only disk pick; serial:\n{serial}"
+    );
+    assert!(
+        !serial.contains("FWOS Bootstrap console"),
+        "Installer must not finish First install until a disk is chosen; serial:\n{serial}"
+    );
+}

@@ -7,6 +7,7 @@ Requires a Fedora Workstation with rootful Podman, KVM, QEMU, and OVMF. Check ou
 ```
 fwos-dev build            # injected-key Disk image (test seam, cached)
 fwos-dev build published  # Disk image with no SSH key and no password
+fwos-dev build installer  # Anaconda Installer ISO from the same Host image (UEFI, self-contained)
 fwos-dev run              # boot the injected-key Disk image under QEMU; SSH when the guest is up
 cargo test                # QEMU guests (injected-key SSH still used by older tests; published path is serial + HTTPS)
 ```
