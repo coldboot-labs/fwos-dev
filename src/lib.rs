@@ -194,24 +194,48 @@ impl Guest {
 
     /// GET `path` on the guest UI over HTTPS from the Workstation (self-signed).
     pub fn https_get(&self, path: &str) -> Result<String, Error> {
+        self.https("GET", path, None, 8)
+    }
+
+    /// POST JSON `body` to `path` on the guest UI over HTTPS from the Workstation.
+    pub fn https_post(&self, path: &str, body: &str) -> Result<String, Error> {
+        self.https("POST", path, Some(body), 90)
+    }
+
+    fn https(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<String, Error> {
         let url = format!("https://10.0.2.15{path}");
         let connect = format!("10.0.2.15:443:127.0.0.1:{}", self.https_port);
-        let output = Command::new("curl")
-            .args([
-                "-sk",
-                "--max-time",
-                "8",
-                "--http1.1",
-                "-H",
-                "Connection: close",
-                "--connect-to",
-                &connect,
-                "-o",
-                "-",
-                "-w",
-                "\nhttp_code=%{http_code}",
-                &url,
-            ])
+        let mut cmd = Command::new("curl");
+        cmd.args([
+            "-sk",
+            "--max-time",
+            &max_time_secs.to_string(),
+            "--http1.1",
+            "-H",
+            "Connection: close",
+            "-X",
+            method,
+            "--connect-to",
+            &connect,
+            "-o",
+            "-",
+            "-w",
+            "\nhttp_code=%{http_code}",
+        ]);
+        if body.is_some() {
+            cmd.args(["-H", "Content-Type: application/json"]);
+        }
+        if let Some(body) = body {
+            cmd.args(["--data-binary", body]);
+        }
+        cmd.arg(&url);
+        let output = cmd
             .output()
             .map_err(|e| Error::from_io("running curl", e))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -219,13 +243,12 @@ impl Guest {
             Some((body, rest)) => (body.to_string(), rest.trim().parse::<u16>().ok()),
             None => (stdout.into_owned(), None),
         };
-        // Python ssl http.server often omits TLS close_notify; curl then exits
-        // 56 (CURLE_RECV_ERROR) after a complete 200. HTTP status is the result.
+        // A complete 200 is success even if curl exits 56 (no TLS close_notify).
         if code == Some(200) {
             Ok(body)
         } else {
             Err(Error::from_message(format!(
-                "curl {url} failed with {} http_code={}: {}\n{}",
+                "curl {method} {url} failed with {} http_code={}: {}\n{}",
                 output.status,
                 code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
                 String::from_utf8_lossy(&output.stderr).trim(),
@@ -465,15 +488,23 @@ fn builtin_addons_dir() -> Result<PathBuf, Error> {
 }
 
 fn instance_dir() -> Result<PathBuf, Error> {
+    temp_work_dir("fwos-dev-guest", "creating guest work dir")
+}
+
+fn ui_build_context() -> Result<PathBuf, Error> {
+    temp_work_dir("fwos-dev-ui", "creating UI image context")
+}
+
+fn temp_work_dir(prefix: &str, err: &str) -> Result<PathBuf, Error> {
     let dir = std::env::temp_dir().join(format!(
-        "fwos-dev-guest-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    fs::create_dir_all(&dir).map_err(|e| Error::from_io("creating guest work dir", e))?;
+    fs::create_dir_all(&dir).map_err(|e| Error::from_io(err, e))?;
     Ok(dir)
 }
 
@@ -526,7 +557,14 @@ fn ensure_host_qcow2(
         )));
     }
     build_cli_image(&addons, &cli)?;
-    build_ui_image(&addons)?;
+    let ui = src.join("target/release/fwos-ui");
+    if !ui.is_file() {
+        return Err(Error::from_message(format!(
+            "cargo build did not produce {}",
+            ui.display()
+        )));
+    }
+    build_ui_image(&addons, &ui)?;
     build_vendor_image(&addons.join("kea"), KEA_IMAGE_TAG)?;
     build_vendor_image(&addons.join("unbound"), UNBOUND_IMAGE_TAG)?;
     let stale = !disk.exists()
@@ -535,10 +573,11 @@ fn ensure_host_qcow2(
         || file_newer_than(&binary, disk)?
         || file_newer_than(&netd, disk)?
         || file_newer_than(&cli, disk)?
+        || file_newer_than(&ui, disk)?
         || file_newer_than(&addons.join("netd").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("cli").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("ui").join("Containerfile"), disk)?
-        || file_newer_than(&addons.join("ui").join("fwos-ui"), disk)?
+        || ui_sources_newer(&addons.join("ui"), disk)?
         || file_newer_than(&addons.join("kea").join("Containerfile"), disk)?
         || file_newer_than(&addons.join("kea").join("run-dhcp4"), disk)?
         || file_newer_than(&addons.join("kea").join("run-dhcp6"), disk)?
@@ -613,15 +652,34 @@ fn build_vendor_image(dir: &Path, tag: &str) -> Result<(), Error> {
     }
 }
 
-fn build_ui_image(addons: &Path) -> Result<(), Error> {
-    let context = addons.join("ui");
-    let dockerfile = context.join("Containerfile");
+fn ui_sources_newer(ui_dir: &Path, disk: &Path) -> Result<bool, Error> {
+    if !ui_dir.exists() {
+        return Ok(false);
+    }
+    let disk_mtime = disk
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(|e| Error::from_io("reading disk mtime", e))?;
+    Ok(newest_mtime(ui_dir)? > disk_mtime)
+}
+
+fn build_ui_image(addons: &Path, binary: &Path) -> Result<(), Error> {
+    let context = ui_build_context()?;
+    fs::copy(binary, context.join("fwos-ui"))
+        .map_err(|e| Error::from_io("copying fwos-ui into image context", e))?;
+    fs::copy(
+        addons.join("ui").join("Containerfile"),
+        context.join("Containerfile"),
+    )
+    .map_err(|e| Error::from_io("copying UI Containerfile", e))?;
+    copy_tree(&addons.join("ui").join("static"), &context.join("static"))?;
     let output = Command::new("sudo")
         .args(["podman", "build", "-t", UI_IMAGE_TAG, "-f"])
-        .arg(&dockerfile)
+        .arg(context.join("Containerfile"))
         .arg(&context)
         .output()
         .map_err(|e| Error::from_io("running podman build for ui", e))?;
+    let _ = fs::remove_dir_all(&context);
     if output.status.success() {
         Ok(())
     } else {
@@ -631,6 +689,31 @@ fn build_ui_image(addons: &Path) -> Result<(), Error> {
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
+    fs::create_dir_all(dst).map_err(|e| Error::from_io("creating UI static context", e))?;
+    if !src.exists() {
+        return Err(Error::from_message(format!(
+            "UI static assets missing at {}",
+            src.display()
+        )));
+    }
+    for entry in
+        fs::read_dir(src).map_err(|e| Error::from_io(&format!("read_dir {}", src.display()), e))?
+    {
+        let entry = entry.map_err(|e| Error::from_io("read_dir entry", e))?;
+        let to = dst.join(entry.file_name());
+        let ty = entry
+            .file_type()
+            .map_err(|e| Error::from_io("stat UI static entry", e))?;
+        if ty.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to).map_err(|e| Error::from_io("copying UI static file", e))?;
+        }
+    }
+    Ok(())
 }
 
 fn build_cli_image(addons: &Path, binary: &Path) -> Result<(), Error> {

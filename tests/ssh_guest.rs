@@ -132,6 +132,49 @@ fn published_guest_serial_and_https_without_ssh() {
         "Workstation must reach the UI over HTTPS, last={err}; body:\n{page}; serial:\n{}",
         guest.serial()
     );
+    assert!(
+        lower.contains("hostname") && lower.contains("admin"),
+        "wizard HTML must collect hostname and admin, body:\n{page}"
+    );
+    for needle in ["fwd", "mgmt", "vlan", "dhcp", "static", "lan", "pool", "pd"] {
+        assert!(
+            lower.contains(needle),
+            "wizard HTML must collect {needle} (NIC placement, stick VLANs, static/DHCP, LAN prefix, DHCP pool, WAN v6/PD), body:\n{page}"
+        );
+    }
+    assert!(
+        !lower.contains("wireguard") && !lower.contains("qdisc") && !lower.contains("addon"),
+        "v1 UI must not offer WG/qdisc/addons, body:\n{page}"
+    );
+
+    let mut status = String::new();
+    let mut status_err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                status = body;
+                if status.contains("bootstrapped") {
+                    break;
+                }
+            }
+            Err(e) => status_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let trimmed = status.trim_start();
+    assert!(
+        trimmed.starts_with('{'),
+        "browser uses HTTPS JSON; /api/status must be JSON, last={status_err}; body:\n{status}; serial:\n{}",
+        guest.serial()
+    );
+    assert!(
+        status.contains("\"bootstrapped\"") && status.contains("false"),
+        "published wizard is pre-Bootstrap; last={status_err}; body:\n{status}"
+    );
+    assert!(
+        status.contains("\"nics\"") && status.contains("hostname"),
+        "status JSON must list NICs and hostname; body:\n{status}"
+    );
 
     let mut banner = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -909,31 +952,21 @@ fn https_ui_completes_bootstrap() {
         "before Bootstrap, SSH reaches the UI in the Host netns"
     );
 
-    let post = format!(
-        r#"
-import ssl, urllib.request, urllib.parse, sys
-ctx = ssl._create_unverified_context()
-body = urllib.parse.urlencode({{
-  "hostname": "fwos-box",
-  "admin": "alice",
-  "password": "secret12",
-  "mgmt": "{ssh_nic}",
-  "wan": "{traffic_nic}",
-  "wan_addr": "192.0.2.1/24",
-  "wan_addr6": "2001:db8::1/64",
-  "wan_pd": "2001:db8:1::/48",
-  "lan_prefix": "192.168.1.0/24",
-  "dhcp_pool": "192.168.1.100-192.168.1.200",
-}}).encode()
-req = urllib.request.Request("https://{ip}/bootstrap", data=body, method="POST")
-try:
-    print(urllib.request.urlopen(req, context=ctx, timeout=30).read().decode())
-except Exception as e:
-    print("POST_ERR", e)
-"#
+    let payload = format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{ssh_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24","2001:db8::1/64"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wan_pd":"2001:db8:1::/48"}}"#
     );
-    let _ = py_exec(&guest, &post);
-    wait_until_mgmt(&guest, &ssh_nic, "ui-bootstrap");
+    let mut post = String::from("(no POST)");
+    for _ in 0..30 {
+        match guest.https_post("/api/bootstrap", &payload) {
+            Ok(body) => {
+                post = body;
+                break;
+            }
+            Err(e) => post = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    wait_until_mgmt(&guest, &ssh_nic, &format!("ui-bootstrap:{post}"));
     assert_mgmt_placed(&guest, &ssh_nic, &traffic_nic);
 
     let mut hn = String::new();
@@ -979,6 +1012,35 @@ except Exception as e:
     assert!(
         page2.to_ascii_lowercase().contains("hostname"),
         "same UI must still serve HTTPS in mgmt, got:\n{page2}"
+    );
+    let mut after = String::new();
+    for _ in 0..60 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                after = body;
+                if after.contains("\"bootstrapped\"") && after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        after.contains("\"bootstrapped\"") && after.contains("true"),
+        "after Bootstrap, status JSON must report bootstrapped; got:\n{after}"
+    );
+    assert!(
+        after.contains("fwos-box") && after.contains("192.168.1.0/24"),
+        "status JSON must show hostname and LAN prefix, got:\n{after}"
+    );
+    let after_l = after.to_ascii_lowercase();
+    assert!(
+        !after_l.contains("password")
+            && !after_l.contains("wireguard")
+            && !after_l.contains("qdisc")
+            && !after_l.contains("private_key"),
+        "v1 status must not expose a rule editor, WG, qdisc, or secrets, got:\n{after}"
     );
     guest.ssh("true").expect("injected-key SSH after wizard");
 }
