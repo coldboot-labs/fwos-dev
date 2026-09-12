@@ -604,7 +604,7 @@ fn published_serial_cli_applies_full_desired_state() {
 }
 
 #[test]
-fn published_serial_stages_host_update_without_reboot() {
+fn published_serial_stages_host_update_then_reboot_applies() {
     let _guard = guest_lock();
     let registry = LocalRegistry::publish_next_release()
         .expect("Workstation-local registry must serve a newer Release");
@@ -728,6 +728,109 @@ fn published_serial_stages_host_update_without_reboot() {
         "Traffic NIC placement in fwd must still be applied after staging, status:\n{ui_status}"
     );
     assert_no_ssh(&guest, "after Host update stage");
+
+    let previous = json_string_field(&staged, "booted");
+    let next_image = json_string_field(&staged, "staged")
+        .filter(|s| s.contains("fwos:next") || s.contains(&image))
+        .unwrap_or_else(|| image.clone());
+    let from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("explicit Appliance CLI reboot after stage");
+    let rebooted = serial_wait(&guest, from, 300, |t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("linux version") || l.contains("fwos appliance cli")
+    });
+    let rebooted_l = rebooted.to_ascii_lowercase();
+    assert!(
+        rebooted_l.contains("linux version") || rebooted_l.contains("fwos appliance cli"),
+        "operator reboot on serial must restart the guest onto the staged bootc deployment, serial:\n{rebooted}"
+    );
+    assert!(
+        !serial_tail(&rebooted, 4000).contains("unknown command"),
+        "Appliance CLI reboot must be a command, not a Host shell, serial:\n{rebooted}"
+    );
+
+    serial_login_admin_from(&guest, "alice", "secret12", from);
+    let deployed = serial_cmd(&guest, "status\n", 30, |t| {
+        t.contains("fwos-box")
+            && t.contains("fwd: yes")
+            && t.contains("mgmt: yes")
+            && t.contains("netd: running")
+            && (t.contains("fwos:next") || t.contains(&image) || t.contains(&next_image))
+    });
+    assert!(
+        deployed.contains("fwos-box"),
+        "/var is shared across bootc deployments; hostname must survive reboot, serial:\n{deployed}"
+    );
+    assert!(
+        deployed.contains("bootstrapped"),
+        "/var is shared; Bootstrap stamp must survive reboot, serial:\n{deployed}"
+    );
+    assert!(
+        deployed.contains("fwos:next")
+            || deployed.contains(&image)
+            || deployed.contains(&next_image),
+        "guest must come up on the new bootc deployment, serial:\n{deployed}"
+    );
+    let booted = json_status_image(&deployed, "booted").unwrap_or_default();
+    let rollback = json_status_image(&deployed, "rollback").unwrap_or_default();
+    let staged_after = json_status_image(&deployed, "staged").unwrap_or_default();
+    assert!(
+        booted.contains("fwos:next") || booted.contains(&image) || booted.contains(&next_image),
+        "booted bootc deployment must be the new Host image, serial:\n{deployed}"
+    );
+    assert!(
+        staged_after.is_empty()
+            || (!staged_after.contains("fwos:next") && !staged_after.contains(&image)),
+        "reboot must consume the staged deployment, serial:\n{deployed}"
+    );
+    assert!(
+        deployed.contains("rollback:") && !rollback.contains("fwos:next"),
+        "previous bootc deployment remains the rollback target, serial:\n{deployed}"
+    );
+    if let Some(prev) = previous {
+        if !prev.is_empty() && !prev.contains("fwos:next") {
+            assert!(
+                rollback.contains(&prev) || deployed.contains(&prev),
+                "rollback target must be the previously booted image {prev}, serial:\n{deployed}"
+            );
+        }
+    }
+    assert!(
+        deployed.contains("fwd: yes") && deployed.contains("mgmt: yes"),
+        "fwd and mgmt must exist after the Host-update reboot, serial:\n{deployed}"
+    );
+    assert!(
+        deployed.contains("netd: running"),
+        "netd must be running after the Host-update reboot, serial:\n{deployed}"
+    );
+
+    let mut ui_after = String::new();
+    for _ in 0..180 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                ui_after = body;
+                if ui_after.contains("\"bootstrapped\"") && ui_after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => ui_after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        ui_after.contains("\"bootstrapped\"") && ui_after.contains("true"),
+        "after reboot, HTTPS UI in mgmt must still serve status; got:\n{ui_after}; serial:\n{}",
+        guest.serial()
+    );
+    assert!(
+        ui_after.contains("fwos-box")
+            && ui_after.contains("\"fwd\"")
+            && ui_after.contains("\"mgmt\""),
+        "HTTPS status must show hostname and NIC placement from shared /var, status:\n{ui_after}"
+    );
+    assert_no_ssh(&guest, "after Host update reboot");
 }
 
 fn https_bootstrap(guest: &Guest, payload: &str) {
@@ -801,17 +904,31 @@ fn https_bootstrap(guest: &Guest, payload: &str) {
 }
 
 fn serial_login_admin(guest: &Guest, user: &str, password: &str) {
-    let mut last = guest.serial();
-    for _ in 0..60 {
-        let _ = guest.serial_write("\n");
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    serial_login_admin_from(guest, user, password, 0);
+}
+
+fn serial_login_admin_from(guest: &Guest, user: &str, password: &str, from: usize) {
+    let mut last = String::new();
+    for _ in 0..90 {
         last = guest.serial();
-        if last.contains("FWOS Appliance CLI") {
+        let new = if last.len() > from {
+            &last[from..]
+        } else {
+            last.as_str()
+        };
+        if new.contains("FWOS Appliance CLI") || new.contains("admin:") {
             break;
         }
+        let _ = guest.serial_write("\n");
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
+    let new = if last.len() > from {
+        &last[from..]
+    } else {
+        last.as_str()
+    };
     assert!(
-        last.contains("FWOS Appliance CLI"),
+        new.contains("FWOS Appliance CLI") || last.contains("FWOS Appliance CLI"),
         "after Bootstrap, serial must be the admin Appliance CLI; serial:\n{last}"
     );
     guest
@@ -858,6 +975,10 @@ fn serial_cmd(guest: &Guest, cmd: &str, secs: u64, pred: impl Fn(&str) -> bool) 
     guest
         .serial_write(cmd)
         .unwrap_or_else(|e| panic!("serial {cmd:?}: {e}"));
+    serial_wait(guest, from, secs, pred)
+}
+
+fn serial_wait(guest: &Guest, from: usize, secs: u64, pred: impl Fn(&str) -> bool) -> String {
     let mut last = guest.serial();
     for _ in 0..secs {
         last = guest.serial();
@@ -872,6 +993,39 @@ fn serial_cmd(guest: &Guest, cmd: &str, secs: u64, pred: impl Fn(&str) -> bool) 
     } else {
         last
     }
+}
+
+fn json_string_field(blob: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let rest = blob.split(&pat).nth(1)?;
+    let rest = rest.trim_start().trim_start_matches(':').trim_start();
+    if rest.starts_with("null") {
+        return None;
+    }
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let s = &rest[..end];
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn json_status_image(status: &str, which: &str) -> Option<String> {
+    json_string_field(status, which).or_else(|| {
+        for line in status.lines() {
+            let t = line.trim();
+            let prefix = format!("{which}:");
+            if let Some(rest) = t.strip_prefix(&prefix) {
+                let s = rest.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    })
 }
 
 fn assert_no_ssh(guest: &Guest, when: &str) {
