@@ -263,6 +263,352 @@ fn published_guest_bootstrap_console_on_serial() {
     }
 }
 
+#[test]
+fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let lower = serial.to_ascii_lowercase();
+    assert!(
+        !lower.contains("login:") && !lower.contains("admin:"),
+        "unauthenticated Bootstrap console is not the admin Appliance CLI, serial:\n{serial}"
+    );
+    assert_no_ssh(&guest, "before Bootstrap");
+
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let mut page = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("hostname")
+                    && page.to_ascii_lowercase().contains("admin")
+                {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let lower = page.to_ascii_lowercase();
+    assert!(
+        lower.contains("hostname") && lower.contains("admin"),
+        "Workstation must reach the HTTPS wizard, last={err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut status = String::new();
+    for _ in 0..90 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                status = body;
+                if status.contains("\"bootstrapped\"") {
+                    break;
+                }
+            }
+            Err(e) => status = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        status.contains("\"bootstrapped\"") && status.contains("false"),
+        "wizard is pre-Bootstrap; body:\n{status}; serial:\n{}",
+        guest.serial()
+    );
+
+    let payload = format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    );
+    let mut post = String::from("(no POST)");
+    let mut post_ok = false;
+    for _ in 0..90 {
+        match guest.https_exchange("POST", "/api/bootstrap", Some(&payload), 90) {
+            Ok((200, body)) => {
+                post = body;
+                if post.contains("\"ok\"") {
+                    post_ok = true;
+                    break;
+                }
+            }
+            Ok((409, body)) => {
+                // UI restart after a successful apply can drop the 200; stamp is on /var.
+                post = body;
+                post_ok = true;
+                break;
+            }
+            Ok((code, body)) => post = format!("http_code={code} {body}"),
+            Err(e) => post = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        post_ok,
+        "HTTPS wizard POST must complete Bootstrap, last={post}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut after = String::new();
+    for _ in 0..180 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                after = body;
+                if after.contains("\"bootstrapped\"") && after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        after.contains("\"bootstrapped\"") && after.contains("true"),
+        "after Bootstrap, UI status must report bootstrapped (UI in mgmt); got:\n{after}; serial:\n{}",
+        guest.serial()
+    );
+    assert!(
+        after.contains("fwos-box") && after.contains("192.168.1.0/24"),
+        "status JSON must show hostname and LAN prefix, got:\n{after}"
+    );
+    assert!(
+        after.contains("\"mgmt\"") && after.contains("\"fwd\""),
+        "status JSON must show NIC placement, got:\n{after}"
+    );
+    let after_l = after.to_ascii_lowercase();
+    assert!(
+        !after_l.contains("password")
+            && !after_l.contains("wireguard")
+            && !after_l.contains("qdisc")
+            && !after_l.contains("private_key"),
+        "v1 status must not expose a rule editor, WG, qdisc, or secrets, got:\n{after}"
+    );
+
+    let mut saw_409 = false;
+    let mut post2 = String::from("(no POST)");
+    for _ in 0..90 {
+        match guest.https_exchange("POST", "/api/bootstrap", Some(&payload), 15) {
+            Ok((409, body)) => {
+                post2 = body;
+                saw_409 = true;
+                break;
+            }
+            Ok((200, body)) => panic!(
+                "wizard must not accept POST after Bootstrap, got 200: {body}; serial:\n{}",
+                guest.serial()
+            ),
+            Ok((code, body)) => post2 = format!("http_code={code} {body}"),
+            Err(e) => post2 = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        saw_409 && post2.to_ascii_lowercase().contains("bootstrapped"),
+        "POST after Bootstrap must 409; last={post2}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut last = guest.serial();
+    for _ in 0..60 {
+        let _ = guest.serial_write("\n");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if last.contains("FWOS Appliance CLI") {
+            break;
+        }
+    }
+    assert!(
+        last.contains("FWOS Appliance CLI"),
+        "after Bootstrap, serial must be the admin Appliance CLI, not the Bootstrap console; serial:\n{last}"
+    );
+    let tail = serial_tail(&last, 4000).to_ascii_lowercase();
+    assert!(
+        !tail.contains("fwos bootstrap console")
+            && !tail.contains("ephemeral")
+            && !tail.contains("reach the ui"),
+        "admin Appliance CLI must not keep first-boot ephemeral addressing as the UX; serial:\n{last}"
+    );
+
+    guest
+        .serial_write("alice\n")
+        .expect("admin name on Appliance CLI");
+    let mut saw_password = false;
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if serial_tail(&last, 2000)
+            .to_ascii_lowercase()
+            .contains("password")
+        {
+            saw_password = true;
+            break;
+        }
+        let _ = guest.serial_write("alice\n");
+    }
+    assert!(
+        saw_password,
+        "Appliance CLI must prompt for the admin password, serial:\n{last}"
+    );
+    guest
+        .serial_write("secret12\n")
+        .expect("admin password on Appliance CLI");
+    let mut logged_in = false;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        let tail = serial_tail(&last, 3000);
+        if tail.contains("fwos>") || tail.contains("fwos-box") {
+            logged_in = true;
+            break;
+        }
+    }
+    assert!(
+        logged_in,
+        "admin must authenticate into the Appliance CLI, serial:\n{last}"
+    );
+
+    guest
+        .serial_write("status\n")
+        .expect("status on Appliance CLI");
+    let mut status_cli = String::new();
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        status_cli = guest.serial();
+        if serial_tail(&status_cli, 3000).contains("fwos-box") {
+            break;
+        }
+    }
+    let st_tail = serial_tail(&status_cli, 4000);
+    assert!(
+        st_tail.contains("fwos-box"),
+        "Appliance CLI status must show the hostname, serial:\n{status_cli}"
+    );
+    assert!(
+        !serial_tail(&status_cli, 2000).contains("FWOS Bootstrap console"),
+        "status must not be the Bootstrap console, serial:\n{status_cli}"
+    );
+
+    guest
+        .serial_write("echo SHELL_RAN\n")
+        .expect("probe Host shell");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after_shell = guest.serial();
+    let shell_tail = serial_tail(&after_shell, 2000);
+    assert!(
+        shell_tail.contains("unknown command"),
+        "Appliance CLI must reject a shell command, serial:\n{after_shell}"
+    );
+    assert!(
+        !shell_tail.lines().any(|l| l.trim() == "SHELL_RAN"),
+        "serial must not be a Host shell, serial:\n{after_shell}"
+    );
+    guest
+        .serial_write(&format!("static {mgmt_nic} 192.168.9.9/24\n"))
+        .expect("probe ephemeral addressing");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let after_static = guest.serial();
+    let static_tail = serial_tail(&after_static, 2000);
+    assert!(
+        static_tail.contains("unknown command"),
+        "admin CLI must not offer first-boot ephemeral addressing, serial:\n{after_static}"
+    );
+    assert!(
+        static_tail.contains("fwos>") && !static_tail.contains("FWOS Bootstrap console"),
+        "rejected ephemeral static must stay in the Appliance CLI, serial:\n{after_static}"
+    );
+
+    assert_no_ssh(&guest, "after Bootstrap");
+}
+
+fn assert_no_ssh(guest: &Guest, when: &str) {
+    let mut banner = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if let Some(ident) = guest.ssh_ident() {
+            banner = Some(ident);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if let Some(ident) = banner {
+        panic!(
+            "{when}: port 22 must not answer SSH, got banner {ident}; serial:\n{}",
+            guest.serial()
+        );
+    }
+}
+
+fn serial_tail(serial: &str, keep: usize) -> &str {
+    if serial.len() <= keep {
+        serial
+    } else {
+        &serial[serial.len() - keep..]
+    }
+}
+
+fn console_nics(serial: &str) -> Vec<(String, String)> {
+    let chunk = serial
+        .rsplit("FWOS Bootstrap console")
+        .next()
+        .unwrap_or(serial);
+    let mut nics = Vec::new();
+    let mut in_nics = false;
+    for line in chunk.lines() {
+        let t = line.trim();
+        if t.starts_with("NICs:") {
+            in_nics = true;
+            continue;
+        }
+        if !in_nics {
+            continue;
+        }
+        if t.starts_with("Reach the UI") || t == ">" || t.starts_with("> ") {
+            break;
+        }
+        let mut parts = t.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !is_ethernet_name(name) {
+            continue;
+        }
+        nics.push((name.to_string(), parts.collect::<Vec<_>>().join(" ")));
+    }
+    nics
+}
+
+fn is_ethernet_name(name: &str) -> bool {
+    let nic = name.starts_with("enp")
+        || name.starts_with("ens")
+        || name.starts_with("eno")
+        || name.starts_with("eth");
+    nic && name.chars().any(|c| c.is_ascii_digit())
+}
+
+fn published_mgmt_and_traffic(serial: &str) -> (String, String) {
+    let nics = console_nics(serial);
+    assert!(
+        nics.len() >= 2,
+        "published two-NIC guest must list two Host-netns NICs on the Bootstrap console, serial:\n{serial}"
+    );
+    let mgmt = nics
+        .iter()
+        .find(|(_, addrs)| addrs.contains("10.0.2."))
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| nics[0].0.clone());
+    let traffic = nics
+        .iter()
+        .find(|(n, _)| n != &mgmt)
+        .map(|(n, _)| n.clone())
+        .expect("Traffic NIC");
+    (mgmt, traffic)
+}
+
 fn serial_ethernet_name(serial: &str) -> Option<String> {
     serial
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_'))

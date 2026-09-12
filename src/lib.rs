@@ -108,6 +108,12 @@ impl Guest {
         Self::boot_disk(&disk_path, None, 0, BootWait::SerialBootstrap)
     }
 
+    /// Same published Disk image with a second virtio-net (Management NIC + Traffic NIC).
+    pub fn boot_published_host_image_two_nics() -> Result<Self, Error> {
+        let disk_path = build_published_host_image_disk()?;
+        Self::boot_disk(&disk_path, None, 1, BootWait::SerialBootstrap)
+    }
+
     fn boot_disk(
         disk_path: &Path,
         key_path: Option<&Path>,
@@ -194,21 +200,22 @@ impl Guest {
 
     /// GET `path` on the guest UI over HTTPS from the Workstation (self-signed).
     pub fn https_get(&self, path: &str) -> Result<String, Error> {
-        self.https("GET", path, None, 8)
+        self.https_ok("GET", path, None, 8)
     }
 
     /// POST JSON `body` to `path` on the guest UI over HTTPS from the Workstation.
     pub fn https_post(&self, path: &str, body: &str) -> Result<String, Error> {
-        self.https("POST", path, Some(body), 90)
+        self.https_ok("POST", path, Some(body), 90)
     }
 
-    fn https(
+    /// HTTPS from the Workstation; returns status and body for any complete HTTP response.
+    pub fn https_exchange(
         &self,
         method: &str,
         path: &str,
         body: Option<&str>,
         max_time_secs: u64,
-    ) -> Result<String, Error> {
+    ) -> Result<(u16, String), Error> {
         let url = format!("https://10.0.2.15{path}");
         let connect = format!("10.0.2.15:443:127.0.0.1:{}", self.https_port);
         let mut cmd = Command::new("curl");
@@ -243,15 +250,35 @@ impl Guest {
             Some((body, rest)) => (body.to_string(), rest.trim().parse::<u16>().ok()),
             None => (stdout.into_owned(), None),
         };
-        // A complete 200 is success even if curl exits 56 (no TLS close_notify).
-        if code == Some(200) {
+        // A complete HTTP response is usable even if curl exits 56 (no TLS close_notify).
+        if let Some(code) = code {
+            if code != 0 {
+                return Ok((code, body));
+            }
+        }
+        Err(Error::from_message(format!(
+            "curl {method} {url} failed with {} http_code={}: {}\n{}",
+            output.status,
+            code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            body.trim()
+        )))
+    }
+
+    fn https_ok(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<String, Error> {
+        let url = format!("https://10.0.2.15{path}");
+        let (code, body) = self.https_exchange(method, path, body, max_time_secs)?;
+        if code == 200 {
             Ok(body)
         } else {
             Err(Error::from_message(format!(
-                "curl {method} {url} failed with {} http_code={}: {}\n{}",
-                output.status,
-                code.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
-                String::from_utf8_lossy(&output.stderr).trim(),
+                "curl {method} {url} http_code={code}: {}",
                 body.trim()
             )))
         }
