@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use fwos_dev::Guest;
+use fwos_dev::{Guest, LocalRegistry};
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -575,15 +575,15 @@ fn published_serial_cli_applies_full_desired_state() {
         "Appliance CLI must apply break-glass TOML from /var, serial:\n{after_toml}"
     );
 
-    let after_update = serial_cmd(&guest, "update\n", 15, |t| t.contains("update.sock"));
+    let after_update = serial_cmd(&guest, "update\n", 15, |t| t.contains("usage: update"));
     assert!(
-        after_update.contains("update.sock"),
-        "CLI must be a client of the Host update unix socket and error if it is missing, serial:\n{after_update}"
+        after_update.contains("usage: update"),
+        "Appliance CLI update without a Host image must print usage, serial:\n{after_update}"
     );
     assert!(
         !after_update.to_ascii_lowercase().contains("reboot")
             && !after_update.to_ascii_lowercase().contains("staged"),
-        "stage/reboot land in later tickets; missing socket must not stage, serial:\n{after_update}"
+        "update without an image must not stage, serial:\n{after_update}"
     );
 
     guest
@@ -601,6 +601,133 @@ fn published_serial_cli_applies_full_desired_state() {
         "serial must not be a Host shell, serial:\n{after_shell}"
     );
     assert_no_ssh(&guest, "after serial apply");
+}
+
+#[test]
+fn published_serial_stages_host_update_without_reboot() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_next_release()
+        .expect("Workstation-local registry must serve a newer Release");
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let image = registry.guest_image();
+
+    let refused = serial_cmd(&guest, &format!("update {image}\n"), 30, |t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("admin") || l.contains("refus")
+    });
+    let refused_l = refused.to_ascii_lowercase();
+    assert!(
+        refused_l.contains("admin") || refused_l.contains("refus"),
+        "Host update must be refused until an admin exists, serial:\n{refused}"
+    );
+    assert!(
+        !refused.contains("\"ok\": true") && !refused.contains("\"ok\":true"),
+        "Host update must not be accepted before an admin exists, serial:\n{refused}"
+    );
+
+    let payload = format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    );
+    https_bootstrap(&guest, &payload);
+    serial_login_admin(&guest, "alice", "secret12");
+
+    let mut ui_update = String::from("(no POST)");
+    let mut ui_code = 0u16;
+    for _ in 0..30 {
+        match guest.https_exchange(
+            "POST",
+            "/api/update",
+            Some(&format!(r#"{{"image":"{image}"}}"#)),
+            15,
+        ) {
+            Ok((code, body)) => {
+                ui_code = code;
+                ui_update = body;
+                break;
+            }
+            Err(e) => ui_update = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(
+        ui_code, 404,
+        "v1 UI must not be a client of the Host update socket, got http_code={ui_code} {ui_update}; serial:\n{}",
+        guest.serial()
+    );
+    let js = guest.https_get("/app.js").unwrap_or_default();
+    assert!(
+        !js.contains("update.sock") && !js.contains("/api/update"),
+        "UI JS must not call the Host update program, js:\n{js}"
+    );
+
+    let before_len = guest.serial().len();
+    let staged = serial_cmd(&guest, &format!("update {image}\n"), 1200, |t| {
+        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
+            && t.to_ascii_lowercase().contains("reboot_required")
+    });
+    assert!(
+        staged.contains("\"ok\": true") || staged.contains("\"ok\":true"),
+        "Appliance CLI on serial must stage a Host update from the Workstation-local registry, serial:\n{staged}"
+    );
+    assert!(
+        staged.to_ascii_lowercase().contains("reboot_required") && staged.contains("true"),
+        "staging must report that a reboot is required, serial:\n{staged}"
+    );
+    assert!(
+        staged.contains("fwos:next") || staged.contains(&image),
+        "a Release is one tag; staged image must be the Workstation-local Release, serial:\n{staged}"
+    );
+
+    let after = guest.serial();
+    let new = if after.len() > before_len {
+        &after[before_len..]
+    } else {
+        after.as_str()
+    };
+    let new_l = new.to_ascii_lowercase();
+    assert!(
+        !new_l.contains("linux version") && !new.contains("FWOS Bootstrap console"),
+        "Host update must not reboot by itself, serial:\n{new}"
+    );
+
+    let still = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains("fwos-box") && t.contains("fwos>")
+    });
+    assert!(
+        still.contains("fwos-box") && still.contains("fwos>"),
+        "running bootc deployment is unchanged; Appliance CLI session must survive staging, serial:\n{still}"
+    );
+
+    let mut ui_status = String::new();
+    for _ in 0..30 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                ui_status = body;
+                if ui_status.contains("\"bootstrapped\"") && ui_status.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => ui_status = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        ui_status.contains("\"bootstrapped\"") && ui_status.contains("true"),
+        "Forwarding must keep running after staging; UI status:\n{ui_status}; serial:\n{}",
+        guest.serial()
+    );
+    assert!(
+        ui_status.contains("\"fwd\"") && ui_status.contains("192.0.2.1"),
+        "Traffic NIC placement in fwd must still be applied after staging, status:\n{ui_status}"
+    );
+    assert_no_ssh(&guest, "after Host update stage");
 }
 
 fn https_bootstrap(guest: &Guest, payload: &str) {

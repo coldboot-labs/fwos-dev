@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
 const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
+const NEXT_IMAGE_TAG: &str = "localhost/fwos:next";
+const REGISTRY_IMAGE: &str = "docker.io/library/registry:2";
 const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
 const CLI_IMAGE_TAG: &str = "localhost/fwos-cli:dev";
@@ -642,6 +644,7 @@ struct HostImageParts {
     netd: PathBuf,
     cli: PathBuf,
     ui: PathBuf,
+    update: PathBuf,
 }
 
 fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
@@ -673,6 +676,13 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         )));
     }
     build_ui_image(&addons, &ui)?;
+    let update = src.join("target/release/fwos-update");
+    if !update.is_file() {
+        return Err(Error::from_message(format!(
+            "cargo build did not produce {}",
+            update.display()
+        )));
+    }
     build_vendor_image(&addons.join("kea"), KEA_IMAGE_TAG)?;
     build_vendor_image(&addons.join("unbound"), UNBOUND_IMAGE_TAG)?;
     Ok(HostImageParts {
@@ -682,6 +692,7 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         netd,
         cli,
         ui,
+        update,
     })
 }
 
@@ -694,6 +705,7 @@ impl HostImageParts {
             || file_newer_than(&self.netd, artifact)?
             || file_newer_than(&self.cli, artifact)?
             || file_newer_than(&self.ui, artifact)?
+            || file_newer_than(&self.update, artifact)?
             || file_newer_than(&self.addons.join("netd").join("Containerfile"), artifact)?
             || file_newer_than(&self.addons.join("cli").join("Containerfile"), artifact)?
             || file_newer_than(&self.addons.join("ui").join("Containerfile"), artifact)?
@@ -1779,4 +1791,144 @@ fn iso_extract(iso: &Path, src: &str, dest: &Path) -> Result<(), Error> {
 /// Path to the cached SSH private key used to log into the host-image guest.
 pub fn cached_ssh_key() -> Result<PathBuf, Error> {
     Ok(cache_dir("fwos-host")?.join("id_ed25519"))
+}
+
+/// Workstation-local registry serving a newer Release for Host update tests.
+pub struct LocalRegistry {
+    container: String,
+    port: u16,
+}
+
+impl LocalRegistry {
+    /// Build a newer Host image (one tag: Host image plus Built-in addons) and serve it over HTTP.
+    pub fn publish_next_release() -> Result<Self, Error> {
+        let image_dir = host_image_dir()?;
+        let _parts = prepare_host_image_parts(&image_dir)?;
+        build_host_container(&image_dir)?;
+        build_next_release()?;
+        let port = free_localhost_port()?;
+        let container = format!("fwos-registry-{port}");
+        start_registry(&container, port)?;
+        if let Err(err) = push_next_release(port) {
+            stop_registry(&container);
+            return Err(err);
+        }
+        Ok(Self { container, port })
+    }
+
+    /// Image ref the guest uses (QEMU user-net host is 10.0.2.2).
+    pub fn guest_image(&self) -> String {
+        format!("10.0.2.2:{}/fwos:next", self.port)
+    }
+}
+
+impl Drop for LocalRegistry {
+    fn drop(&mut self) {
+        stop_registry(&self.container);
+    }
+}
+
+fn stop_registry(name: &str) {
+    let _ = Command::new("sudo")
+        .args(["podman", "rm", "-f", name])
+        .status();
+}
+
+fn build_next_release() -> Result<(), Error> {
+    let ctx = temp_work_dir("fwos-dev-next", "creating next Release context")?;
+    fs::write(
+        ctx.join("Containerfile"),
+        "FROM localhost/fwos:dev\nRUN printf 'next\\n' > /usr/lib/fwos/release && ostree container commit\n",
+    )
+    .map_err(|e| Error::from_io("writing next Release Containerfile", e))?;
+    let output = Command::new("sudo")
+        .args(["podman", "build", "-t", NEXT_IMAGE_TAG, "-f"])
+        .arg(ctx.join("Containerfile"))
+        .arg(&ctx)
+        .output()
+        .map_err(|e| Error::from_io("running podman build for next Release", e))?;
+    let _ = fs::remove_dir_all(&ctx);
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman build of {NEXT_IMAGE_TAG} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+fn start_registry(name: &str, port: u16) -> Result<(), Error> {
+    stop_registry(name);
+    pull_image(REGISTRY_IMAGE)?;
+    let output = Command::new("sudo")
+        .args([
+            "podman",
+            "run",
+            "-d",
+            "--name",
+            name,
+            "-p",
+            &format!("127.0.0.1:{port}:5000"),
+            REGISTRY_IMAGE,
+        ])
+        .output()
+        .map_err(|e| Error::from_io("starting Workstation-local registry", e))?;
+    if !output.status.success() {
+        return Err(Error::from_message(format!(
+            "podman run {REGISTRY_IMAGE} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if let Err(err) = wait_tcp("127.0.0.1", port, Duration::from_secs(30)) {
+        stop_registry(name);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn push_next_release(port: u16) -> Result<(), Error> {
+    let dest = format!("127.0.0.1:{port}/fwos:next");
+    let tag = Command::new("sudo")
+        .args(["podman", "tag", NEXT_IMAGE_TAG, &dest])
+        .output()
+        .map_err(|e| Error::from_io("tagging next Release for the registry", e))?;
+    if !tag.status.success() {
+        return Err(Error::from_message(format!(
+            "podman tag {NEXT_IMAGE_TAG} {dest} failed with {}: {}",
+            tag.status,
+            String::from_utf8_lossy(&tag.stderr).trim()
+        )));
+    }
+    let push = Command::new("sudo")
+        .args(["podman", "push", "--tls-verify=false", &dest])
+        .output()
+        .map_err(|e| Error::from_io("pushing next Release", e))?;
+    if push.status.success() {
+        Ok(())
+    } else {
+        Err(Error::from_message(format!(
+            "podman push {dest} failed with {}: {}",
+            push.status,
+            String::from_utf8_lossy(&push.stderr).trim()
+        )))
+    }
+}
+
+fn wait_tcp(host: &str, port: u16, wait: Duration) -> Result<(), Error> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if TcpStream::connect((host, port)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::from_message(format!(
+                "Workstation-local registry did not listen on {host}:{port} within {}s",
+                wait.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
