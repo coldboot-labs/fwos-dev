@@ -789,10 +789,10 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         deployed.contains("rollback:") && !rollback.contains("fwos:next"),
         "previous bootc deployment remains the rollback target, serial:\n{deployed}"
     );
-    if let Some(prev) = previous {
+    if let Some(prev) = previous.as_deref() {
         if !prev.is_empty() && !prev.contains("fwos:next") {
             assert!(
-                rollback.contains(&prev) || deployed.contains(&prev),
+                rollback.contains(prev) || deployed.contains(prev),
                 "rollback target must be the previously booted image {prev}, serial:\n{deployed}"
             );
         }
@@ -830,7 +830,187 @@ fn published_serial_stages_host_update_then_reboot_applies() {
             && ui_after.contains("\"mgmt\""),
         "HTTPS status must show hostname and NIC placement from shared /var, status:\n{ui_after}"
     );
+
+    let bad = serial_cmd(&guest, "apply this-is-not-desired-state\n", 20, |t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("error")
+            || l.contains("parse")
+            || l.contains("\"ok\": false")
+            || l.contains("\"ok\":false")
+    });
+    assert!(
+        !bad.contains("\"ok\": true") && !bad.contains("\"ok\":true"),
+        "invalid Desired state must not apply, serial:\n{bad}"
+    );
+    let still_next = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains("fwos-box")
+            && (t.contains("fwos:next") || t.contains(&image) || t.contains(&next_image))
+    });
+    let still_booted = json_status_image(&still_next, "booted").unwrap_or_default();
+    assert!(
+        still_booted.contains("fwos:next")
+            || still_booted.contains(&image)
+            || still_booted.contains(&next_image)
+            || still_next.contains("fwos:next"),
+        "Desired state that fails to apply must not roll back the Host image, serial:\n{still_next}"
+    );
+
+    let help = serial_cmd(&guest, "help\n", 10, |t| t.contains("rollback"));
+    assert!(
+        help.contains("rollback"),
+        "manual rollback via Appliance CLI must remain, serial:\n{help}"
+    );
+    let rolled = serial_cmd(&guest, "rollback\n", 60, |t| {
+        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
+            && t.to_ascii_lowercase().contains("reboot_required")
+    });
+    assert!(
+        rolled.contains("\"ok\": true") || rolled.contains("\"ok\":true"),
+        "Appliance CLI rollback must queue the previous bootc deployment, serial:\n{rolled}"
+    );
+    assert!(
+        !serial_tail(&rolled, 4000).contains("unknown command"),
+        "rollback must be an Appliance CLI command, serial:\n{rolled}"
+    );
+
+    let from_rb = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("explicit reboot after manual rollback");
+    let rb_boot = serial_wait(&guest, from_rb, 300, |t| {
+        let l = t.to_ascii_lowercase();
+        l.contains("linux version") || l.contains("fwos appliance cli")
+    });
+    assert!(
+        rb_boot.to_ascii_lowercase().contains("linux version")
+            || rb_boot.to_ascii_lowercase().contains("fwos appliance cli"),
+        "manual rollback reboot must restart the guest, serial:\n{rb_boot}"
+    );
+    serial_login_admin_from(&guest, "alice", "secret12", from_rb);
+    let back = serial_cmd(&guest, "status\n", 30, |t| {
+        t.contains("fwos-box")
+            && t.contains("fwd: yes")
+            && t.contains("netd: running")
+            && t.contains("booted:")
+    });
+    let back_booted = json_status_image(&back, "booted").unwrap_or_default();
+    assert!(
+        back.contains("booted:") && !back_booted.contains("fwos:next"),
+        "manual rollback must return the previous bootc deployment, serial:\n{back}"
+    );
+    if let Some(prev) = previous.as_deref() {
+        if !prev.is_empty() && !prev.contains("fwos:next") {
+            assert!(
+                back_booted.contains(prev) || back.contains(prev),
+                "manual rollback must boot {prev}, serial:\n{back}"
+            );
+        }
+    }
+    assert!(
+        back.contains("netd: running"),
+        "netd must be running after manual rollback, serial:\n{back}"
+    );
     assert_no_ssh(&guest, "after Host update reboot");
+}
+
+#[test]
+fn published_serial_rolls_back_host_update_when_netd_is_dead() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_dead_netd_release()
+        .expect("Workstation-local registry must serve a Release with dead netd");
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let image = registry.guest_image();
+
+    let payload = format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    );
+    https_bootstrap(&guest, &payload);
+    serial_login_admin(&guest, "alice", "secret12");
+
+    let prior = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains("fwos-box") && t.contains("netd: running")
+    });
+    let previous = json_status_image(&prior, "booted").unwrap_or_default();
+
+    let staged = serial_cmd(&guest, &format!("update {image}\n"), 1200, |t| {
+        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
+            && t.to_ascii_lowercase().contains("reboot_required")
+    });
+    assert!(
+        staged.contains("\"ok\": true") || staged.contains("\"ok\":true"),
+        "Appliance CLI must stage the dead-netd Release, serial:\n{staged}"
+    );
+
+    let from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("explicit Appliance CLI reboot onto the dead-netd deployment");
+    let rolled = serial_wait(&guest, from, 600, |t| {
+        t.to_ascii_lowercase().matches("linux version").count() >= 2
+    });
+    assert!(
+        rolled.to_ascii_lowercase().matches("linux version").count() >= 2,
+        "failed appliance health (dead netd) must reboot into the previous bootc deployment, serial:\n{rolled}"
+    );
+
+    let serial_now = guest.serial();
+    let login_from = serial_now
+        .to_ascii_lowercase()
+        .rfind("linux version")
+        .unwrap_or(from);
+    serial_login_admin_from(&guest, "alice", "secret12", login_from);
+    let deployed = serial_cmd(&guest, "status\n", 30, |t| {
+        t.contains("fwos-box")
+            && t.contains("fwd: yes")
+            && t.contains("mgmt: yes")
+            && t.contains("netd: running")
+    });
+    let booted = json_status_image(&deployed, "booted").unwrap_or_default();
+    assert!(
+        deployed.contains("booted:") && !booted.contains("fwos:next"),
+        "auto rollback must leave the previous bootc deployment booted, not the dead-netd Release, serial:\n{deployed}"
+    );
+    if !previous.is_empty() && !previous.contains("fwos:next") {
+        assert!(
+            booted.contains(&previous) || deployed.contains(&previous),
+            "rollback target must be the previously booted image {previous}, serial:\n{deployed}"
+        );
+    }
+    assert!(
+        deployed.contains("fwd: yes") && deployed.contains("mgmt: yes"),
+        "fwd and mgmt must exist after automatic rollback, serial:\n{deployed}"
+    );
+    assert!(
+        deployed.contains("netd: running"),
+        "netd must be running after automatic rollback, serial:\n{deployed}"
+    );
+
+    let mut ui_after = String::new();
+    for _ in 0..180 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                ui_after = body;
+                if ui_after.contains("\"bootstrapped\"") && ui_after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => ui_after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        ui_after.contains("\"bootstrapped\"") && ui_after.contains("true"),
+        "after automatic rollback, HTTPS UI must still serve status; got:\n{ui_after}; serial:\n{}",
+        guest.serial()
+    );
+    assert_no_ssh(&guest, "after automatic rollback");
 }
 
 fn https_bootstrap(guest: &Guest, payload: &str) {

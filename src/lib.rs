@@ -1802,10 +1802,19 @@ pub struct LocalRegistry {
 impl LocalRegistry {
     /// Build a newer Host image (one tag: Host image plus Built-in addons) and serve it over HTTP.
     pub fn publish_next_release() -> Result<Self, Error> {
+        Self::publish(false)
+    }
+
+    /// Same, but the newer Release has no netd — appliance health must roll it back.
+    pub fn publish_dead_netd_release() -> Result<Self, Error> {
+        Self::publish(true)
+    }
+
+    fn publish(dead_netd: bool) -> Result<Self, Error> {
         let image_dir = host_image_dir()?;
         let _parts = prepare_host_image_parts(&image_dir)?;
         build_host_container(&image_dir)?;
-        build_next_release()?;
+        build_next_release(dead_netd)?;
         let port = free_localhost_port()?;
         let container = format!("fwos-registry-{port}");
         start_registry(&container, port)?;
@@ -1834,13 +1843,19 @@ fn stop_registry(name: &str) {
         .status();
 }
 
-fn build_next_release() -> Result<(), Error> {
+fn build_next_release(dead_netd: bool) -> Result<(), Error> {
     let ctx = temp_work_dir("fwos-dev-next", "creating next Release context")?;
-    fs::write(
-        ctx.join("Containerfile"),
-        "FROM localhost/fwos:dev\nRUN printf 'next\\n' > /usr/lib/fwos/release && ostree container commit\n",
-    )
-    .map_err(|e| Error::from_io("writing next Release Containerfile", e))?;
+    let body = if dead_netd {
+        "FROM localhost/fwos:dev\n\
+         RUN rm -f /usr/share/containers/systemd/fwos-netd.container \\\n\
+         && ln -sfn /dev/null /etc/systemd/system/fwos-netd.service \\\n\
+         && printf 'next\\n' > /usr/lib/fwos/release \\\n\
+         && ostree container commit\n"
+    } else {
+        "FROM localhost/fwos:dev\nRUN printf 'next\\n' > /usr/lib/fwos/release && ostree container commit\n"
+    };
+    fs::write(ctx.join("Containerfile"), body)
+        .map_err(|e| Error::from_io("writing next Release Containerfile", e))?;
     let output = Command::new("sudo")
         .args(["podman", "build", "-t", NEXT_IMAGE_TAG, "-f"])
         .arg(ctx.join("Containerfile"))

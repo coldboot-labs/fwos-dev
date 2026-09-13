@@ -9,7 +9,7 @@ fwos-dev build            # injected-key Disk image (test seam, cached)
 fwos-dev build published  # Disk image with no SSH key and no password
 fwos-dev build installer  # Anaconda Installer ISO from the same Host image (UEFI, self-contained)
 fwos-dev run              # boot the injected-key Disk image under QEMU; SSH when the guest is up
-cargo test                # QEMU guests (injected-key SSH still used by older tests; published path is serial + HTTPS, including Host update stage then reboot)
+cargo test                # QEMU guests (injected-key SSH still used by older tests; published path is serial + HTTPS, including Host update stage, reboot, and automatic rollback on dead netd)
 ```
 
 SSH user on the injected-key disk is `fwos`. The published Disk image has no injected key and no default password; observe it on the Bootstrap console over serial, not Host-netns SSH. Disks are cached under `$XDG_CACHE_HOME/fwos-dev/fwos-host/` (or `~/.cache/fwos-dev/fwos-host/`). `build` and `cargo test` run `sudo podman`; the first image build can take several minutes.
