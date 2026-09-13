@@ -1399,10 +1399,93 @@ fn installer_asks_which_disk_when_more_than_one() {
     let serial = guest.serial();
     assert!(
         serial.contains("FWOS Installer: pick a disk to wipe"),
-        "more than one writable disk: only disk pick; serial:\n{serial}"
+        "several eligible disks: serial still asks which disk to wipe before the yes prompt; serial:\n{serial}"
+    );
+    assert!(
+        !serial.contains("Type yes to wipe"),
+        "picking a number is not the wipe; yes comes after a valid disk number; serial:\n{serial}"
     );
     assert!(
         !serial.contains("FWOS Bootstrap console"),
-        "Installer must not finish First install until a disk is chosen; serial:\n{serial}"
+        "two empty disks, no number entered: still no Bootstrap console; serial:\n{serial}"
     );
+}
+
+#[test]
+fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_installer_two_disks()
+        .expect("Installer with two writable disks must start under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Installer: pick a disk to wipe"),
+        "several eligible disks: serial asks which disk before yes; serial:\n{serial}"
+    );
+    assert!(
+        !serial.contains("Type yes to wipe"),
+        "yes must not appear before a valid disk number; serial:\n{serial}"
+    );
+
+    let after_bad = installer_serial_cmd(&guest, "nope\r\n", 30, |t| t.contains("Disk number:"));
+    assert!(
+        !after_bad.contains("Type yes to wipe") && !after_bad.contains("FWOS Bootstrap console"),
+        "non-numeric input does not select a disk or write; serial:\n{after_bad}"
+    );
+
+    let after_range = installer_serial_cmd(&guest, "9\r\n", 30, |t| t.contains("Disk number:"));
+    assert!(
+        !after_range.contains("Type yes to wipe")
+            && !after_range.contains("FWOS Bootstrap console"),
+        "out-of-range input does not select a disk or write; serial:\n{after_range}"
+    );
+
+    let after_pick = installer_serial_cmd(&guest, "1\r\n", 30, |t| t.contains("Type yes to wipe"));
+    assert!(
+        after_pick.contains("Type yes to wipe")
+            && after_pick.contains("FWOS Installer: /dev/")
+            && after_pick.contains(
+                "The entire disk will be erased and replaced with the Host disk layout"
+            ),
+        "after a valid disk number, serial shows that disk and waits for typed yes; serial:\n{after_pick}"
+    );
+    assert!(
+        !after_pick.contains("FWOS Bootstrap console"),
+        "typed yes is required after pick; serial:\n{after_pick}"
+    );
+
+    let after_decline = installer_serial_cmd(&guest, "n\r\n", 30, |t| {
+        t.contains("FWOS Installer: pick a disk to wipe")
+    });
+    assert!(
+        after_decline.contains("FWOS Installer: pick a disk to wipe"),
+        "decline after a pick returns to the disk flow so the operator can pick again; serial:\n{after_decline}"
+    );
+    assert!(
+        !after_decline.contains("FWOS Bootstrap console"),
+        "decline after a pick writes nothing; serial:\n{after_decline}"
+    );
+
+    let after_repick =
+        installer_serial_cmd(&guest, "2\r\n", 30, |t| t.contains("Type yes to wipe"));
+    assert!(
+        after_repick.contains("Type yes to wipe") && after_repick.contains("FWOS Installer: /dev/"),
+        "after decline the operator can pick again and still waits for typed yes; serial:\n{after_repick}"
+    );
+    assert!(
+        !after_repick.contains("FWOS Bootstrap console"),
+        "a second pick is still not the wipe; serial:\n{after_repick}"
+    );
+}
+
+fn installer_serial_cmd(
+    guest: &Guest,
+    data: &str,
+    secs: u64,
+    pred: impl Fn(&str) -> bool,
+) -> String {
+    let from = guest.serial().len();
+    guest
+        .serial_write(data)
+        .unwrap_or_else(|e| panic!("Installer serial {data:?}: {e}"));
+    serial_wait(guest, from, secs, pred)
 }
