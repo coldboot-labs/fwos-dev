@@ -340,7 +340,8 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         last.contains("FWOS Appliance CLI"),
         "after Bootstrap, serial must be the admin Appliance CLI, not the Bootstrap console; serial:\n{last}"
     );
-    let tail = serial_tail(&last, 4000).to_ascii_lowercase();
+    let after_switch = last.rsplit("Bootstrap complete.").next().unwrap_or(&last);
+    let tail = serial_tail(after_switch, 4000).to_ascii_lowercase();
     assert!(
         !tail.contains("fwos bootstrap console")
             && !tail.contains("ephemeral")
@@ -402,8 +403,9 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         st_tail.contains("fwos-box"),
         "Appliance CLI status must show the hostname, serial:\n{status_cli}"
     );
+    let after_login = status_cli.rsplit("password:").next().unwrap_or(&status_cli);
     assert!(
-        !serial_tail(&status_cli, 2000).contains("FWOS Bootstrap console"),
+        !after_login.contains("FWOS Bootstrap console"),
         "status must not be the Bootstrap console, serial:\n{status_cli}"
     );
 
@@ -426,7 +428,10 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         .expect("probe ephemeral addressing");
     std::thread::sleep(std::time::Duration::from_secs(2));
     let after_static = guest.serial();
-    let static_tail = serial_tail(&after_static, 2000);
+    let static_tail = after_static
+        .rsplit("password:")
+        .next()
+        .unwrap_or(&after_static);
     assert!(
         static_tail.contains("unknown command"),
         "admin CLI must not offer first-boot ephemeral addressing, serial:\n{after_static}"
@@ -652,12 +657,10 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         .serial_write("reboot\n")
         .expect("explicit Appliance CLI reboot after stage");
     let rebooted = serial_wait(&guest, from, 300, |t| {
-        let l = t.to_ascii_lowercase();
-        l.contains("linux version") || l.contains("fwos appliance cli")
+        t.to_ascii_lowercase().contains("fwos appliance cli")
     });
-    let rebooted_l = rebooted.to_ascii_lowercase();
     assert!(
-        rebooted_l.contains("linux version") || rebooted_l.contains("fwos appliance cli"),
+        rebooted.to_ascii_lowercase().contains("fwos appliance cli"),
         "operator reboot on serial must restart the guest onto the staged bootc deployment, serial:\n{rebooted}"
     );
     assert!(
@@ -792,12 +795,10 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         .serial_write("reboot\n")
         .expect("explicit reboot after manual rollback");
     let rb_boot = serial_wait(&guest, from_rb, 300, |t| {
-        let l = t.to_ascii_lowercase();
-        l.contains("linux version") || l.contains("fwos appliance cli")
+        t.to_ascii_lowercase().contains("fwos appliance cli")
     });
     assert!(
-        rb_boot.to_ascii_lowercase().contains("linux version")
-            || rb_boot.to_ascii_lowercase().contains("fwos appliance cli"),
+        rb_boot.to_ascii_lowercase().contains("fwos appliance cli"),
         "manual rollback reboot must restart the guest, serial:\n{rb_boot}"
     );
     serial_login_admin_from(&guest, "alice", "secret12", from_rb);
@@ -867,17 +868,17 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
         .serial_write("reboot\n")
         .expect("explicit Appliance CLI reboot onto the dead-netd deployment");
     let rolled = serial_wait(&guest, from, 600, |t| {
-        t.to_ascii_lowercase().matches("linux version").count() >= 2
+        t.to_ascii_lowercase().matches("fwos appliance cli").count() >= 2
     });
     assert!(
-        rolled.to_ascii_lowercase().matches("linux version").count() >= 2,
+        rolled.to_ascii_lowercase().matches("fwos appliance cli").count() >= 2,
         "failed appliance health (dead netd) must reboot into the previous bootc deployment, serial:\n{rolled}"
     );
 
     let serial_now = guest.serial();
     let login_from = serial_now
         .to_ascii_lowercase()
-        .rfind("linux version")
+        .rfind("fwos appliance cli")
         .unwrap_or(from);
     serial_login_admin_from(&guest, "alice", "secret12", login_from);
     let deployed = serial_cmd(&guest, "status\n", 30, |t| {

@@ -4,9 +4,24 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+
+static PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Phase lines on stderr for `fwos-dev build` / `run`. Tests stay quiet.
+pub fn enable_progress() {
+    PROGRESS.store(true, Ordering::Relaxed);
+}
+
+fn progress(msg: &str) {
+    if PROGRESS.load(Ordering::Relaxed) {
+        let _ = writeln!(io::stderr(), "fwos-dev: {msg}");
+        let _ = io::stderr().flush();
+    }
+}
 
 const FEDORA_BOOTC: &str = "quay.io/fedora/fedora-bootc:44";
 const HOST_IMAGE_TAG: &str = "localhost/fwos:dev";
@@ -304,6 +319,7 @@ impl Guest {
     }
 
     fn wait_for_serial_timeout(&mut self, needle: &str, wait: Duration) -> Result<(), Error> {
+        progress("waiting for Appliance CLI");
         let deadline = Instant::now() + wait;
         loop {
             if let Some(status) = self
@@ -478,6 +494,7 @@ struct HostImageParts {
 
 fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
     let src = src_dir()?;
+    progress("building host programs");
     let binary = build_host_program(&src)?;
     build_host_program_image(&src, &binary)?;
     let netd = src.join("target/release/netd");
@@ -488,6 +505,7 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         )));
     }
     let addons = builtin_addons_dir()?;
+    progress("building Built-in addons");
     build_netd_image(&addons, &netd)?;
     let cli = src.join("target/release/fwos");
     if !cli.is_file() {
@@ -801,6 +819,7 @@ fn newest_mtime(path: &Path) -> Result<std::time::SystemTime, Error> {
 }
 
 fn build_host_container(image_dir: &Path) -> Result<(), Error> {
+    progress("building Host image");
     pull_image(FEDORA_BOOTC)?;
     let output = Command::new("sudo")
         .args(["podman", "build", "--pull=missing", "-t", HOST_IMAGE_TAG])
@@ -835,6 +854,7 @@ fn image_builder_dirs(artifact: &Path) -> Result<(PathBuf, PathBuf), Error> {
 }
 
 fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Error> {
+    progress("writing Disk image");
     let (out_dir, config_dir) = image_builder_dirs(disk)?;
     let config_path = config_dir.join("config.toml");
     let bib = image_dir.join("bib.toml");
@@ -861,6 +881,7 @@ fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Err
 }
 
 fn build_anaconda_iso(iso: &Path, image_dir: &Path) -> Result<(), Error> {
+    progress("writing Installer ISO");
     let installer_toml = image_dir.join("installer.toml");
     if !installer_toml.is_file() {
         return Err(Error::from_message(format!(
@@ -1122,6 +1143,7 @@ fn free_localhost_port() -> Result<u16, Error> {
 }
 
 fn spawn_guest(opts: QemuStart<'_>) -> Result<Guest, Error> {
+    progress("starting QEMU");
     let mut child = start_qemu(opts)?;
     let serial = match connect_serial(opts.serial_sock, opts.serial_log) {
         Ok(s) => s,

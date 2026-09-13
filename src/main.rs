@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    fwos_dev::enable_progress();
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("build") => match args.next().as_deref() {
