@@ -1330,6 +1330,68 @@ fn installer_writes_host_image_onto_empty_disk() {
 }
 
 #[test]
+fn installer_one_disk_without_yes_never_reaches_bootstrap() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_installer_one_disk()
+        .expect("Installer with one writable disk must start under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("The entire disk will be erased and replaced with the Host disk layout"),
+        "one writable disk: name the target and explain the wipe before any write; serial:\n{serial}"
+    );
+    assert!(
+        serial.contains("FWOS Installer: /dev/") && serial.contains("("),
+        "one writable disk: serial must name the target device and size; serial:\n{serial}"
+    );
+    assert!(
+        !serial.contains("FWOS Bootstrap console"),
+        "without yes, the one-disk Installer must not finish First install; serial:\n{serial}"
+    );
+
+    let yes_prompts = serial.matches("Type yes to wipe").count();
+    guest
+        .serial_write("y\n")
+        .expect("y on the Installer serial must be a decline");
+    let mut after_y = serial;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        after_y = guest.serial();
+        if after_y.matches("Type yes to wipe").count() > yes_prompts {
+            break;
+        }
+    }
+    assert!(
+        after_y.matches("Type yes to wipe").count() > yes_prompts,
+        "y must not wipe; the operator stays on the approval prompt; serial:\n{after_y}"
+    );
+    assert!(
+        !after_y.contains("FWOS Bootstrap console"),
+        "y must not complete First install; serial:\n{after_y}"
+    );
+
+    let yes_prompts = after_y.matches("Type yes to wipe").count();
+    guest
+        .serial_write("\n")
+        .expect("empty Enter on the Installer serial must be a decline");
+    let mut after_enter = after_y;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        after_enter = guest.serial();
+        if after_enter.matches("Type yes to wipe").count() > yes_prompts {
+            break;
+        }
+    }
+    assert!(
+        after_enter.matches("Type yes to wipe").count() > yes_prompts,
+        "empty Enter must not wipe; the operator stays on the approval prompt; serial:\n{after_enter}"
+    );
+    assert!(
+        !after_enter.contains("FWOS Bootstrap console"),
+        "without yes, QEMU one-disk Installer never reaches the Bootstrap console; serial:\n{after_enter}"
+    );
+}
+
+#[test]
 fn installer_asks_which_disk_when_more_than_one() {
     let _guard = guest_lock();
     let guest = Guest::boot_installer_two_disks()

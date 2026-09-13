@@ -41,6 +41,8 @@ const QEMU_MEMORY_MIB: &str = "4096";
 const OVMF_CODE: &str = "/usr/share/edk2/ovmf/OVMF_CODE.fd";
 const SERIAL_BOOTSTRAP: &str = "FWOS Bootstrap console";
 const INSTALLER_DISK_PROMPT: &str = "FWOS Installer: pick a disk to wipe";
+const INSTALLER_WIPE_PROMPT: &str =
+    "The entire disk will be erased and replaced with the Host disk layout";
 const EMPTY_DISK_SIZE: &str = "10G";
 const MIN_INSTALLED_DISK: u64 = 64 * 1024 * 1024;
 
@@ -120,25 +122,36 @@ impl Guest {
         Self::boot_disk(&disk_path, 0)
     }
 
+    /// Boot the Installer ISO against one empty virt disk and wait for wipe approval.
+    pub fn boot_installer_one_disk() -> Result<Self, Error> {
+        Self::boot_installer(1, INSTALLER_WIPE_PROMPT)
+    }
+
     /// Boot the Installer ISO with two empty virt disks and wait for the disk pick.
     pub fn boot_installer_two_disks() -> Result<Self, Error> {
+        Self::boot_installer(2, INSTALLER_DISK_PROMPT)
+    }
+
+    fn boot_installer(n_disks: usize, needle: &str) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let iso = build_installer_iso()?;
         let work = instance_dir()?;
-        let disk1 = work.join("disk1.qcow2");
-        let disk2 = work.join("disk2.qcow2");
-        create_empty_qcow2(&disk1)?;
-        create_empty_qcow2(&disk2)?;
+        let mut disks = Vec::new();
+        for i in 0..n_disks {
+            let path = work.join(format!("disk{}.qcow2", i + 1));
+            create_empty_qcow2(&path)?;
+            disks.push(path);
+        }
         let linux = extract_iso_linux(&iso, &work)?;
         let port = free_localhost_port()?;
         let https_port = free_localhost_port()?;
         let serial_log = work.join("serial.log");
         let serial_sock = work.join("serial.sock");
         let monitor = work.join("monitor.sock");
-        let extra = [disk2.as_path()];
+        let extra: Vec<&Path> = disks.iter().skip(1).map(|p| p.as_path()).collect();
         let mut guest = spawn_guest(QemuStart {
-            boot_disk: &disk1,
+            boot_disk: &disks[0],
             extra_disks: &extra,
             cdrom: Some(&iso),
             linux: Some(&linux),
@@ -150,7 +163,7 @@ impl Guest {
             monitor: &monitor,
             no_reboot: false,
         })?;
-        let ready = guest.wait_for_serial_timeout(INSTALLER_DISK_PROMPT, INSTALLER_PROMPT_WAIT);
+        let ready = guest.wait_for_serial_timeout(needle, INSTALLER_PROMPT_WAIT);
         guest.wait_or_stop(ready)?;
         Ok(guest)
     }
@@ -1327,14 +1340,14 @@ fn install_host_image_disk() -> Result<PathBuf, Error> {
     {
         return Ok(disk);
     }
-    if let Err(err) = run_unattended_install(&iso, &disk) {
+    if let Err(err) = run_iso_install(&iso, &disk) {
         let _ = fs::remove_file(&disk);
         return Err(err);
     }
     Ok(disk)
 }
 
-fn run_unattended_install(iso: &Path, disk: &Path) -> Result<(), Error> {
+fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
     ensure_kvm_usable()?;
     ensure_ovmf()?;
     create_empty_qcow2(disk)?;
@@ -1358,7 +1371,7 @@ fn run_unattended_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         monitor: &monitor,
         no_reboot: true,
     })?;
-    let _serial = match connect_serial(&serial_sock, &serial_log) {
+    let mut serial = match connect_serial(&serial_sock, &serial_log) {
         Ok(s) => s,
         Err(err) => {
             let _ = child.kill();
@@ -1367,6 +1380,40 @@ fn run_unattended_install(iso: &Path, disk: &Path) -> Result<(), Error> {
             return Err(err);
         }
     };
+    progress("waiting for Installer wipe approval");
+    let prompt_deadline = Instant::now() + INSTALLER_PROMPT_WAIT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| Error::from_io("waiting for installer QEMU", e))?
+        {
+            let serial = read_serial_all(&serial_log);
+            let _ = fs::remove_dir_all(&work);
+            return Err(Error::from_message(format!(
+                "QEMU exited before Installer wipe approval (status {status}). serial log:\n{serial}"
+            )));
+        }
+        let log = read_serial_all(&serial_log);
+        if log.contains(INSTALLER_WIPE_PROMPT) && log.contains("Type yes to wipe") {
+            break;
+        }
+        if Instant::now() >= prompt_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&work);
+            return Err(Error::from_message(format!(
+                "Installer wipe approval did not appear within {}s. serial log:\n{log}",
+                INSTALLER_PROMPT_WAIT.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    serial
+        .write_all(b"yes\r\n")
+        .map_err(|e| Error::from_io("writing Installer yes", e))?;
+    serial
+        .flush()
+        .map_err(|e| Error::from_io("flushing Installer yes", e))?;
     let deadline = Instant::now() + INSTALL_WAIT;
     let status = loop {
         if let Some(status) = child
