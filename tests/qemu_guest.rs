@@ -1310,20 +1310,6 @@ fn opt_user_net(guest: &Guest) -> String {
     );
 }
 
-#[allow(dead_code)]
-fn serial_ethernet_name(serial: &str) -> Option<String> {
-    serial
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_'))
-        .find(|tok| {
-            let nic = tok.starts_with("enp")
-                || tok.starts_with("ens")
-                || tok.starts_with("eno")
-                || tok.starts_with("eth");
-            nic && tok.chars().any(|c| c.is_ascii_digit())
-        })
-        .map(str::to_string)
-}
-
 #[test]
 fn published_console_opt_survives_reboot_before_bootstrap() {
     let _guard = guest_lock();
@@ -1430,6 +1416,28 @@ fn published_console_can_replace_opt() {
         &guest,
         20,
         "after replacing the opt, the old user-net overlay must be gone",
+    );
+    let mut extra_page = String::new();
+    let mut extra_err = String::from("(no GET)");
+    for _ in 0..30 {
+        match guest.https_get_extra("/") {
+            Ok(body) => {
+                extra_page = body;
+                if extra_page.to_ascii_lowercase().contains("hostname")
+                    || extra_page.to_ascii_lowercase().contains("html")
+                {
+                    break;
+                }
+            }
+            Err(e) => extra_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        extra_page.to_ascii_lowercase().contains("hostname")
+            || extra_page.to_ascii_lowercase().contains("html"),
+        "after replacing the opt, the extra NIC must answer HTTPS, last={extra_err}; body:\n{extra_page}; serial:\n{}",
+        guest.serial()
     );
 }
 

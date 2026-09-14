@@ -61,6 +61,7 @@ struct QemuStart<'a> {
     extra_nics: u8,
     port_22: u16,
     https_port: u16,
+    extra_https_port: Option<u16>,
     serial_log: &'a Path,
     serial_sock: &'a Path,
     monitor: &'a Path,
@@ -72,6 +73,7 @@ pub struct Guest {
     child: Child,
     port_22: u16,
     https_port: u16,
+    extra_https_port: Option<u16>,
     serial_log: PathBuf,
     serial: Mutex<UnixStream>,
     monitor: PathBuf,
@@ -159,6 +161,7 @@ impl Guest {
             extra_nics: 0,
             port_22: port,
             https_port,
+            extra_https_port: None,
             serial_log: &serial_log,
             serial_sock: &serial_sock,
             monitor: &monitor,
@@ -174,6 +177,11 @@ impl Guest {
         ensure_ovmf()?;
         let port = free_localhost_port()?;
         let https_port = free_localhost_port()?;
+        let extra_https_port = if extra_nics > 0 {
+            Some(free_localhost_port()?)
+        } else {
+            None
+        };
         let work = instance_dir()?;
         let overlay = work.join("overlay.qcow2");
         let serial_log = work.join("serial.log");
@@ -188,6 +196,7 @@ impl Guest {
             extra_nics,
             port_22: port,
             https_port,
+            extra_https_port,
             serial_log: &serial_log,
             serial_sock: &serial_sock,
             monitor: &monitor,
@@ -246,6 +255,23 @@ impl Guest {
         self.https_ok("POST", path, Some(body), 90)
     }
 
+    /// GET `path` on the extra virtio-net (10.0.3.15) over HTTPS.
+    pub fn https_get_extra(&self, path: &str) -> Result<String, Error> {
+        let port = self.extra_https_port.ok_or_else(|| {
+            Error::from_message("guest has no extra NIC HTTPS hostfwd")
+        })?;
+        let url = format!("https://10.0.3.15{path}");
+        let (code, body) = self.https_exchange_at("10.0.3.15", port, "GET", path, None, 8)?;
+        if code == 200 {
+            Ok(body)
+        } else {
+            Err(Error::from_message(format!(
+                "curl GET {url} http_code={code}: {}",
+                body.trim()
+            )))
+        }
+    }
+
     /// HTTPS from the Workstation; returns status and body for any complete HTTP response.
     pub fn https_exchange(
         &self,
@@ -254,8 +280,20 @@ impl Guest {
         body: Option<&str>,
         max_time_secs: u64,
     ) -> Result<(u16, String), Error> {
-        let url = format!("https://10.0.2.15{path}");
-        let connect = format!("10.0.2.15:443:127.0.0.1:{}", self.https_port);
+        self.https_exchange_at("10.0.2.15", self.https_port, method, path, body, max_time_secs)
+    }
+
+    fn https_exchange_at(
+        &self,
+        guest_ip: &str,
+        host_port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<(u16, String), Error> {
+        let url = format!("https://{guest_ip}{path}");
+        let connect = format!("{guest_ip}:443:127.0.0.1:{host_port}");
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sk",
@@ -1205,6 +1243,7 @@ fn spawn_guest(opts: QemuStart<'_>) -> Result<Guest, Error> {
         child,
         port_22: opts.port_22,
         https_port: opts.https_port,
+        extra_https_port: opts.extra_https_port,
         serial_log: opts.serial_log.to_path_buf(),
         serial: Mutex::new(serial),
         monitor: opts.monitor.to_path_buf(),
@@ -1263,7 +1302,13 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
     for i in 0..opts.extra_nics {
         let id = format!("net{}", i + 1);
         let net = format!("10.0.{}.0/24", i + 3);
-        cmd.args(["-netdev", &format!("user,id={id},net={net}")])
+        let mut netdev = format!("user,id={id},net={net}");
+        if i == 0 {
+            if let Some(port) = opts.extra_https_port {
+                netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
+            }
+        }
+        cmd.args(["-netdev", &netdev])
             .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
     }
     let child = cmd
@@ -1402,6 +1447,7 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         extra_nics: 0,
         port_22: port,
         https_port,
+        extra_https_port: None,
         serial_log: &serial_log,
         serial_sock: &serial_sock,
         monitor: &monitor,
