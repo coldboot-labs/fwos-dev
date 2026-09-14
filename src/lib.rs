@@ -74,6 +74,7 @@ pub struct Guest {
     https_port: u16,
     serial_log: PathBuf,
     serial: Mutex<UnixStream>,
+    monitor: PathBuf,
 }
 
 #[derive(Debug)]
@@ -204,6 +205,20 @@ impl Guest {
     /// Serial console log (how a published guest is observed).
     pub fn serial(&self) -> String {
         read_serial_all(&self.serial_log)
+    }
+
+    /// Reset the virtual machine (QEMU `system_reset`), keeping the same disk.
+    pub fn qemu_system_reset(&self) -> Result<(), Error> {
+        let mut stream = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        stream
+            .write_all(b"system_reset\n")
+            .map_err(|e| Error::from_io("QEMU system_reset", e))?;
+        stream
+            .flush()
+            .map_err(|e| Error::from_io("flushing QEMU monitor", e))?;
+        Ok(())
     }
 
     /// Write bytes to the guest serial console.
@@ -860,6 +875,12 @@ fn image_builder_dirs(artifact: &Path) -> Result<(PathBuf, PathBuf), Error> {
             .map_err(|e| Error::from_io("clearing image-builder output", e))?;
     }
     fs::create_dir_all(&out_dir).map_err(|e| Error::from_io("creating image-builder output", e))?;
+    // osbuild export writes /output/<type>/; create it so a late umount race
+    // still has a dest directory.
+    fs::create_dir_all(out_dir.join("qcow2"))
+        .map_err(|e| Error::from_io("creating image-builder qcow2 dest", e))?;
+    fs::create_dir_all(out_dir.join("anaconda-iso"))
+        .map_err(|e| Error::from_io("creating image-builder iso dest", e))?;
     let config_dir = parent.join("bib-config");
     fs::create_dir_all(&config_dir)
         .map_err(|e| Error::from_io("creating image-builder config dir", e))?;
@@ -868,8 +889,6 @@ fn image_builder_dirs(artifact: &Path) -> Result<(PathBuf, PathBuf), Error> {
 
 fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Error> {
     progress("writing Disk image");
-    let (out_dir, config_dir) = image_builder_dirs(disk)?;
-    let config_path = config_dir.join("config.toml");
     let bib = image_dir.join("bib.toml");
     if !bib.is_file() {
         return Err(Error::from_message(
@@ -878,19 +897,35 @@ fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Err
     }
     let config =
         fs::read_to_string(&bib).map_err(|e| Error::from_io("reading published bib.toml", e))?;
-    fs::write(&config_path, config)
-        .map_err(|e| Error::from_io("writing image-builder config", e))?;
-
-    run_image_builder(&config_path, &out_dir, image_ref, false, "qcow2", None)?;
-    let produced = out_dir.join("qcow2").join("disk.qcow2");
-    if !produced.exists() {
-        return Err(Error::from_message(format!(
-            "image-builder succeeded but {} is missing",
-            produced.display()
-        )));
+    let mut last_err = None;
+    for attempt in 1..=2 {
+        let (out_dir, config_dir) = image_builder_dirs(disk)?;
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, &config)
+            .map_err(|e| Error::from_io("writing image-builder config", e))?;
+        match run_image_builder(&config_path, &out_dir, image_ref, false, "qcow2", None) {
+            Ok(()) => {
+                let produced = out_dir.join("qcow2").join("disk.qcow2");
+                if !produced.exists() {
+                    last_err = Some(Error::from_message(format!(
+                        "image-builder succeeded but {} is missing",
+                        produced.display()
+                    )));
+                    continue;
+                }
+                fs::rename(&produced, disk)
+                    .map_err(|e| Error::from_io("moving qcow2 into cache", e))?;
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                if attempt == 1 {
+                    progress("image-builder failed; retrying Disk image write");
+                }
+            }
+        }
     }
-    fs::rename(&produced, disk).map_err(|e| Error::from_io("moving qcow2 into cache", e))?;
-    Ok(())
+    Err(last_err.unwrap_or_else(|| Error::from_message("image-builder failed")))
 }
 
 fn build_anaconda_iso(iso: &Path, image_dir: &Path) -> Result<(), Error> {
@@ -1172,6 +1207,7 @@ fn spawn_guest(opts: QemuStart<'_>) -> Result<Guest, Error> {
         https_port: opts.https_port,
         serial_log: opts.serial_log.to_path_buf(),
         serial: Mutex::new(serial),
+        monitor: opts.monitor.to_path_buf(),
     })
 }
 

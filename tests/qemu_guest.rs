@@ -52,6 +52,17 @@ fn published_guest_serial_and_https_without_ssh() {
         "serial write must reach the Bootstrap console; serial:\n{last}"
     );
 
+    let nics = wait_console_nics(&guest);
+    for (name, addrs) in &nics {
+        assert!(
+            !addrs.contains("10.0.2."),
+            "un-opted NICs must not run DHCP or SLAAC/RA; {name} has {addrs}; serial:\n{}",
+            guest.serial()
+        );
+    }
+    https_must_not_answer(&guest, 15, "before a console opt");
+    opt_user_net(&guest);
+
     let mut page = String::new();
     let mut err = String::from("(no GET)");
     for _ in 0..90 {
@@ -136,9 +147,16 @@ fn published_guest_bootstrap_console_on_serial() {
         lower.contains("bootstrap"),
         "first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let nic = serial_ethernet_name(&serial).unwrap_or_else(|| {
-        panic!("Bootstrap console must list Host-netns NICs, serial:\n{serial}")
-    });
+    let nic = wait_console_nics(&guest)
+        .into_iter()
+        .next()
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| {
+            panic!(
+                "Bootstrap console must list Traffic NICs, serial:\n{}",
+                guest.serial()
+            )
+        });
 
     guest
         .serial_write(&format!("static {nic} 192.168.200.50/24\n"))
@@ -194,7 +212,8 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     );
     assert_no_ssh(&guest, "before Bootstrap");
 
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let mgmt_nic = opt_user_net(&guest);
+    let traffic_nic = other_console_nic(&guest, &mgmt_nic);
     let mut page = String::new();
     let mut err = String::from("(no GET)");
     for _ in 0..90 {
@@ -454,7 +473,7 @@ fn published_serial_cli_applies_full_desired_state() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
     let payload = format!(
         r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
     );
@@ -534,7 +553,7 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
     let image = registry.guest_image();
 
     let refused = serial_cmd(&guest, &format!("update {image}\n"), 30, |t| {
@@ -840,7 +859,7 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic(&serial);
+    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
     let image = registry.guest_image();
 
     let payload = format!(
@@ -929,6 +948,7 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
 }
 
 fn https_bootstrap(guest: &Guest, payload: &str) {
+    opt_user_net(guest);
     let mut page = String::new();
     let mut err = String::from("(no GET)");
     for _ in 0..90 {
@@ -1187,7 +1207,7 @@ fn published_mgmt_and_traffic(serial: &str) -> (String, String) {
     let nics = console_nics(serial);
     assert!(
         nics.len() >= 2,
-        "published two-NIC guest must list two Host-netns NICs on the Bootstrap console, serial:\n{serial}"
+        "published two-NIC guest must list two Traffic NICs on the Bootstrap console, serial:\n{serial}"
     );
     let mgmt = nics
         .iter()
@@ -1202,6 +1222,95 @@ fn published_mgmt_and_traffic(serial: &str) -> (String, String) {
     (mgmt, traffic)
 }
 
+fn published_mgmt_and_traffic_after_opt(guest: &Guest) -> (String, String) {
+    opt_user_net(guest);
+    published_mgmt_and_traffic(&guest.serial())
+}
+
+fn wait_console_nics(guest: &Guest) -> Vec<(String, String)> {
+    let mut last = String::new();
+    for _ in 0..90 {
+        last = guest.serial();
+        let nics = console_nics(&last);
+        if !nics.is_empty() {
+            return nics;
+        }
+        let _ = guest.serial_write("status\n");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!("Bootstrap console must list Traffic NICs, serial:\n{last}");
+}
+
+fn other_console_nic(guest: &Guest, used: &str) -> String {
+    wait_console_nics(guest)
+        .into_iter()
+        .find(|(n, _)| n != used)
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| {
+            panic!(
+                "published two-NIC guest must list another Traffic NIC besides {used}, serial:\n{}",
+                guest.serial()
+            )
+        })
+}
+
+fn console_opt_static(guest: &Guest, nic: &str, cidr: &str) {
+    let ip = cidr.split('/').next().unwrap_or(cidr);
+    guest
+        .serial_write(&format!("static {nic} {cidr}\n"))
+        .expect("set ephemeral addressing on serial");
+    let mut last = String::new();
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+        if last.contains(ip) {
+            return;
+        }
+    }
+    panic!("console static {nic} {cidr} did not take, serial:\n{last}");
+}
+
+fn https_must_not_answer(guest: &Guest, secs: u64, when: &str) {
+    for _ in 0..secs {
+        match guest.https_exchange("GET", "/", None, 3) {
+            Ok((code, body)) if code != 0 => panic!(
+                "{when}: HTTPS must not answer (http_code={code}); body:\n{body}; serial:\n{}",
+                guest.serial()
+            ),
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn https_up(guest: &Guest) -> bool {
+    matches!(guest.https_exchange("GET", "/", None, 3), Ok((code, _)) if code != 0)
+}
+
+fn opt_user_net(guest: &Guest) -> String {
+    let nics = wait_console_nics(guest);
+    if https_up(guest) {
+        if let Some((name, _)) = nics.iter().find(|(_, a)| a.contains("10.0.2.")) {
+            return name.clone();
+        }
+        return nics[0].0.clone();
+    }
+    for (name, _) in &nics {
+        console_opt_static(guest, name, "10.0.2.15/24");
+        for _ in 0..20 {
+            if https_up(guest) {
+                return name.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    panic!(
+        "console static 10.0.2.15/24 on a Traffic NIC must make the HTTPS wizard reachable; serial:\n{}",
+        guest.serial()
+    );
+}
+
+#[allow(dead_code)]
 fn serial_ethernet_name(serial: &str) -> Option<String> {
     serial
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_'))
@@ -1216,6 +1325,115 @@ fn serial_ethernet_name(serial: &str) -> Option<String> {
 }
 
 #[test]
+fn published_console_opt_survives_reboot_before_bootstrap() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image()
+        .expect("published Disk image guest must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    opt_user_net(&guest);
+    let mut page = String::new();
+    for _ in 0..30 {
+        if let Ok(body) = guest.https_get("/") {
+            page = body;
+            if page.to_ascii_lowercase().contains("hostname") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        page.to_ascii_lowercase().contains("hostname"),
+        "HTTPS wizard must answer after the console opt; serial:\n{}",
+        guest.serial()
+    );
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("QEMU must reset the published guest");
+    let mut last = String::new();
+    for _ in 0..240 {
+        last = guest.serial();
+        let new = if last.len() > from { &last[from..] } else { "" };
+        if new.contains("FWOS Bootstrap console") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let new = if last.len() > from { &last[from..] } else { last.as_str() };
+    assert!(
+        new.contains("FWOS Bootstrap console"),
+        "reboot before Bootstrap must return to the Bootstrap console; serial:\n{last}"
+    );
+    assert!(
+        !serial_tail(new, 4000).contains("FWOS Appliance CLI")
+            || serial_tail(new, 4000).contains("FWOS Bootstrap console"),
+        "reboot before Bootstrap is not the admin Appliance CLI; serial:\n{last}"
+    );
+
+    let mut after = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                after = body;
+                if after.to_ascii_lowercase().contains("hostname") {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        after.to_ascii_lowercase().contains("hostname"),
+        "console opt must persist across reboot until Bootstrap, last={err}; body:\n{after}; serial:\n{}",
+        guest.serial()
+    );
+}
+
+#[test]
+fn published_console_can_replace_opt() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let user = opt_user_net(&guest);
+    let extra = other_console_nic(&guest, &user);
+    let mut page = String::new();
+    for _ in 0..30 {
+        if let Ok(body) = guest.https_get("/") {
+            page = body;
+            if page.to_ascii_lowercase().contains("html") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        page.to_ascii_lowercase().contains("html") || page.to_ascii_lowercase().contains("hostname"),
+        "HTTPS must answer on the opted user-net NIC; serial:\n{}",
+        guest.serial()
+    );
+
+    console_opt_static(&guest, &extra, "10.0.3.15/24");
+    https_must_not_answer(
+        &guest,
+        20,
+        "after replacing the opt, the old user-net overlay must be gone",
+    );
+}
+
+#[test]
 fn published_stick_serial_and_https_without_ssh() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image()
@@ -1226,9 +1444,7 @@ fn published_stick_serial_and_https_without_ssh() {
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
     assert_no_ssh(&guest, "before stick Bootstrap");
-    let nic = serial_ethernet_name(&serial).unwrap_or_else(|| {
-        panic!("Bootstrap console must list the Host-netns NIC, serial:\n{serial}")
-    });
+    let nic = opt_user_net(&guest);
     let payload = format!(
         r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{nic}","placement":"fwd","role":"stick"}},{{"name":"{nic}.10","placement":"fwd","role":"wan","parent":"{nic}","vlan":10,"addresses":["192.0.2.1/24"]}},{{"name":"{nic}.20","placement":"fwd","role":"lan","parent":"{nic}","vlan":20,"addresses":["192.168.1.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
     );
@@ -1305,6 +1521,9 @@ fn installer_writes_host_image_onto_empty_disk() {
         !lower.contains("login:"),
         "Appliance CLI owns serial after First install; serial:\n{serial}"
     );
+
+    https_must_not_answer(&guest, 10, "after First install, before a console opt");
+    opt_user_net(&guest);
 
     let mut page = String::new();
     let mut err = String::from("(no GET)");
