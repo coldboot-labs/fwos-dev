@@ -61,6 +61,7 @@ struct QemuStart<'a> {
     extra_nics: u8,
     port_22: u16,
     https_port: u16,
+    extra_https_port: Option<u16>,
     serial_log: &'a Path,
     serial_sock: &'a Path,
     monitor: &'a Path,
@@ -72,8 +73,10 @@ pub struct Guest {
     child: Child,
     port_22: u16,
     https_port: u16,
+    extra_https_port: Option<u16>,
     serial_log: PathBuf,
     serial: Mutex<UnixStream>,
+    monitor: PathBuf,
 }
 
 #[derive(Debug)]
@@ -110,10 +113,16 @@ impl Guest {
         Self::boot_disk(&disk_path, 0)
     }
 
-    /// Same Disk image with a second virtio-net (Management NIC + Traffic NIC).
+    /// Same Disk image with a second virtio-net (WAN + LAN Traffic NICs).
     pub fn boot_published_host_image_two_nics() -> Result<Self, Error> {
         let disk_path = build_published_host_image_disk()?;
         Self::boot_disk(&disk_path, 1)
+    }
+
+    /// Same Disk image with two extra virtio-nets (WAN, LAN, Management NIC).
+    pub fn boot_published_host_image_three_nics() -> Result<Self, Error> {
+        let disk_path = build_published_host_image_disk()?;
+        Self::boot_disk(&disk_path, 2)
     }
 
     /// Boot the Installer ISO against an empty virt disk, then observe the installed guest.
@@ -158,6 +167,7 @@ impl Guest {
             extra_nics: 0,
             port_22: port,
             https_port,
+            extra_https_port: None,
             serial_log: &serial_log,
             serial_sock: &serial_sock,
             monitor: &monitor,
@@ -173,6 +183,11 @@ impl Guest {
         ensure_ovmf()?;
         let port = free_localhost_port()?;
         let https_port = free_localhost_port()?;
+        let extra_https_port = if extra_nics > 0 {
+            Some(free_localhost_port()?)
+        } else {
+            None
+        };
         let work = instance_dir()?;
         let overlay = work.join("overlay.qcow2");
         let serial_log = work.join("serial.log");
@@ -187,6 +202,7 @@ impl Guest {
             extra_nics,
             port_22: port,
             https_port,
+            extra_https_port,
             serial_log: &serial_log,
             serial_sock: &serial_sock,
             monitor: &monitor,
@@ -204,6 +220,20 @@ impl Guest {
     /// Serial console log (how a published guest is observed).
     pub fn serial(&self) -> String {
         read_serial_all(&self.serial_log)
+    }
+
+    /// Reset the virtual machine (QEMU `system_reset`), keeping the same disk.
+    pub fn qemu_system_reset(&self) -> Result<(), Error> {
+        let mut stream = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        stream
+            .write_all(b"system_reset\n")
+            .map_err(|e| Error::from_io("QEMU system_reset", e))?;
+        stream
+            .flush()
+            .map_err(|e| Error::from_io("flushing QEMU monitor", e))?;
+        Ok(())
     }
 
     /// Write bytes to the guest serial console.
@@ -231,6 +261,23 @@ impl Guest {
         self.https_ok("POST", path, Some(body), 90)
     }
 
+    /// GET `path` on the extra virtio-net (10.0.3.15) over HTTPS.
+    pub fn https_get_extra(&self, path: &str) -> Result<String, Error> {
+        let port = self
+            .extra_https_port
+            .ok_or_else(|| Error::from_message("guest has no extra NIC HTTPS hostfwd"))?;
+        let url = format!("https://10.0.3.15{path}");
+        let (code, body) = self.https_exchange_at("10.0.3.15", port, "GET", path, None, 8)?;
+        if code == 200 {
+            Ok(body)
+        } else {
+            Err(Error::from_message(format!(
+                "curl GET {url} http_code={code}: {}",
+                body.trim()
+            )))
+        }
+    }
+
     /// HTTPS from the Workstation; returns status and body for any complete HTTP response.
     pub fn https_exchange(
         &self,
@@ -239,8 +286,27 @@ impl Guest {
         body: Option<&str>,
         max_time_secs: u64,
     ) -> Result<(u16, String), Error> {
-        let url = format!("https://10.0.2.15{path}");
-        let connect = format!("10.0.2.15:443:127.0.0.1:{}", self.https_port);
+        self.https_exchange_at(
+            "10.0.2.15",
+            self.https_port,
+            method,
+            path,
+            body,
+            max_time_secs,
+        )
+    }
+
+    fn https_exchange_at(
+        &self,
+        guest_ip: &str,
+        host_port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<(u16, String), Error> {
+        let url = format!("https://{guest_ip}{path}");
+        let connect = format!("{guest_ip}:443:127.0.0.1:{host_port}");
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sk",
@@ -860,6 +926,12 @@ fn image_builder_dirs(artifact: &Path) -> Result<(PathBuf, PathBuf), Error> {
             .map_err(|e| Error::from_io("clearing image-builder output", e))?;
     }
     fs::create_dir_all(&out_dir).map_err(|e| Error::from_io("creating image-builder output", e))?;
+    // osbuild export writes /output/<type>/; create it so a late umount race
+    // still has a dest directory.
+    fs::create_dir_all(out_dir.join("qcow2"))
+        .map_err(|e| Error::from_io("creating image-builder qcow2 dest", e))?;
+    fs::create_dir_all(out_dir.join("anaconda-iso"))
+        .map_err(|e| Error::from_io("creating image-builder iso dest", e))?;
     let config_dir = parent.join("bib-config");
     fs::create_dir_all(&config_dir)
         .map_err(|e| Error::from_io("creating image-builder config dir", e))?;
@@ -868,8 +940,6 @@ fn image_builder_dirs(artifact: &Path) -> Result<(PathBuf, PathBuf), Error> {
 
 fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Error> {
     progress("writing Disk image");
-    let (out_dir, config_dir) = image_builder_dirs(disk)?;
-    let config_path = config_dir.join("config.toml");
     let bib = image_dir.join("bib.toml");
     if !bib.is_file() {
         return Err(Error::from_message(
@@ -878,19 +948,35 @@ fn build_qcow2(disk: &Path, image_dir: &Path, image_ref: &str) -> Result<(), Err
     }
     let config =
         fs::read_to_string(&bib).map_err(|e| Error::from_io("reading published bib.toml", e))?;
-    fs::write(&config_path, config)
-        .map_err(|e| Error::from_io("writing image-builder config", e))?;
-
-    run_image_builder(&config_path, &out_dir, image_ref, false, "qcow2", None)?;
-    let produced = out_dir.join("qcow2").join("disk.qcow2");
-    if !produced.exists() {
-        return Err(Error::from_message(format!(
-            "image-builder succeeded but {} is missing",
-            produced.display()
-        )));
+    let mut last_err = None;
+    for attempt in 1..=2 {
+        let (out_dir, config_dir) = image_builder_dirs(disk)?;
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, &config)
+            .map_err(|e| Error::from_io("writing image-builder config", e))?;
+        match run_image_builder(&config_path, &out_dir, image_ref, false, "qcow2", None) {
+            Ok(()) => {
+                let produced = out_dir.join("qcow2").join("disk.qcow2");
+                if !produced.exists() {
+                    last_err = Some(Error::from_message(format!(
+                        "image-builder succeeded but {} is missing",
+                        produced.display()
+                    )));
+                    continue;
+                }
+                fs::rename(&produced, disk)
+                    .map_err(|e| Error::from_io("moving qcow2 into cache", e))?;
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                if attempt == 1 {
+                    progress("image-builder failed; retrying Disk image write");
+                }
+            }
+        }
     }
-    fs::rename(&produced, disk).map_err(|e| Error::from_io("moving qcow2 into cache", e))?;
-    Ok(())
+    Err(last_err.unwrap_or_else(|| Error::from_message("image-builder failed")))
 }
 
 fn build_anaconda_iso(iso: &Path, image_dir: &Path) -> Result<(), Error> {
@@ -1170,8 +1256,10 @@ fn spawn_guest(opts: QemuStart<'_>) -> Result<Guest, Error> {
         child,
         port_22: opts.port_22,
         https_port: opts.https_port,
+        extra_https_port: opts.extra_https_port,
         serial_log: opts.serial_log.to_path_buf(),
         serial: Mutex::new(serial),
+        monitor: opts.monitor.to_path_buf(),
     })
 }
 
@@ -1227,7 +1315,13 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
     for i in 0..opts.extra_nics {
         let id = format!("net{}", i + 1);
         let net = format!("10.0.{}.0/24", i + 3);
-        cmd.args(["-netdev", &format!("user,id={id},net={net}")])
+        let mut netdev = format!("user,id={id},net={net}");
+        if i == 0 {
+            if let Some(port) = opts.extra_https_port {
+                netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
+            }
+        }
+        cmd.args(["-netdev", &netdev])
             .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
     }
     let child = cmd
@@ -1366,6 +1460,7 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         extra_nics: 0,
         port_22: port,
         https_port,
+        extra_https_port: None,
         serial_log: &serial_log,
         serial_sock: &serial_sock,
         monitor: &monitor,
