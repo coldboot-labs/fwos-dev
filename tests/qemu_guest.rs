@@ -1863,6 +1863,10 @@ fn installer_one_disk_without_yes_never_reaches_bootstrap() {
         "one writable disk: serial must name the target device and size; serial:\n{serial}"
     );
     assert!(
+        !serial.contains("These partitions will be overwritten"),
+        "empty disk path is unchanged: no fake partition list; serial:\n{serial}"
+    );
+    assert!(
         !serial.contains("FWOS Bootstrap console"),
         "without yes, the one-disk Installer must not finish First install; serial:\n{serial}"
     );
@@ -1972,11 +1976,19 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
         "typed yes is required after pick; serial:\n{after_pick}"
     );
 
-    let after_decline = installer_serial_cmd(&guest, "n\r\n", 30, |t| {
-        t.contains("FWOS Installer: pick a disk to wipe")
-    });
+    guest
+        .serial_write("n\r\n")
+        .expect("decline on the Installer serial must be written");
+    let mut after_decline = guest.serial();
+    for _ in 0..30 {
+        after_decline = guest.serial();
+        if pick_prompt_after_yes(&after_decline) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     assert!(
-        after_decline.contains("FWOS Installer: pick a disk to wipe"),
+        pick_prompt_after_yes(&after_decline),
         "decline after a pick returns to the disk flow so the operator can pick again; serial:\n{after_decline}"
     );
     assert!(
@@ -1994,6 +2006,59 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
         !after_repick.contains("FWOS Bootstrap console"),
         "a second pick is still not the wipe; serial:\n{after_repick}"
     );
+}
+
+#[test]
+fn installer_approval_lists_existing_partitions() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_installer_one_partitioned_disk()
+        .expect("Installer with one partitioned disk must start under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Installer: /dev/") && serial.contains("("),
+        "partitioned disk still names the target; serial:\n{serial}"
+    );
+    assert!(
+        serial.contains("vda1") && serial.contains("vda2"),
+        "if the target has partitions and they can be listed, they appear on the approval screen; serial:\n{serial}"
+    );
+    let list_at = serial.find("vda1");
+    let overwrite_at =
+        serial.find("These partitions will be overwritten with the Host disk layout.");
+    assert!(
+        list_at.is_some()
+            && overwrite_at.is_some()
+            && overwrite_at.unwrap() > list_at.unwrap(),
+        "that listing is followed by a sentence that they will be overwritten with the Host disk layout; serial:\n{serial}"
+    );
+    assert!(
+        serial
+            .lines()
+            .any(|line| line.contains("vda1") && line.contains("ext4")),
+        "filesystem is shown on the partition listing when known; serial:\n{serial}"
+    );
+    assert!(
+        serial.contains("The entire disk will be erased and replaced with the Host disk layout"),
+        "approval still states the whole disk is erased; serial:\n{serial}"
+    );
+    assert!(
+        serial.contains("Type yes to wipe"),
+        "approval still requires typed yes; serial:\n{serial}"
+    );
+    assert!(
+        !serial.contains("FWOS Bootstrap console"),
+        "without yes, a partitioned disk is not written; serial:\n{serial}"
+    );
+}
+
+fn pick_prompt_after_yes(serial: &str) -> bool {
+    match (
+        serial.rfind("Type yes to wipe"),
+        serial.rfind("FWOS Installer: pick a disk to wipe"),
+    ) {
+        (Some(yes_at), Some(pick_at)) => pick_at > yes_at,
+        _ => false,
+    }
 }
 
 fn installer_serial_cmd(

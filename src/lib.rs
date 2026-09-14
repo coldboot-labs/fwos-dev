@@ -46,6 +46,12 @@ const INSTALLER_WIPE_PROMPT: &str =
 const EMPTY_DISK_SIZE: &str = "10G";
 const MIN_INSTALLED_DISK: u64 = 64 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+enum FirstDisk {
+    Empty,
+    Partitioned,
+}
+
 struct IsoLinux {
     kernel: PathBuf,
     initrd: PathBuf,
@@ -133,15 +139,20 @@ impl Guest {
 
     /// Boot the Installer ISO against one empty virt disk and wait for wipe approval.
     pub fn boot_installer_one_disk() -> Result<Self, Error> {
-        Self::boot_installer(1, INSTALLER_WIPE_PROMPT)
+        Self::boot_installer(1, INSTALLER_WIPE_PROMPT, FirstDisk::Empty)
+    }
+
+    /// Boot the Installer ISO against one virt disk that already has partitions.
+    pub fn boot_installer_one_partitioned_disk() -> Result<Self, Error> {
+        Self::boot_installer(1, INSTALLER_WIPE_PROMPT, FirstDisk::Partitioned)
     }
 
     /// Boot the Installer ISO with two empty virt disks and wait for the disk pick.
     pub fn boot_installer_two_disks() -> Result<Self, Error> {
-        Self::boot_installer(2, INSTALLER_DISK_PROMPT)
+        Self::boot_installer(2, INSTALLER_DISK_PROMPT, FirstDisk::Empty)
     }
 
-    fn boot_installer(n_disks: usize, needle: &str) -> Result<Self, Error> {
+    fn boot_installer(n_disks: usize, needle: &str, first: FirstDisk) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let iso = build_installer_iso()?;
@@ -149,7 +160,11 @@ impl Guest {
         let mut disks = Vec::new();
         for i in 0..n_disks {
             let path = work.join(format!("disk{}.qcow2", i + 1));
-            create_empty_qcow2(&path)?;
+            if i == 0 && matches!(first, FirstDisk::Partitioned) {
+                create_partitioned_qcow2(&path)?;
+            } else {
+                create_empty_qcow2(&path)?;
+            }
             disks.push(path);
         }
         let linux = extract_iso_linux(&iso, &work)?;
@@ -1555,6 +1570,68 @@ fn create_empty_qcow2(path: &Path) -> Result<(), Error> {
     } else {
         Err(Error::from_message(format!(
             "qemu-img create empty disk failed with {status}"
+        )))
+    }
+}
+
+fn create_partitioned_qcow2(path: &Path) -> Result<(), Error> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| Error::from_io("removing old partitioned disk", e))?;
+    }
+    let raw = path.with_extension("raw");
+    let _ = fs::remove_file(&raw);
+    let created = Command::new("qemu-img")
+        .args(["create", "-f", "raw"])
+        .arg(&raw)
+        .arg(EMPTY_DISK_SIZE)
+        .status()
+        .map_err(|e| Error::from_io("running qemu-img create raw", e))?;
+    if !created.success() {
+        let _ = fs::remove_file(&raw);
+        return Err(Error::from_message(format!(
+            "qemu-img create partitioned raw disk failed with {created}"
+        )));
+    }
+    let parted = Command::new("parted")
+        .args(["-s"])
+        .arg(&raw)
+        .args([
+            "mklabel", "gpt", "mkpart", "p1", "1MiB", "1025MiB", "mkpart", "p2", "1025MiB", "100%",
+        ])
+        .status()
+        .map_err(|e| Error::from_io("running parted", e))?;
+    if !parted.success() {
+        let _ = fs::remove_file(&raw);
+        return Err(Error::from_message(format!(
+            "parted gpt partitions failed with {parted}"
+        )));
+    }
+    // 1MiB GPT offset, 1GiB ext4 so udev can report a filesystem when known.
+    let mkfs = Command::new("mke2fs")
+        .args(["-t", "ext4", "-F", "-E", "offset=1048576", "-b", "4096"])
+        .arg(&raw)
+        .arg("262144")
+        .status()
+        .map_err(|e| Error::from_io("running mke2fs", e))?;
+    if !mkfs.success() {
+        let _ = fs::remove_file(&raw);
+        return Err(Error::from_message(format!(
+            "mke2fs ext4 on first partition failed with {mkfs}"
+        )));
+    }
+    let converted = Command::new("qemu-img")
+        .args(["convert", "-f", "raw", "-O", "qcow2"])
+        .arg(&raw)
+        .arg(path)
+        .status()
+        .map_err(|e| Error::from_io("running qemu-img convert", e))?;
+    let _ = fs::remove_file(&raw);
+    if converted.success() {
+        Ok(())
+    } else {
+        let _ = fs::remove_file(path);
+        Err(Error::from_message(format!(
+            "qemu-img convert partitioned disk failed with {converted}"
         )))
     }
 }
