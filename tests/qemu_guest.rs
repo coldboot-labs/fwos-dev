@@ -1629,7 +1629,7 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
     );
     assert!(
         !shown.contains("stick"),
-        "one-NIC WAN+LAN is roles on parent+VLAN, not a stick exception, serial:\n{shown}"
+        "one-NIC WAN+LAN Desired state has no stick role, serial:\n{shown}"
     );
 }
 
