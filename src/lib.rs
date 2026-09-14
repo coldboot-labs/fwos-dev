@@ -119,6 +119,12 @@ impl Guest {
         Self::boot_disk(&disk_path, 1)
     }
 
+    /// Same Disk image with two extra virtio-nets (WAN, LAN, Management NIC).
+    pub fn boot_published_host_image_three_nics() -> Result<Self, Error> {
+        let disk_path = build_published_host_image_disk()?;
+        Self::boot_disk(&disk_path, 2)
+    }
+
     /// Boot the Installer ISO against an empty virt disk, then observe the installed guest.
     pub fn install_from_iso() -> Result<Self, Error> {
         let disk_path = install_host_image_disk()?;

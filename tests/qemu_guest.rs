@@ -90,7 +90,15 @@ fn published_guest_serial_and_https_without_ssh() {
         "wizard HTML must collect hostname and admin, body:\n{page}"
     );
     for needle in [
-        "wan", "lan", "vlan", "dhcp", "static", "pool", "pd", "exposure",
+        "wan",
+        "lan",
+        "vlan",
+        "dhcp",
+        "static",
+        "pool",
+        "pd",
+        "exposure",
+        "management",
     ] {
         assert!(
             lower.contains(needle),
@@ -534,6 +542,165 @@ fn published_two_nic_user_net_wan_stops_https_after_apply() {
     assert!(
         shown.contains(&wan_nic) && shown.contains(&lan_nic),
         "serial must still work and show WAN+LAN Desired state, serial:\n{shown}"
+    );
+}
+
+#[test]
+fn published_three_nic_mgmt_https_after_bootstrap() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_three_nics()
+        .expect("published three-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+
+    let mgmt_nic = opt_user_net(&guest);
+    let extras: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| n != &mgmt_nic)
+        .collect();
+    assert_eq!(
+        extras.len(),
+        2,
+        "three-NIC guest must list WAN and LAN extras besides the user-net Management NIC, serial:\n{}",
+        guest.serial()
+    );
+    let lan_nic = extras[0].clone();
+    let wan_nic = extras[1].clone();
+
+    let mut page = String::new();
+    let mut page_err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("management") {
+                    break;
+                }
+            }
+            Err(e) => page_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        page.to_ascii_lowercase().contains("management"),
+        "wizard HTML must collect an optional Management NIC, last={page_err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut js = String::new();
+    let mut js_err = String::from("(no GET)");
+    for _ in 0..30 {
+        match guest.https_get("/app.js") {
+            Ok(body) => {
+                js = body;
+                if js.contains("mgmt_nic") && js.contains("mgmt_prefix") {
+                    break;
+                }
+            }
+            Err(e) => js_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        js.contains("mgmt_nic")
+            && js.contains("mgmt_prefix")
+            && js.contains("on-link prefix")
+            && js.contains("none"),
+        "wizard must offer an optional Management NIC and on-link static prefix (no gateway), last={js_err}; js:\n{js}"
+    );
+    assert!(
+        js.contains("expose_lan") && js.contains("lan_req") && js.contains("(optional)"),
+        "LAN UI exposure must be optional when a Management NIC is selected, js:\n{js}"
+    );
+
+    let payload = wan_lan_mgmt_bootstrap_json(&lan_nic, &wan_nic, &mgmt_nic);
+    let mut post = String::from("(no POST)");
+    let mut post_ok = false;
+    for _ in 0..90 {
+        match guest.https_exchange("POST", "/api/bootstrap", Some(&payload), 90) {
+            Ok((200, body)) => {
+                post = body;
+                if post.contains("\"ok\"") {
+                    post_ok = true;
+                    break;
+                }
+            }
+            Ok((409, body)) => {
+                post = body;
+                post_ok = true;
+                break;
+            }
+            Ok((code, body)) => post = format!("http_code={code} {body}"),
+            Err(e) => post = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        post_ok,
+        "HTTPS wizard POST must complete Bootstrap, last={post}; serial:\n{}",
+        guest.serial()
+    );
+
+    let mut after = String::new();
+    for _ in 0..180 {
+        match guest.https_get("/api/status") {
+            Ok(body) => {
+                after = body;
+                if after.contains("\"bootstrapped\"") && after.contains("true") {
+                    break;
+                }
+            }
+            Err(e) => after = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        after.contains("\"bootstrapped\"") && after.contains("true"),
+        "workstation HTTPS status after Bootstrap must answer on the Management NIC (user-net); got:\n{after}; serial:\n{}",
+        guest.serial()
+    );
+    assert!(
+        after.contains("\"mgmt\"") && after.contains(&mgmt_nic) && after.contains("10.0.2.15"),
+        "status JSON must show the Management NIC role and on-link prefix, got:\n{after}"
+    );
+    assert!(
+        after.contains("ui_exposure") && after.contains(&mgmt_nic),
+        "Management NIC is always in UI exposure, got:\n{after}"
+    );
+    assert!(
+        after.contains(&wan_nic)
+            && after.contains("\"wan\"")
+            && after.contains(&lan_nic)
+            && after.contains("\"lan\""),
+        "v1 still applies WAN and LAN; WAN is an extra NIC, got:\n{after}"
+    );
+    assert!(
+        !after.contains("\"placement\"") && !after.contains("placement=mgmt"),
+        "Management NIC stays in fwd; it is not placement=mgmt, got:\n{after}"
+    );
+
+    serial_login_admin(&guest, "alice", "secret12");
+    let shown = serial_cmd(&guest, "show\n", 20, |t| {
+        t.contains("role = \"mgmt\"")
+            && t.contains(&mgmt_nic)
+            && t.contains(&wan_nic)
+            && t.contains(&lan_nic)
+    });
+    assert!(
+        shown.contains("role = \"mgmt\"") && shown.contains(&mgmt_nic),
+        "Appliance CLI show must list the Management NIC in fwd, serial:\n{shown}"
+    );
+    assert!(
+        shown.contains("ui_exposure") && shown.contains(&format!("\"{mgmt_nic}\"")),
+        "UI exposure after apply includes the Management NIC, serial:\n{shown}"
+    );
+    assert!(
+        !shown.contains("placement =") && !shown.contains("placement=mgmt"),
+        "Desired state must not move the Management NIC into the Management netns, serial:\n{shown}"
     );
 }
 
@@ -1291,6 +1458,12 @@ fn post_bootstrap_observe_serial(guest: &Guest, payload: &str) {
 fn wan_lan_bootstrap_json(lan: &str, wan: &str) -> String {
     format!(
         r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{lan}","role":"lan"}},{{"name":"{wan}","role":"wan","addresses":["192.0.2.1/24"]}}],"ui_exposure":["{lan}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    )
+}
+
+fn wan_lan_mgmt_bootstrap_json(lan: &str, wan: &str, mgmt: &str) -> String {
+    format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{lan}","role":"lan"}},{{"name":"{wan}","role":"wan","addresses":["192.0.2.1/24"]}},{{"name":"{mgmt}","role":"mgmt","addresses":["10.0.2.15/24"]}}],"ui_exposure":["{mgmt}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
     )
 }
 
