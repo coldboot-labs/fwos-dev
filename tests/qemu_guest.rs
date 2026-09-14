@@ -89,10 +89,12 @@ fn published_guest_serial_and_https_without_ssh() {
         lower.contains("hostname") && lower.contains("admin"),
         "wizard HTML must collect hostname and admin, body:\n{page}"
     );
-    for needle in ["fwd", "mgmt", "vlan", "dhcp", "static", "lan", "pool", "pd"] {
+    for needle in [
+        "wan", "lan", "vlan", "dhcp", "static", "pool", "pd", "exposure",
+    ] {
         assert!(
             lower.contains(needle),
-            "wizard HTML must collect {needle} (NIC placement, stick VLANs, static/DHCP, LAN prefix, DHCP pool, WAN v6/PD), body:\n{page}"
+            "wizard HTML must collect {needle} (roles, VLAN IDs, UI exposure, static/DHCP, LAN prefix, DHCP pool, WAN v6/PD), body:\n{page}"
         );
     }
     assert!(
@@ -212,8 +214,8 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     );
     assert_no_ssh(&guest, "before Bootstrap");
 
-    let mgmt_nic = opt_user_net(&guest);
-    let traffic_nic = other_console_nic(&guest, &mgmt_nic);
+    let lan_nic = opt_user_net(&guest);
+    let wan_nic = other_console_nic(&guest, &lan_nic);
     let mut page = String::new();
     let mut err = String::from("(no GET)");
     for _ in 0..90 {
@@ -256,9 +258,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         guest.serial()
     );
 
-    let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
-    );
+    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     let mut post = String::from("(no POST)");
     let mut post_ok = false;
     for _ in 0..90 {
@@ -310,8 +310,16 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         "status JSON must show hostname and LAN prefix, got:\n{after}"
     );
     assert!(
-        after.contains("\"mgmt\"") && after.contains("\"fwd\""),
-        "status JSON must show NIC placement, got:\n{after}"
+        after.contains("\"lan\"") && after.contains("\"wan\""),
+        "status JSON must show interface roles, got:\n{after}"
+    );
+    assert!(
+        after.contains("ui_exposure") && after.contains(&lan_nic),
+        "status JSON must show UI exposure on the LAN, got:\n{after}"
+    );
+    assert!(
+        !after.contains("\"placement\"") && !after.contains("placement=mgmt"),
+        "Desired state must not classify a NIC into the Management netns, got:\n{after}"
     );
     let after_l = after.to_ascii_lowercase();
     assert!(
@@ -443,7 +451,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         "serial must not be a Host shell, serial:\n{after_shell}"
     );
     guest
-        .serial_write(&format!("static {mgmt_nic} 192.168.9.9/24\n"))
+        .serial_write(&format!("static {lan_nic} 192.168.9.9/24\n"))
         .expect("probe ephemeral addressing");
     std::thread::sleep(std::time::Duration::from_secs(2));
     let after_static = guest.serial();
@@ -464,6 +472,72 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
 }
 
 #[test]
+fn published_two_nic_user_net_wan_stops_https_after_apply() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published two-NIC Disk image must boot under QEMU");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+    );
+    let (wan_nic, lan_nic) = published_user_net_and_extra(&guest);
+    let mut page = String::new();
+    let mut err = String::from("(no GET)");
+    for _ in 0..90 {
+        match guest.https_get("/") {
+            Ok(body) => {
+                page = body;
+                if page.to_ascii_lowercase().contains("hostname") {
+                    break;
+                }
+            }
+            Err(e) => err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        page.to_ascii_lowercase().contains("hostname"),
+        "Workstation must reach the HTTPS wizard on the user-net NIC, last={err}; body:\n{page}; serial:\n{}",
+        guest.serial()
+    );
+
+    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
+    post_bootstrap_observe_serial(&guest, &payload);
+
+    let mut https_down = false;
+    for _ in 0..60 {
+        match guest.https_exchange("GET", "/", None, 3) {
+            Ok((code, _)) if code != 0 => {}
+            _ => {
+                https_down = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        https_down,
+        "HTTPS on the user-net NIC must stop after apply when that NIC is WAN; serial:\n{}",
+        guest.serial()
+    );
+    https_must_not_answer(
+        &guest,
+        10,
+        "HTTPS on the user-net NIC must stay down after apply when that NIC is WAN",
+    );
+
+    serial_login_admin(&guest, "alice", "secret12");
+    let shown = serial_cmd(&guest, "show\n", 20, |t| {
+        t.contains("wan") && t.contains("lan") && t.contains(&wan_nic) && t.contains(&lan_nic)
+    });
+    assert!(
+        shown.contains(&wan_nic) && shown.contains(&lan_nic),
+        "serial must still work and show WAN+LAN Desired state, serial:\n{shown}"
+    );
+}
+
+#[test]
 fn published_serial_cli_applies_full_desired_state() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
@@ -473,15 +547,13 @@ fn published_serial_cli_applies_full_desired_state() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
-    let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
-    );
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     https_bootstrap(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
 
     let full = format!(
-        r#"{{"hostname":"fwos-box","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wireguard":[{{"name":"wg0","private_key":"{WG_PRIVATE}","listen_port":51820,"addresses":["10.13.13.1/24"]}}],"routes":[{{"to":"198.51.100.0/24","via":"192.0.2.254"}}],"nft_extra":["ip saddr 203.0.113.50 drop"],"qdiscs":[{{"dev":"{traffic_nic}","kind":"fq_codel"}}]}}"#
+        r#"{{"hostname":"fwos-box","interfaces":[{{"name":"{lan_nic}","role":"lan"}},{{"name":"{wan_nic}","role":"wan","addresses":["192.0.2.1/24"]}}],"ui_exposure":["{lan_nic}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wireguard":[{{"name":"wg0","private_key":"{WG_PRIVATE}","listen_port":51820,"addresses":["10.13.13.1/24"]}}],"routes":[{{"to":"198.51.100.0/24","via":"192.0.2.254"}}],"nft_extra":["ip saddr 203.0.113.50 drop"],"qdiscs":[{{"dev":"{wan_nic}","kind":"fq_codel"}}]}}"#
     );
     let after_apply = serial_cmd(&guest, &format!("apply {full}\n"), 90, |t| {
         t.contains("\"ok\": true") || t.contains("\"ok\":true")
@@ -553,7 +625,7 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
     let image = registry.guest_image();
 
     let refused = serial_cmd(&guest, &format!("update {image}\n"), 30, |t| {
@@ -570,9 +642,7 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         "Host update must not be accepted before an admin exists, serial:\n{refused}"
     );
 
-    let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
-    );
+    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     https_bootstrap(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
 
@@ -662,8 +732,8 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         guest.serial()
     );
     assert!(
-        ui_status.contains("\"fwd\"") && ui_status.contains("192.0.2.1"),
-        "Traffic NIC placement in fwd must still be applied after staging, status:\n{ui_status}"
+        ui_status.contains("\"wan\"") && ui_status.contains("192.0.2.1"),
+        "WAN role must still be applied after staging, status:\n{ui_status}"
     );
     assert_no_ssh(&guest, "after Host update stage");
 
@@ -762,9 +832,9 @@ fn published_serial_stages_host_update_then_reboot_applies() {
     );
     assert!(
         ui_after.contains("fwos-box")
-            && ui_after.contains("\"fwd\"")
-            && ui_after.contains("\"mgmt\""),
-        "HTTPS status must show hostname and NIC placement from shared /var, status:\n{ui_after}"
+            && ui_after.contains("\"wan\"")
+            && ui_after.contains("\"lan\""),
+        "HTTPS status must show hostname and interface roles from shared /var, status:\n{ui_after}"
     );
 
     let bad = serial_cmd(&guest, "apply this-is-not-desired-state\n", 20, |t| {
@@ -859,12 +929,10 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    let (mgmt_nic, traffic_nic) = published_mgmt_and_traffic_after_opt(&guest);
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
     let image = registry.guest_image();
 
-    let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{mgmt_nic}","placement":"mgmt"}},{{"name":"{traffic_nic}","placement":"fwd","role":"wan","addresses":["192.0.2.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
-    );
+    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     https_bootstrap(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
 
@@ -1203,28 +1271,33 @@ fn is_ethernet_name(name: &str) -> bool {
     nic && name.chars().any(|c| c.is_ascii_digit())
 }
 
-fn published_mgmt_and_traffic(serial: &str) -> (String, String) {
-    let nics = console_nics(serial);
-    assert!(
-        nics.len() >= 2,
-        "published two-NIC guest must list two Traffic NICs on the Bootstrap console, serial:\n{serial}"
-    );
-    let mgmt = nics
-        .iter()
-        .find(|(_, addrs)| addrs.contains("10.0.2."))
-        .map(|(n, _)| n.clone())
-        .unwrap_or_else(|| nics[0].0.clone());
-    let traffic = nics
-        .iter()
-        .find(|(n, _)| n != &mgmt)
-        .map(|(n, _)| n.clone())
-        .expect("Traffic NIC");
-    (mgmt, traffic)
+fn post_bootstrap_observe_serial(guest: &Guest, payload: &str) {
+    let post = match guest.https_exchange("POST", "/api/bootstrap", Some(payload), 45) {
+        Ok((200, body)) | Ok((409, body)) => body,
+        Ok((code, body)) => format!("http_code={code} {body}"),
+        Err(e) => e.to_string(),
+    };
+    let mut last = guest.serial();
+    for _ in 0..120 {
+        if last.contains("Bootstrap complete") || last.contains("FWOS Appliance CLI") {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        last = guest.serial();
+    }
+    panic!("HTTPS wizard apply must complete (serial after POST={post}); serial:\n{last}");
 }
 
-fn published_mgmt_and_traffic_after_opt(guest: &Guest) -> (String, String) {
-    opt_user_net(guest);
-    published_mgmt_and_traffic(&guest.serial())
+fn wan_lan_bootstrap_json(lan: &str, wan: &str) -> String {
+    format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{lan}","role":"lan"}},{{"name":"{wan}","role":"wan","addresses":["192.0.2.1/24"]}}],"ui_exposure":["{lan}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    )
+}
+
+fn published_user_net_and_extra(guest: &Guest) -> (String, String) {
+    let user = opt_user_net(guest);
+    let extra = other_console_nic(guest, &user);
+    (user, extra)
 }
 
 fn wait_console_nics(guest: &Guest) -> Vec<(String, String)> {
@@ -1351,7 +1424,11 @@ fn published_console_opt_survives_reboot_before_bootstrap() {
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    let new = if last.len() > from { &last[from..] } else { last.as_str() };
+    let new = if last.len() > from {
+        &last[from..]
+    } else {
+        last.as_str()
+    };
     assert!(
         new.contains("FWOS Bootstrap console"),
         "reboot before Bootstrap must return to the Bootstrap console; serial:\n{last}"
@@ -1406,7 +1483,8 @@ fn published_console_can_replace_opt() {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     assert!(
-        page.to_ascii_lowercase().contains("html") || page.to_ascii_lowercase().contains("hostname"),
+        page.to_ascii_lowercase().contains("html")
+            || page.to_ascii_lowercase().contains("hostname"),
         "HTTPS must answer on the opted user-net NIC; serial:\n{}",
         guest.serial()
     );
@@ -1454,7 +1532,7 @@ fn published_stick_serial_and_https_without_ssh() {
     assert_no_ssh(&guest, "before stick Bootstrap");
     let nic = opt_user_net(&guest);
     let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{nic}","placement":"fwd","role":"stick"}},{{"name":"{nic}.10","placement":"fwd","role":"wan","parent":"{nic}","vlan":10,"addresses":["192.0.2.1/24"]}},{{"name":"{nic}.20","placement":"fwd","role":"lan","parent":"{nic}","vlan":20,"addresses":["192.168.1.1/24"]}}],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{nic}","role":"stick"}},{{"name":"{nic}.10","role":"wan","parent":"{nic}","vlan":10,"addresses":["192.0.2.1/24"]}},{{"name":"{nic}.20","role":"lan","parent":"{nic}","vlan":20,"addresses":["192.168.1.1/24"]}}],"ui_exposure":["{nic}.20"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
     );
     let mut page = String::new();
     let mut err = String::from("(no GET)");
@@ -1474,35 +1552,11 @@ fn published_stick_serial_and_https_without_ssh() {
     }
     assert!(
         page.to_ascii_lowercase().contains("hostname"),
-        "Workstation must reach the HTTPS wizard before stick placement, last={err}; body:\n{page}; serial:\n{}",
+        "Workstation must reach the HTTPS wizard before stick WAN/LAN VLANs, last={err}; body:\n{page}; serial:\n{}",
         guest.serial()
     );
-    let mut post = String::from("(no POST)");
-    for _ in 0..30 {
-        match guest.https_exchange("POST", "/api/bootstrap", Some(&payload), 90) {
-            Ok((200, body)) | Ok((409, body)) => {
-                post = body;
-                break;
-            }
-            Ok((code, body)) => post = format!("http_code={code} {body}"),
-            Err(e) => post = e.to_string(),
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    // Stick moves the only NIC into fwd; the Host-netns UI drops and curl may
-    // lose the POST. Serial is how the published guest is observed after that.
-    let mut last = guest.serial();
-    for _ in 0..120 {
-        if last.contains("Bootstrap complete") || last.contains("FWOS Appliance CLI") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        last = guest.serial();
-    }
-    assert!(
-        last.contains("Bootstrap complete") || last.contains("FWOS Appliance CLI"),
-        "HTTPS wizard must apply stick Desired state (serial after POST={post}); serial:\n{last}"
-    );
+    // Stick WAN/LAN VLANs leave untagged first-boot HTTPS; curl may lose the POST.
+    post_bootstrap_observe_serial(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
     let shown = serial_cmd(&guest, "show\n", 20, |t| {
         t.contains("stick") && t.contains(".10") && t.contains(".20")

@@ -113,7 +113,7 @@ impl Guest {
         Self::boot_disk(&disk_path, 0)
     }
 
-    /// Same Disk image with a second virtio-net (Management NIC + Traffic NIC).
+    /// Same Disk image with a second virtio-net (WAN + LAN Traffic NICs).
     pub fn boot_published_host_image_two_nics() -> Result<Self, Error> {
         let disk_path = build_published_host_image_disk()?;
         Self::boot_disk(&disk_path, 1)
@@ -257,9 +257,9 @@ impl Guest {
 
     /// GET `path` on the extra virtio-net (10.0.3.15) over HTTPS.
     pub fn https_get_extra(&self, path: &str) -> Result<String, Error> {
-        let port = self.extra_https_port.ok_or_else(|| {
-            Error::from_message("guest has no extra NIC HTTPS hostfwd")
-        })?;
+        let port = self
+            .extra_https_port
+            .ok_or_else(|| Error::from_message("guest has no extra NIC HTTPS hostfwd"))?;
         let url = format!("https://10.0.3.15{path}");
         let (code, body) = self.https_exchange_at("10.0.3.15", port, "GET", path, None, 8)?;
         if code == 200 {
@@ -280,7 +280,14 @@ impl Guest {
         body: Option<&str>,
         max_time_secs: u64,
     ) -> Result<(u16, String), Error> {
-        self.https_exchange_at("10.0.2.15", self.https_port, method, path, body, max_time_secs)
+        self.https_exchange_at(
+            "10.0.2.15",
+            self.https_port,
+            method,
+            path,
+            body,
+            max_time_secs,
+        )
     }
 
     fn https_exchange_at(
