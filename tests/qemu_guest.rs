@@ -1294,6 +1294,12 @@ fn wan_lan_bootstrap_json(lan: &str, wan: &str) -> String {
     )
 }
 
+fn one_nic_untagged_wan_json(nic: &str, lan_vid: u16) -> String {
+    format!(
+        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{nic}","role":"wan","addresses":["192.0.2.1/24"]}},{{"name":"{nic}.{lan_vid}","role":"lan","parent":"{nic}","vlan":{lan_vid},"addresses":["192.168.1.1/24"]}}],"ui_exposure":["{nic}.{lan_vid}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
+    )
+}
+
 fn published_user_net_and_extra(guest: &Guest) -> (String, String) {
     let user = opt_user_net(guest);
     let extra = other_console_nic(guest, &user);
@@ -1520,7 +1526,7 @@ fn published_console_can_replace_opt() {
 }
 
 #[test]
-fn published_stick_serial_and_https_without_ssh() {
+fn published_one_nic_untagged_wan_stops_https_after_apply() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image()
         .expect("published one-NIC Disk image must boot under QEMU");
@@ -1529,11 +1535,9 @@ fn published_stick_serial_and_https_without_ssh() {
         serial.contains("FWOS Bootstrap console"),
         "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
     );
-    assert_no_ssh(&guest, "before stick Bootstrap");
     let nic = opt_user_net(&guest);
-    let payload = format!(
-        r#"{{"hostname":"fwos-box","admin":"alice","password":"secret12","interfaces":[{{"name":"{nic}","role":"stick"}},{{"name":"{nic}.10","role":"wan","parent":"{nic}","vlan":10,"addresses":["192.0.2.1/24"]}},{{"name":"{nic}.20","role":"lan","parent":"{nic}","vlan":20,"addresses":["192.168.1.1/24"]}}],"ui_exposure":["{nic}.20"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200"}}"#
-    );
+    let lan = format!("{nic}.42");
+    let payload = one_nic_untagged_wan_json(&nic, 42);
     let mut page = String::new();
     let mut err = String::from("(no GET)");
     for _ in 0..90 {
@@ -1552,20 +1556,81 @@ fn published_stick_serial_and_https_without_ssh() {
     }
     assert!(
         page.to_ascii_lowercase().contains("hostname"),
-        "Workstation must reach the HTTPS wizard before stick WAN/LAN VLANs, last={err}; body:\n{page}; serial:\n{}",
+        "Workstation must reach the HTTPS wizard on untagged first-boot, last={err}; body:\n{page}; serial:\n{}",
         guest.serial()
     );
-    // Stick WAN/LAN VLANs leave untagged first-boot HTTPS; curl may lose the POST.
+    let mut wizard = String::new();
+    let mut wizard_err = String::from("(no GET)");
+    for _ in 0..30 {
+        match guest.https_get("/app.js") {
+            Ok(body) => {
+                wizard = body;
+                if wizard.contains("Apply still proceeds") {
+                    break;
+                }
+            }
+            Err(e) => wizard_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        wizard.contains("Untagged first-boot HTTPS will vanish")
+            && wizard.contains("Apply still proceeds"),
+        "one-NIC wizard must warn that untagged first-boot HTTPS leaves when untagged is not in post-apply UI exposure; last={wizard_err}; body:\n{wizard}"
+    );
+
+    // Untagged becomes WAN; workstation HTTPS on 10.0.2.15 leaves with it.
     post_bootstrap_observe_serial(&guest, &payload);
+
+    let mut https_down = false;
+    for _ in 0..60 {
+        match guest.https_exchange("GET", "/", None, 3) {
+            Ok((code, _)) if code != 0 => {}
+            _ => {
+                https_down = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        https_down,
+        "HTTPS on 10.0.2.15 must stop after apply when untagged became WAN; serial:\n{}",
+        guest.serial()
+    );
+    https_must_not_answer(
+        &guest,
+        10,
+        "HTTPS on 10.0.2.15 must stay down after untagged became WAN",
+    );
+
     serial_login_admin(&guest, "alice", "secret12");
     let shown = serial_cmd(&guest, "show\n", 20, |t| {
-        t.contains("stick") && t.contains(".10") && t.contains(".20")
+        t.contains("role = \"wan\"")
+            && t.contains("role = \"lan\"")
+            && t.contains(&lan)
+            && t.contains("vlan = 42")
     });
     assert!(
-        shown.contains("stick") && shown.contains(".10") && shown.contains(".20"),
-        "stick WAN/LAN VLANs must be Desired state, serial:\n{shown}"
+        shown.contains("role = \"wan\"") && shown.contains("role = \"lan\""),
+        "Appliance CLI show must list WAN and LAN L2s, serial:\n{shown}"
     );
-    assert_no_ssh(&guest, "after stick Bootstrap");
+    assert!(
+        shown.contains(&lan) && shown.contains("vlan = 42"),
+        "operator-chosen LAN VID must be Desired state, serial:\n{shown}"
+    );
+    assert!(
+        shown.contains("ui_exposure") && shown.contains(&format!("\"{lan}\"")),
+        "UI exposure after apply is the LAN L2, serial:\n{shown}"
+    );
+    assert!(
+        !shown.contains(&format!("ui_exposure = [\"{nic}\"]")),
+        "UI exposure must not be the WAN parent, serial:\n{shown}"
+    );
+    assert!(
+        !shown.contains("stick"),
+        "one-NIC WAN+LAN is roles on parent+VLAN, not a stick exception, serial:\n{shown}"
+    );
 }
 
 #[test]
