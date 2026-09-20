@@ -205,13 +205,14 @@ fn published_bootstrap_credentials_work_on_https_and_console() {
         );
     }
 
-    let password = "  boundary-passphrase  ";
-    payload["password"] = password.into();
+    // 505 ASCII bytes + two-byte Unicode character + four surrounding spaces.
+    let password = format!("  {}é  ", "x".repeat(505));
+    payload["password"] = password.as_str().into();
     https_bootstrap(&guest, &payload.to_string());
-    let session = https_login_admin(&guest, "alice", password);
+    let session = https_login_admin(&guest, "alice", &password);
     let status = session
         .get("/api/status")
-        .expect("HTTPS must accept the exact password including surrounding spaces");
+        .expect("HTTPS must accept a 511-byte password including Unicode and surrounding spaces");
     assert_eq!(json_string_field(&status, "username").as_deref(), Some("alice"));
     let trimmed = serde_json::json!({
         "source": "local", "username": "alice", "password": password.trim()
@@ -220,7 +221,7 @@ fn published_bootstrap_credentials_work_on_https_and_console() {
         .https_exchange("POST", "/api/login", Some(&trimmed.to_string()), 15)
         .expect("HTTPS must respond to a password with its surrounding spaces removed");
     assert_eq!(code, 401, "password spaces must remain part of the credential");
-    serial_login_admin(&guest, "alice", password);
+    serial_login_admin(&guest, "alice", &password);
     assert!(
         !guest.serial().contains(password.trim()),
         "the Appliance console must not echo the space-preserving password"
