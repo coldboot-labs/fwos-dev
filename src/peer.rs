@@ -98,6 +98,27 @@ impl NetworkPeer {
         ])
     }
 
+    /// Route test traffic through the appliance using only peer-owned routes.
+    pub fn add_route(&self, destination: &str, gateway: &str) -> Result<(), Error> {
+        let family = if destination.contains(':') {
+            "-6"
+        } else {
+            "-4"
+        };
+        ip(&[
+            "-n",
+            &self.namespace,
+            family,
+            "route",
+            "add",
+            destination,
+            "via",
+            gateway,
+            "dev",
+            "eth0",
+        ])
+    }
+
     /// Request the appliance directly over this Ethernet segment.
     pub fn https_get(&self, address: &str, path: &str) -> Result<String, Error> {
         let host = if address.contains(':') {

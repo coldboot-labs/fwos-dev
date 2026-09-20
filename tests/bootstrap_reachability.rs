@@ -2,6 +2,11 @@ use fwos_dev::{Guest, NetworkPeer};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn guest_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 fn console_nics(guest: &Guest) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let serial = loop {
@@ -69,6 +74,7 @@ fn assert_bootstrap_https(peer: &NetworkPeer, address: &str) {
 
 #[test]
 fn bootstrap_https_excludes_non_private_address_classes() {
+    let _guard = guest_lock();
     let peer = NetworkPeer::new().expect("isolated external peer");
     for cidr in [
         "10.56.0.2/24",
@@ -134,6 +140,7 @@ fn bootstrap_https_excludes_non_private_address_classes() {
 
 #[test]
 fn bootstrap_ula_https_works_after_a_fresh_static_selection() {
+    let _guard = guest_lock();
     let peer = NetworkPeer::new().expect("isolated IPv6 external peer");
     peer.add_address("fd56::2/64")
         .expect("on-link ULA peer address");
@@ -143,4 +150,35 @@ fn bootstrap_ula_https_works_after_a_fresh_static_selection() {
     assert_eq!(nics.len(), 1);
     select_static(&guest, &nics[0], "fd56::1/64");
     assert_bootstrap_https(&peer, "fd56::1");
+}
+
+#[test]
+fn bootstrap_https_cannot_bypass_exposure_by_routing_to_internal_addresses() {
+    let _guard = guest_lock();
+    let peer = NetworkPeer::new().expect("isolated routing peer");
+    peer.add_address("10.56.0.2/24").expect("IPv4 peer");
+    peer.add_address("fd56::2/64").expect("IPv6 peer");
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer]).expect("published appliance");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 1);
+    for (cidr, address, internal, route) in [
+        (
+            "10.56.0.1/24",
+            "10.56.0.1",
+            "169.254.127.6",
+            "169.254.127.6/32",
+        ),
+        ("fd56::1/64", "fd56::1", "fd53:1:1::6", "fd53:1:1::6/128"),
+    ] {
+        select_static(&guest, &nics[0], cidr);
+        assert_bootstrap_https(&peer, address);
+        peer.add_route(route, address)
+            .expect("external peer route through selected NIC");
+        assert!(
+            peer.https_response(internal)
+                .expect("probe direct internal HTTPS")
+                .is_none(),
+            "routing directly to internal {internal} must not bypass Bootstrap exposure"
+        );
+    }
 }
