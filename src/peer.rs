@@ -131,6 +131,51 @@ impl NetworkPeer {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// Any HTTPS response counts as exposure, including 4xx/5xx. Only a refused
+    /// connection or timeout with no HTTP response establishes unreachability;
+    /// broken peer commands, malformed URLs and TLS errors remain test errors.
+    pub fn https_response(&self, address: &str) -> Result<Option<u16>, Error> {
+        let host = if address.contains(':') {
+            format!("[{address}]")
+        } else {
+            address.to_owned()
+        };
+        let output = self
+            .command("curl")
+            .args([
+                "--noproxy",
+                "*",
+                "--insecure",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "3",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{response_code}",
+            ])
+            .arg(format!("https://{host}/"))
+            .output()
+            .map_err(|e| Error::from_io("external-peer HTTPS probe", e))?;
+        let response = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| Error::from_message("external-peer HTTPS probe returned no status"))?;
+        if response >= 100 {
+            return Ok(Some(response));
+        }
+        if matches!(output.status.code(), Some(7 | 28)) && response == 0 {
+            return Ok(None);
+        }
+        Err(Error::from_message(format!(
+            "external-peer HTTPS probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+
     /// Inspect the external peer's neighbor discovery result after real traffic.
     /// This does not require the appliance to offer ICMP Echo service.
     pub fn neighbor_resolved(&self, address: &str) -> Result<bool, Error> {

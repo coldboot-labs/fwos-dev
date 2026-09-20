@@ -93,7 +93,9 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
     );
     let nic = &nics[0];
     assert!(
-        peer.https_get("10.56.0.1", "/").is_err(),
+        peer.https_response("10.56.0.1")
+            .expect("probe pre-opt HTTPS")
+            .is_none(),
         "no HTTPS before console opt-in"
     );
     select_static(&guest, nic, "10.56.0.1/24");
@@ -109,7 +111,9 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
         select_static(&guest, nic, cidr);
         thread::sleep(Duration::from_secs(2));
         assert!(
-            peer.https_get(address, "/").is_err(),
+            peer.https_response(address)
+                .expect("probe excluded-address HTTPS")
+                .is_none(),
             "{kind} must not expose Bootstrap HTTPS"
         );
         if kind == "IPv6 link-local" {
@@ -120,7 +124,9 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
             );
         }
         assert!(
-            peer.https_get("10.56.0.1", "/").is_err(),
+            peer.https_response("10.56.0.1")
+                .expect("probe prior-address HTTPS")
+                .is_none(),
             "replacing the temporary address removes old exposure"
         );
     }
