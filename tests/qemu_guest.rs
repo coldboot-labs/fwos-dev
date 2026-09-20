@@ -135,6 +135,78 @@ fn published_local_identity_protects_https_management() {
     assert_no_ssh(&guest, "after authenticated Bootstrap");
 }
 
+#[test]
+fn published_bootstrap_credentials_work_on_https_and_console() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    opt_user_net(&guest);
+    let mut payload = serde_json::json!({
+        "hostname": "fwos-box",
+        "admin": "alice",
+        "password": "",
+        "interfaces": [
+            {"name": lan_nic, "role": "lan"},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [lan_nic],
+        "lan_prefix": "192.168.1.0/24",
+        "dhcp_pool": "192.168.1.100-192.168.1.200"
+    });
+    for (kind, password) in [
+        ("CR", "line\rbreak"),
+        ("LF", "line\nbreak"),
+        ("Ctrl-D", "terminal\u{0004}control"),
+        ("Ctrl-S", "terminal\u{0013}control"),
+        ("DEL", "terminal\u{007f}control"),
+    ] {
+        payload["password"] = password.into();
+        let (code, body) = guest
+            .https_exchange("POST", "/api/bootstrap", Some(&payload.to_string()), 90)
+            .expect("Bootstrap must respond to a password containing a console control character");
+        assert_eq!(
+            code, 400,
+            "Bootstrap must reject a {kind} password before establishing ownership"
+        );
+        assert!(
+            !body.contains(password),
+            "credential validation must not disclose the submitted password"
+        );
+        let (code, status) = guest
+            .https_exchange("GET", "/api/status", None, 15)
+            .expect("Bootstrap remains reachable after credential validation fails");
+        assert_eq!(code, 200, "invalid credentials must not complete Bootstrap");
+        let status: serde_json::Value =
+            serde_json::from_str(&status).expect("Bootstrap status must be JSON");
+        assert_eq!(
+            status["bootstrapped"], false,
+            "invalid credentials must leave the appliance unowned"
+        );
+    }
+
+    let password = "  boundary-passphrase  ";
+    payload["password"] = password.into();
+    https_bootstrap(&guest, &payload.to_string());
+    let session = https_login_admin(&guest, "alice", password);
+    let status = session
+        .get("/api/status")
+        .expect("HTTPS must accept the exact password including surrounding spaces");
+    assert_eq!(json_string_field(&status, "username").as_deref(), Some("alice"));
+    let trimmed = serde_json::json!({
+        "source": "local", "username": "alice", "password": password.trim()
+    });
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&trimmed.to_string()), 15)
+        .expect("HTTPS must respond to a password with its surrounding spaces removed");
+    assert_eq!(code, 401, "password spaces must remain part of the credential");
+    serial_login_admin(&guest, "alice", password);
+    assert!(
+        !guest.serial().contains(password.trim()),
+        "the Appliance console must not echo the space-preserving password"
+    );
+}
+
 fn https_login_admin<'a>(
     guest: &'a Guest,
     username: &str,
