@@ -172,17 +172,19 @@ fn published_bootstrap_credentials_work_on_https_and_console() {
         "lan_prefix": "192.168.1.0/24",
         "dhcp_pool": "192.168.1.100-192.168.1.200"
     });
+    let too_long = "x".repeat(512);
     for (kind, password) in [
         ("CR", "line\rbreak"),
         ("LF", "line\nbreak"),
         ("Ctrl-D", "terminal\u{0004}control"),
         ("Ctrl-S", "terminal\u{0013}control"),
         ("DEL", "terminal\u{007f}control"),
+        ("unsupported-length", too_long.as_str()),
     ] {
         payload["password"] = password.into();
         let (code, body) = guest
             .https_exchange("POST", "/api/bootstrap", Some(&payload.to_string()), 90)
-            .expect("Bootstrap must respond to a password containing a console control character");
+            .expect("Bootstrap must respond to an unsupported password");
         assert_eq!(
             code, 400,
             "Bootstrap must reject a {kind} password before establishing ownership"
