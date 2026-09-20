@@ -83,8 +83,26 @@ fn published_local_identity_protects_https_management() {
         code, 401,
         "logout revokes the server-side session, not just the browser cookie"
     );
+    let admin_ready = serial_wait(&guest, 0, 90, |text| {
+        text.contains("FWOS Appliance CLI")
+            && text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        admin_ready.contains("FWOS Appliance CLI")
+            && admin_ready.lines().any(|line| line.trim() == "admin:"),
+        "Bootstrap must hand serial input to the administrator prompt before login; serial tail:\n{}",
+        serial_tail(&admin_ready, 4000)
+            .replace("secret12", "<REDACTED>")
+            .replace("incorrect-console-password", "<REDACTED>")
+    );
     let password_prompt = serial_cmd(&guest, "alice\n", 15, |text| text.contains("password:"));
-    assert!(password_prompt.contains("password:"));
+    assert!(
+        password_prompt.contains("password:"),
+        "the ready administrator prompt must request a password after a username; serial tail:\n{}",
+        serial_tail(&guest.serial(), 4000)
+            .replace("secret12", "<REDACTED>")
+            .replace("incorrect-console-password", "<REDACTED>")
+    );
     let denied = serial_cmd(&guest, "incorrect-console-password\n", 15, |text| {
         text.contains("login failed")
     });
