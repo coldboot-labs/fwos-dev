@@ -1687,6 +1687,20 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         }
         thread::sleep(Duration::from_secs(2));
     }
+    let approval_started = Instant::now();
+    let approval_offset = match ready_installer_approval(&mut child, &mut serial, &serial_log) {
+        Ok(offset) => offset,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&work);
+            return Err(error);
+        }
+    };
+    eprintln!(
+        "[DEBUG-54-installer] stage=approve target=/dev/vda serial_offset={approval_offset} elapsed_ms={}",
+        approval_started.elapsed().as_millis()
+    );
     serial
         .write_all(b"yes\r\n")
         .map_err(|e| Error::from_io("writing Installer yes", e))?;
@@ -1722,6 +1736,87 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         )));
     }
     Ok(())
+}
+
+fn ready_installer_approval(
+    child: &mut Child,
+    serial: &mut UnixStream,
+    serial_log: &Path,
+) -> Result<usize, Error> {
+    // This path creates exactly one empty virtio disk: never approve a disk
+    // picker or a different target. Enter declines; only the caller sends yes.
+    const PROMPT: &str = "Type yes to wipe /dev/vda: ";
+    let started = Instant::now();
+    let mut last_size = 0;
+    let mut changed = started;
+    let mut attempts = 0;
+    let mut pending: Option<(usize, Instant)> = None;
+    while started.elapsed() < Duration::from_secs(60) {
+        if child
+            .try_wait()
+            .map_err(|error| Error::from_io("checking Installer readiness", error))?
+            .is_some()
+        {
+            return Err(Error::from_message(
+                "Installer exited during approval readiness",
+            ));
+        }
+        let log = fs::read(serial_log)
+            .map_err(|error| Error::from_io("reading Installer readiness serial", error))?;
+        let text = String::from_utf8_lossy(&log);
+        let other_target = text.split("Type yes to wipe ").skip(1).any(|tail| {
+            tail.split_once(':')
+                .is_some_and(|(target, _)| target != "/dev/vda")
+        });
+        if text.contains(INSTALLER_DISK_PROMPT) || other_target {
+            return Err(Error::from_message(
+                "Installer approval target changed; refusing automatic approval",
+            ));
+        }
+        if log.len() != last_size {
+            last_size = log.len();
+            changed = Instant::now();
+        }
+        if let Some((offset, sent)) = pending {
+            let fresh = log.get(offset..).ok_or_else(|| {
+                Error::from_message("Installer serial log shrank during approval readiness")
+            })?;
+            if String::from_utf8_lossy(fresh).contains(PROMPT) {
+                eprintln!(
+                    "[DEBUG-54-installer] stage=fresh-prompt attempt={attempts} serial_offset={} elapsed_ms={}",
+                    log.len(), started.elapsed().as_millis()
+                );
+                return Ok(log.len());
+            }
+            if sent.elapsed() >= Duration::from_secs(10) {
+                pending = None;
+                if attempts == 3 {
+                    break;
+                }
+            }
+        }
+        // Anaconda can reset ttyS0 after its first visible prompt. Wait for
+        // terminal output to settle, then require a new response to safe input.
+        if pending.is_none() && changed.elapsed() >= Duration::from_secs(2) && text.contains(PROMPT)
+        {
+            attempts += 1;
+            let offset = log.len();
+            eprintln!(
+                "[DEBUG-54-installer] stage=decline-probe attempt={attempts} serial_offset={offset} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            serial
+                .write_all(b"\n")
+                .and_then(|_| serial.flush())
+                .map_err(|error| Error::from_io("probing Installer approval with Enter", error))?;
+            pending = Some((offset, Instant::now()));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(Error::from_message(format!(
+        "Installer approval readiness failed: stage=fresh-prompt attempts={attempts} serial_offset={last_size} elapsed_ms={}",
+        started.elapsed().as_millis()
+    )))
 }
 
 fn create_empty_qcow2(path: &Path) -> Result<(), Error> {
