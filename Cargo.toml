@@ -6,6 +6,9 @@ license = "MIT"
 description = "Workstation tooling: build a host-image disk and run guests"
 repository = "https://github.com/coldboot-labs/fwos-dev"
 
+[dependencies]
+serde_json = "1"
+
 [[bin]]
 name = "fwos-dev"
 path = "src/main.rs"

@@ -14,6 +14,157 @@ fn guest_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn published_local_identity_protects_https_management() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+
+    let (code, body) = guest
+        .https_exchange("GET", "/api/status", None, 15)
+        .expect("anonymous HTTPS response after Bootstrap");
+    assert_eq!(code, 401, "management status requires login: {body}");
+    assert!(!body.contains("192.168.1.0/24"));
+    let (code, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/login",
+            Some(r#"{"source":"local","username":"alice","password":"incorrect"}"#),
+            15,
+        )
+        .expect("incorrect-password login response");
+    assert_eq!(
+        code, 401,
+        "an incorrect password cannot authorize management"
+    );
+    let (code, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/login",
+            Some(r#"{"source":"os","username":"alice","password":"secret12"}"#),
+            15,
+        )
+        .expect("unknown Authentication source response");
+    assert_eq!(
+        code, 401,
+        "another source must not fall back to a local account"
+    );
+    let session = guest
+        .https_login(r#"{"source":"local","username":"alice","password":"secret12"}"#)
+        .expect("the Bootstrap-created FWOS-local administrator signs in over HTTPS");
+    let status = session
+        .get("/api/status")
+        .expect("authenticated management status");
+    assert!(status.contains("192.168.1.0/24"));
+    assert_eq!(
+        json_string_field(&status, "source").as_deref(),
+        Some("local")
+    );
+    assert_eq!(
+        json_string_field(&status, "username").as_deref(),
+        Some("alice")
+    );
+    assert!(json_string_field(&status, "subject").is_some());
+    assert!(
+        !status.contains("secret12")
+            && !status.contains("password_hash")
+            && !status.contains("$y$")
+    );
+    let replay = session.clone();
+    let (code, _) = session
+        .exchange("POST", "/api/logout", Some("{}"), 15)
+        .expect("authenticated logout response");
+    assert_eq!(code, 200);
+    let (code, _) = replay
+        .exchange("GET", "/api/status", None, 15)
+        .expect("revoked-cookie replay response");
+    assert_eq!(
+        code, 401,
+        "logout revokes the server-side session, not just the browser cookie"
+    );
+    let password_prompt = serial_cmd(&guest, "alice\n", 15, |text| text.contains("password:"));
+    assert!(password_prompt.contains("password:"));
+    let denied = serial_cmd(&guest, "incorrect-console-password\n", 15, |text| {
+        text.contains("login failed")
+    });
+    assert!(
+        denied.contains("login failed"),
+        "incorrect console credentials must fail"
+    );
+    serial_login_admin(&guest, "alice", "secret12");
+    let serial = guest.serial();
+    assert!(
+        !serial.contains("incorrect-console-password") && !serial.contains("secret12"),
+        "the Appliance console must not echo passwords into serial output"
+    );
+    let before_reboot = https_login_admin(&guest, "alice", "secret12");
+    assert!(before_reboot.get("/api/status").is_ok());
+    let reboot_from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("authenticated console reboot");
+    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+        text.contains("FWOS Appliance CLI")
+    });
+    assert!(
+        rebooted.contains("FWOS Appliance CLI"),
+        "authenticated console must return after reboot"
+    );
+    assert!(
+        !rebooted.contains("FWOS Bootstrap console"),
+        "reboot must not reopen Bootstrap"
+    );
+    serial_login_admin_from(&guest, "alice", "secret12", reboot_from);
+    let current = https_login_admin(&guest, "alice", "secret12");
+    let restored = current
+        .get("/api/status")
+        .expect("persistent local Identity authenticates after reboot");
+    assert_eq!(
+        json_string_field(&restored, "subject"),
+        json_string_field(&status, "subject")
+    );
+    let (code, _) = before_reboot
+        .exchange("GET", "/api/status", None, 15)
+        .expect("old-session request after reboot");
+    assert_eq!(code, 401, "reboot must invalidate prior HTTPS sessions");
+    let browser = guest
+        .browser_login("alice", "secret12")
+        .expect("rendered UI must sign in, show useful authenticated status, and sign out");
+    println!("real rendered local-identity scenario passed on Firefox {browser}");
+    assert_no_ssh(&guest, "after authenticated Bootstrap");
+}
+
+fn https_login_admin<'a>(
+    guest: &'a Guest,
+    username: &str,
+    password: &str,
+) -> fwos_dev::HttpsSession<'a> {
+    let credentials =
+        serde_json::json!({"source": "local", "username": username, "password": password})
+            .to_string();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        match guest.https_login(&credentials) {
+            Ok(session) => return session,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "HTTPS administrator login unavailable: {error}"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+fn https_authenticated_status(guest: &Guest) -> Result<String, fwos_dev::Error> {
+    guest
+        .https_login(r#"{"source":"local","username":"alice","password":"secret12"}"#)?
+        .get("/api/status")
+}
+
+#[test]
 fn published_disk_image_has_no_network_ssh_before_bootstrap() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image()
@@ -297,7 +448,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
 
     let mut after = String::new();
     for _ in 0..180 {
-        match guest.https_get("/api/status") {
+        match https_authenticated_status(&guest) {
             Ok(body) => {
                 after = body;
                 if after.contains("\"bootstrapped\"") && after.contains("true") {
@@ -647,7 +798,7 @@ fn published_three_nic_mgmt_https_after_bootstrap() {
 
     let mut after = String::new();
     for _ in 0..180 {
-        match guest.https_get("/api/status") {
+        match https_authenticated_status(&guest) {
             Ok(body) => {
                 after = body;
                 if after.contains("\"bootstrapped\"") && after.contains("true") {
@@ -815,8 +966,9 @@ fn published_serial_stages_host_update_then_reboot_applies() {
 
     let mut ui_update = String::from("(no POST)");
     let mut ui_code = 0u16;
+    let ui_session = https_login_admin(&guest, "alice", "secret12");
     for _ in 0..30 {
-        match guest.https_exchange(
+        match ui_session.exchange(
             "POST",
             "/api/update",
             Some(&format!(r#"{{"image":"{image}"}}"#)),
@@ -882,7 +1034,7 @@ fn published_serial_stages_host_update_then_reboot_applies() {
 
     let mut ui_status = String::new();
     for _ in 0..30 {
-        match guest.https_get("/api/status") {
+        match https_authenticated_status(&guest) {
             Ok(body) => {
                 ui_status = body;
                 if ui_status.contains("\"bootstrapped\"") && ui_status.contains("true") {
@@ -981,7 +1133,7 @@ fn published_serial_stages_host_update_then_reboot_applies() {
 
     let mut ui_after = String::new();
     for _ in 0..180 {
-        match guest.https_get("/api/status") {
+        match https_authenticated_status(&guest) {
             Ok(body) => {
                 ui_after = body;
                 if ui_after.contains("\"bootstrapped\"") && ui_after.contains("true") {
@@ -1163,7 +1315,7 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
 
     let mut ui_after = String::new();
     for _ in 0..180 {
-        match guest.https_get("/api/status") {
+        match https_authenticated_status(&guest) {
             Ok(body) => {
                 ui_after = body;
                 if ui_after.contains("\"bootstrapped\"") && ui_after.contains("true") {
@@ -1235,13 +1387,14 @@ fn https_bootstrap(guest: &Guest, payload: &str) {
 
     let mut after = String::new();
     for _ in 0..180 {
-        match guest.https_get("/api/status") {
-            Ok(body) => {
+        match guest.https_exchange("GET", "/api/status", None, 15) {
+            Ok((200 | 401, body)) => {
                 after = body;
                 if after.contains("\"bootstrapped\"") && after.contains("true") {
                     break;
                 }
             }
+            Ok((code, body)) => after = format!("http_code={code} {body}"),
             Err(e) => after = e.to_string(),
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1316,7 +1469,8 @@ fn serial_login_admin_from(guest: &Guest, user: &str, password: &str, from: usiz
     }
     assert!(
         logged_in,
-        "admin must authenticate into the Appliance CLI, serial:\n{last}"
+        "admin must authenticate into the Appliance CLI, serial:\n{}",
+        last.replace(password, "[redacted]")
     );
 }
 

@@ -1,0 +1,12 @@
+{
+  "name": "fwos-dev-browser-driver",
+  "private": true,
+  "type": "module",
+  "description": "Rendered UI driver invoked by the existing Rust appliance tests",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

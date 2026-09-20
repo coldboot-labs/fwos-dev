@@ -85,6 +85,44 @@ pub struct Guest {
     monitor: PathBuf,
 }
 
+/// An ordinary HTTPS client authenticated through the appliance's login flow.
+/// Cloning it copies the browser cookie, allowing revoked-cookie replay checks.
+#[derive(Clone)]
+pub struct HttpsSession<'a> {
+    guest: &'a Guest,
+    cookie: String,
+}
+
+impl HttpsSession<'_> {
+    pub fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<(u16, String), Error> {
+        let (code, body, _) = self.guest.https_exchange_headers(
+            "10.0.2.15",
+            self.guest.https_port,
+            method,
+            path,
+            body,
+            max_time_secs,
+            &[format!("Cookie: {}", self.cookie)],
+        )?;
+        Ok((code, body))
+    }
+
+    pub fn get(&self, path: &str) -> Result<String, Error> {
+        let (code, body) = self.exchange("GET", path, None, 15)?;
+        if code == 200 {
+            Ok(body)
+        } else {
+            Err(Error::from_message(format!("HTTPS status {code}: {body}")))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Error {
     message: String,
@@ -111,6 +149,25 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+fn output_with_input(command: &mut Command, input: &[u8]) -> io::Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("child stdin unavailable"))
+        .and_then(|mut stdin| stdin.write_all(input));
+    if let Err(error) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait_with_output()
+}
 
 impl Guest {
     /// Disk image: no injected SSH key, no default password. Observe via serial and HTTPS.
@@ -276,6 +333,87 @@ impl Guest {
         self.https_ok("POST", path, Some(body), 90)
     }
 
+    /// Submit credentials through HTTPS, retaining only the returned session cookie.
+    /// The anonymous request helpers remain anonymous even after this call.
+    pub fn https_login(&self, credentials: &str) -> Result<HttpsSession<'_>, Error> {
+        let (code, _, headers) = self.https_exchange_headers(
+            "10.0.2.15",
+            self.https_port,
+            "POST",
+            "/api/login",
+            Some(credentials),
+            15,
+            &[],
+        )?;
+        if code != 200 {
+            return Err(Error::from_message(format!("HTTPS login status {code}")));
+        }
+        let cookie = headers
+            .lines()
+            .find_map(|header| {
+                let (name, value) = header.split_once(':')?;
+                if !name.eq_ignore_ascii_case("set-cookie") {
+                    return None;
+                }
+                let mut parts = value.trim().split(';');
+                let cookie = parts.next()?;
+                if !cookie.starts_with("__Host-fwos=") {
+                    return None;
+                }
+                let attributes: Vec<String> =
+                    parts.map(|part| part.trim().to_ascii_lowercase()).collect();
+                let protected = ["secure", "httponly", "samesite=strict", "path=/"]
+                    .iter()
+                    .all(|required| attributes.iter().any(|attribute| attribute == required))
+                    && !attributes
+                        .iter()
+                        .any(|attribute| attribute.starts_with("domain="));
+                protected.then(|| cookie.to_string())
+            })
+            .ok_or_else(|| {
+                Error::from_message(
+                    "login did not set a Secure, HttpOnly, SameSite=Strict host session cookie",
+                )
+            })?;
+        Ok(HttpsSession {
+            guest: self,
+            cookie,
+        })
+    }
+
+    /// Drive real rendered sign-in/status/sign-out through the same HTTPS peer
+    /// connection. The Node driver is a client of this Guest, not another runner.
+    pub fn browser_login(&self, username: &str, password: &str) -> Result<String, Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "username": username,
+            "password": password,
+        }))
+        .map_err(|_| Error::from_message("encode browser login input"))?;
+        let mut command = Command::new("node");
+        command.arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/browser/login.mjs"
+        ));
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run rendered UI driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| Error::from_message("rendered UI driver returned no valid result"))?;
+        if !output.status.success()
+            || result["ok"] != true
+            || result["scenario"] != "local-identity"
+        {
+            let stage = result["stage"].as_str().unwrap_or("driver");
+            return Err(Error::from_message(format!(
+                "rendered local-identity scenario failed at {stage}"
+            )));
+        }
+        result["browser"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::from_message("rendered UI driver omitted browser version"))
+    }
+
     /// GET `path` on the extra virtio-net (10.0.3.15) over HTTPS.
     pub fn https_get_extra(&self, path: &str) -> Result<String, Error> {
         let port = self
@@ -320,11 +458,36 @@ impl Guest {
         body: Option<&str>,
         max_time_secs: u64,
     ) -> Result<(u16, String), Error> {
+        let (code, body, _) = self.https_exchange_headers(
+            guest_ip,
+            host_port,
+            method,
+            path,
+            body,
+            max_time_secs,
+            &[],
+        )?;
+        Ok((code, body))
+    }
+
+    fn https_exchange_headers(
+        &self,
+        guest_ip: &str,
+        host_port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        max_time_secs: u64,
+        headers: &[String],
+    ) -> Result<(u16, String, String), Error> {
         let url = format!("https://{guest_ip}{path}");
         let connect = format!("{guest_ip}:443:127.0.0.1:{host_port}");
         let mut cmd = Command::new("curl");
         cmd.args([
             "-sk",
+            "--include",
+            "--noproxy",
+            "*",
             "--max-time",
             &max_time_secs.to_string(),
             "--http1.1",
@@ -342,12 +505,15 @@ impl Guest {
         if body.is_some() {
             cmd.args(["-H", "Content-Type: application/json"]);
         }
-        if let Some(body) = body {
-            cmd.args(["--data-binary", body]);
+        for header in headers {
+            cmd.args(["-H", header]);
+        }
+        if body.is_some() {
+            // Bootstrap and login credentials must not appear in process argv.
+            cmd.args(["--data-binary", "@-"]);
         }
         cmd.arg(&url);
-        let output = cmd
-            .output()
+        let output = output_with_input(&mut cmd, body.unwrap_or("").as_bytes())
             .map_err(|e| Error::from_io("running curl", e))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let (body, code) = match stdout.rsplit_once("http_code=") {
@@ -357,7 +523,10 @@ impl Guest {
         // A complete HTTP response is usable even if curl exits 56 (no TLS close_notify).
         if let Some(code) = code {
             if code != 0 {
-                return Ok((code, body));
+                let (headers, body) = body
+                    .split_once("\r\n\r\n")
+                    .ok_or_else(|| Error::from_message("incomplete HTTPS response headers"))?;
+                return Ok((code, body.to_string(), headers.to_string()));
             }
         }
         Err(Error::from_message(format!(
