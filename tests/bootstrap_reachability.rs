@@ -68,7 +68,7 @@ fn assert_bootstrap_https(peer: &NetworkPeer, address: &str) {
 }
 
 #[test]
-fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
+fn bootstrap_https_excludes_non_private_address_classes() {
     let peer = NetworkPeer::new().expect("isolated external peer");
     for cidr in [
         "10.56.0.2/24",
@@ -130,6 +130,17 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
             "replacing the temporary address removes old exposure"
         );
     }
-    select_static(&guest, nic, "fd56::1/64");
+}
+
+#[test]
+fn bootstrap_ula_https_works_after_a_fresh_static_selection() {
+    let peer = NetworkPeer::new().expect("isolated IPv6 external peer");
+    peer.add_address("fd56::2/64")
+        .expect("on-link ULA peer address");
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer])
+        .expect("published appliance on external IPv6 Ethernet");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 1);
+    select_static(&guest, &nics[0], "fd56::1/64");
     assert_bootstrap_https(&peer, "fd56::1");
 }
