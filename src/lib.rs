@@ -1687,20 +1687,12 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         }
         thread::sleep(Duration::from_secs(2));
     }
-    let approval_started = Instant::now();
-    let approval_offset = match ready_installer_approval(&mut child, &mut serial, &serial_log) {
-        Ok(offset) => offset,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_dir_all(&work);
-            return Err(error);
-        }
-    };
-    eprintln!(
-        "[DEBUG-54-installer] stage=approve target=/dev/vda serial_offset={approval_offset} elapsed_ms={}",
-        approval_started.elapsed().as_millis()
-    );
+    if let Err(error) = ready_installer_approval(&mut child, &mut serial, &serial_log) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&work);
+        return Err(error);
+    }
     serial
         .write_all(b"yes\r\n")
         .map_err(|e| Error::from_io("writing Installer yes", e))?;
@@ -1742,7 +1734,7 @@ fn ready_installer_approval(
     child: &mut Child,
     serial: &mut UnixStream,
     serial_log: &Path,
-) -> Result<usize, Error> {
+) -> Result<(), Error> {
     // This path creates exactly one empty virtio disk: never approve a disk
     // picker or a different target. Enter declines; only the caller sends yes.
     const PROMPT: &str = "Type yes to wipe /dev/vda: ";
@@ -1782,11 +1774,7 @@ fn ready_installer_approval(
                 Error::from_message("Installer serial log shrank during approval readiness")
             })?;
             if String::from_utf8_lossy(fresh).contains(PROMPT) {
-                eprintln!(
-                    "[DEBUG-54-installer] stage=fresh-prompt attempt={attempts} serial_offset={} elapsed_ms={}",
-                    log.len(), started.elapsed().as_millis()
-                );
-                return Ok(log.len());
+                return Ok(());
             }
             if sent.elapsed() >= Duration::from_secs(10) {
                 pending = None;
@@ -1801,10 +1789,6 @@ fn ready_installer_approval(
         {
             attempts += 1;
             let offset = log.len();
-            eprintln!(
-                "[DEBUG-54-installer] stage=decline-probe attempt={attempts} serial_offset={offset} elapsed_ms={}",
-                started.elapsed().as_millis()
-            );
             serial
                 .write_all(b"\n")
                 .and_then(|_| serial.flush())
