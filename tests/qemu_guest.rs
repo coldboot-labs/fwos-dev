@@ -84,8 +84,7 @@ fn published_local_identity_protects_https_management() {
         "logout revokes the server-side session, not just the browser cookie"
     );
     let admin_ready = serial_wait(&guest, 0, 90, |text| {
-        text.contains("FWOS Appliance CLI")
-            && text.lines().any(|line| line.trim() == "admin:")
+        text.contains("FWOS Appliance CLI") && text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
         admin_ready.contains("FWOS Appliance CLI")
@@ -213,14 +212,20 @@ fn published_bootstrap_credentials_work_on_https_and_console() {
     let status = session
         .get("/api/status")
         .expect("HTTPS must accept a 511-byte password including Unicode and surrounding spaces");
-    assert_eq!(json_string_field(&status, "username").as_deref(), Some("alice"));
+    assert_eq!(
+        json_string_field(&status, "username").as_deref(),
+        Some("alice")
+    );
     let trimmed = serde_json::json!({
         "source": "local", "username": "alice", "password": password.trim()
     });
     let (code, _) = guest
         .https_exchange("POST", "/api/login", Some(&trimmed.to_string()), 15)
         .expect("HTTPS must respond to a password with its surrounding spaces removed");
-    assert_eq!(code, 401, "password spaces must remain part of the credential");
+    assert_eq!(
+        code, 401,
+        "password spaces must remain part of the credential"
+    );
     serial_login_admin(&guest, "alice", &password);
     assert!(
         !guest.serial().contains(password.trim()),
