@@ -280,6 +280,47 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
 }
 
 #[test]
+fn bootstrap_slaac_exposes_a_ula_advertised_after_console_selection_finishes() {
+    let _guard = guest_lock();
+    let mut peer = NetworkPeer::new().expect("isolated late-RA peer");
+    peer.add_address("10.59.0.2/24").unwrap();
+    peer.add_address("fd59::2/64").unwrap();
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer]).expect("published appliance");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 1);
+    let selected = console_command(&guest, &format!("slaac {}", nics[0]));
+    assert!(
+        nic_addresses(&selected, &nics[0])
+            .iter()
+            .all(|address| address.starts_with("fe80:")),
+        "no router has advertised a ULA yet: {selected}"
+    );
+    // Start the real router only after the command's acquisition wait ends.
+    peer.advertise("10.59.0.100", "255.255.255.0", "fd59::")
+        .expect("start delayed external RA");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let address = loop {
+        let status = console_command(&guest, "status");
+        if let Some(address) = nic_addresses(&status, &nics[0])
+            .into_iter()
+            .find(|address| address.starts_with("fd59:"))
+        {
+            break address;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late RA must configure selected NIC: {status}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    };
+    assert_bootstrap_https(&peer, &address);
+    assert!(
+        peer.discovery_packets().unwrap().neighbor_discovery > 0,
+        "positive control for delayed-RA capture and IPv6 traffic"
+    );
+}
+
+#[test]
 fn bootstrap_https_excludes_non_private_address_classes() {
     let _guard = guest_lock();
     let peer = NetworkPeer::new().expect("isolated external peer");
