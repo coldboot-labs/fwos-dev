@@ -3,8 +3,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn console_nics(guest: &Guest) -> Vec<String> {
-    guest
-        .serial()
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let serial = loop {
+        let serial = guest.serial();
+        if serial.contains("Reach the UI:") {
+            break serial;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "console NIC list is incomplete: {serial}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    serial
         .rsplit("NICs:")
         .next()
         .unwrap_or("")
@@ -63,9 +74,9 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
         "10.56.0.2/24",
         "169.254.56.2/16",
         "100.64.56.2/24",
-        "198.51.100.2/24",
+        "8.8.8.2/24",
         "fd56::2/64",
-        "2001:db8:56::2/64",
+        "2001:4860:56::2/64",
         "fe80::2/64",
     ] {
         peer.add_address(cidr)
@@ -91,8 +102,8 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
     for (kind, cidr, address) in [
         ("IPv4 link-local", "169.254.56.1/16", "169.254.56.1"),
         ("CGNAT", "100.64.56.1/24", "100.64.56.1"),
-        ("global IPv4", "198.51.100.1/24", "198.51.100.1"),
-        ("IPv6 GUA", "2001:db8:56::1/64", "2001:db8:56::1"),
+        ("global IPv4", "8.8.8.1/24", "8.8.8.1"),
+        ("IPv6 GUA", "2001:4860:56::1/64", "2001:4860:56::1"),
         ("IPv6 link-local", "fe80::1/64", "fe80::1%eth0"),
     ] {
         select_static(&guest, nic, cidr);
