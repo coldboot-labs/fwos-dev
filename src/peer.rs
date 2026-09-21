@@ -160,26 +160,9 @@ impl NetworkPeer {
 
     /// Request the appliance directly over this Ethernet segment.
     pub fn https_get(&self, address: &str, path: &str) -> Result<String, Error> {
-        let host = if address.contains(':') {
-            format!("[{address}]")
-        } else {
-            address.to_owned()
-        };
         let output = self
-            .command("curl")
-            .args([
-                "--noproxy",
-                "*",
-                "--insecure",
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--connect-timeout",
-                "2",
-                "--max-time",
-                "3",
-            ])
-            .arg(format!("https://{host}{path}"))
+            .https_command(address, path)
+            .arg("--fail")
             .output()
             .map_err(|e| Error::from_io("external-peer HTTPS", e))?;
         if !output.status.success() {
@@ -195,29 +178,9 @@ impl NetworkPeer {
     /// connection or timeout with no HTTP response establishes unreachability;
     /// broken peer commands, malformed URLs and TLS errors remain test errors.
     pub fn https_response(&self, address: &str) -> Result<Option<u16>, Error> {
-        let host = if address.contains(':') {
-            format!("[{address}]")
-        } else {
-            address.to_owned()
-        };
         let output = self
-            .command("curl")
-            .args([
-                "--noproxy",
-                "*",
-                "--insecure",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "2",
-                "--max-time",
-                "3",
-                "--output",
-                "/dev/null",
-                "--write-out",
-                "%{response_code}",
-            ])
-            .arg(format!("https://{host}/"))
+            .https_command(address, "/")
+            .args(["--output", "/dev/null", "--write-out", "%{response_code}"])
             .output()
             .map_err(|e| Error::from_io("external-peer HTTPS probe", e))?;
         let response = String::from_utf8_lossy(&output.stdout)
@@ -234,6 +197,29 @@ impl NetworkPeer {
             "external-peer HTTPS probe failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )))
+    }
+
+    fn https_command(&self, address: &str, path: &str) -> Command {
+        let host = if address.contains(':') {
+            format!("[{address}]")
+        } else {
+            address.to_owned()
+        };
+        let mut command = self.command("curl");
+        command
+            .args([
+                "--noproxy",
+                "*",
+                "--insecure",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "2",
+                "--max-time",
+                "3",
+            ])
+            .arg(format!("https://{host}{path}"));
+        command
     }
 
     /// Establish real TLS and hold an incomplete HTTP request across a network change.

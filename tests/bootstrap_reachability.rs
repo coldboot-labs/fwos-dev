@@ -332,21 +332,7 @@ fn bootstrap_slaac_exposes_a_ula_advertised_after_console_selection_finishes() {
     // Start the real router only after the command's acquisition wait ends.
     peer.advertise("10.59.0.100", "255.255.255.0", "fd59::")
         .expect("start delayed external RA");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let address = loop {
-        let status = console_command(&guest, "status");
-        if let Some(address) = nic_addresses(&status, &nics[0])
-            .into_iter()
-            .find(|address| address.starts_with("fd59:"))
-        {
-            break address;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "late RA must configure selected NIC: {status}"
-        );
-        thread::sleep(Duration::from_secs(1));
-    };
+    let address = wait_for_advertised_ula(&guest, &nics[0], "fd59:");
     assert_bootstrap_https(&peer, &address);
     assert!(
         peer.discovery_packets().unwrap().neighbor_discovery > 0,
