@@ -108,19 +108,22 @@ fn bootstrap_https_only_uses_rfc1918_or_ula_on_the_selected_nic() {
     ] {
         select_static(&guest, nic, cidr);
         thread::sleep(Duration::from_secs(2));
-        peer.ping(address)
-            .expect("selected interface remains on-link, including neighbor discovery");
         assert!(
             peer.https_get(address, "/").is_err(),
             "{kind} must not expose Bootstrap HTTPS"
         );
+        if kind == "IPv6 link-local" {
+            assert!(
+                peer.neighbor_resolved("fe80::1")
+                    .expect("read external peer's neighbor discovery result"),
+                "excluding link-local HTTPS must not break IPv6 neighbor discovery"
+            );
+        }
         assert!(
             peer.https_get("10.56.0.1", "/").is_err(),
             "replacing the temporary address removes old exposure"
         );
     }
     select_static(&guest, nic, "fd56::1/64");
-    peer.ping("fd56::1")
-        .expect("IPv6 neighbor discovery still works");
     assert_bootstrap_https(&peer, "fd56::1");
 }

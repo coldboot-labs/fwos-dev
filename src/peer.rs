@@ -131,21 +131,35 @@ impl NetworkPeer {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// Verify neighbor discovery through ordinary peer traffic, not guest state.
-    pub fn ping(&self, address: &str) -> Result<(), Error> {
+    /// Inspect the external peer's neighbor discovery result after real traffic.
+    /// This does not require the appliance to offer ICMP Echo service.
+    pub fn neighbor_resolved(&self, address: &str) -> Result<bool, Error> {
         let output = self
-            .command("ping")
-            .args(["-I", "eth0", "-c", "1", "-W", "2", address])
+            .command("ip")
+            .args(["-j", "neigh", "show", "to", address, "dev", "eth0"])
             .output()
-            .map_err(|e| Error::from_io("external-peer ping", e))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(Error::from_message(format!(
-                "external-peer ping failed: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )))
+            .map_err(|e| Error::from_io("external-peer neighbor discovery", e))?;
+        if !output.status.success() {
+            return Err(Error::from_message(format!(
+                "reading external-peer neighbors: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
+        let neighbors: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|e| Error::from_message(format!("external-peer neighbor JSON: {e}")))?;
+        Ok(neighbors.iter().any(|neighbor| {
+            neighbor["lladdr"]
+                .as_str()
+                .is_some_and(|mac| !mac.is_empty())
+                && neighbor["state"].as_array().is_some_and(|states| {
+                    states.iter().any(|state| {
+                        matches!(
+                            state.as_str(),
+                            Some("REACHABLE" | "STALE" | "DELAY" | "PROBE")
+                        )
+                    })
+                })
+        }))
     }
 
     fn command(&self, executable: &str) -> Command {
