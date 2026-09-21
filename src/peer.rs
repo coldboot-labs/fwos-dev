@@ -4,6 +4,10 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+mod discovery;
+use discovery::Discovery;
+pub use discovery::DiscoveryPackets;
+
 static NEXT_PEER: AtomicU32 = AtomicU32::new(0);
 
 /// An isolated external Ethernet peer. Only task-owned links and namespace are
@@ -17,6 +21,7 @@ pub struct NetworkPeer {
     owned_bridge: bool,
     owned_tap: bool,
     owned_uplink: bool,
+    discovery: Option<Discovery>,
 }
 
 impl NetworkPeer {
@@ -32,6 +37,7 @@ impl NetworkPeer {
             owned_bridge: false,
             owned_tap: false,
             owned_uplink: false,
+            discovery: None,
         };
         let (uid, _) = current_uid_gid()?;
         ip(&["netns", "add", &peer.namespace])?;
@@ -78,12 +84,43 @@ impl NetworkPeer {
             ip(&["link", "set", name, "up"])?;
         }
         ip(&["-n", &peer.namespace, "link", "set", "lo", "up"])?;
+        let output = peer
+            .command("sysctl")
+            .args([
+                "-w",
+                "net.ipv6.conf.eth0.accept_ra=0",
+                "net.ipv6.conf.eth0.autoconf=0",
+            ])
+            .output()
+            .map_err(|e| Error::from_io("isolate peer IPv6 configuration", e))?;
+        if !output.status.success() {
+            return Err(Error::from_message(
+                "could not isolate peer IPv6 configuration",
+            ));
+        }
         ip(&["-n", &peer.namespace, "link", "set", "eth0", "up"])?;
         Ok(peer)
     }
 
     pub(crate) fn tap(&self) -> &str {
         &self.tap
+    }
+
+    /// Start real DHCP/RA service and capture guest discovery packets before boot.
+    /// Addresses and prefixes belong only to this peer's isolated segment.
+    pub fn advertise(&mut self, lease: &str, netmask: &str, ula_prefix: &str) -> Result<(), Error> {
+        if self.discovery.is_some() {
+            return Err(Error::from_message("peer discovery already started"));
+        }
+        self.discovery = Some(Discovery::start(self, lease, netmask, ula_prefix)?);
+        Ok(())
+    }
+
+    pub fn discovery_packets(&mut self) -> Result<DiscoveryPackets, Error> {
+        self.discovery
+            .as_mut()
+            .ok_or_else(|| Error::from_message("peer discovery not started"))?
+            .packets()
     }
 
     /// Add an on-link peer address, not an address inside the appliance.
@@ -323,6 +360,23 @@ impl Drop for PendingHttps {
 
 impl Drop for NetworkPeer {
     fn drop(&mut self) {
+        if self.owned_namespace {
+            // Processes in this exclusively owned namespace are only fixture
+            // helpers. Stop them before removing links or dropping log files.
+            if let Ok(output) = Command::new("sudo")
+                .args(["-n", "ip", "netns", "pids", &self.namespace])
+                .output()
+            {
+                for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                    if pid.parse::<u32>().is_ok() {
+                        let _ = Command::new("sudo")
+                            .args(["-n", "kill", "-TERM", pid])
+                            .output();
+                    }
+                }
+            }
+        }
+        self.discovery.take();
         // These names are generated exclusively for this peer. Removing the
         // namespace also removes its veth; no broad network cleanup is used.
         for (owned, args) in [

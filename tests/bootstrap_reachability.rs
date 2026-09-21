@@ -35,16 +35,24 @@ fn console_nics(guest: &Guest) -> Vec<String> {
 }
 
 fn select_static(guest: &Guest, nic: &str, cidr: &str) {
+    console_command(guest, &format!("static {nic} {cidr}"));
+}
+
+fn console_command(guest: &Guest, command: &str) -> String {
     let before = guest.serial().len();
     guest
-        .serial_write(&format!("static {nic} {cidr}\n"))
+        .serial_write(&format!("{command}\n"))
         .expect("select temporary address through console");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_console_since(guest, before, Duration::from_secs(40))
+}
+
+fn wait_console_since(guest: &Guest, before: usize, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
     loop {
         let serial = guest.serial();
         let tail = serial.get(before..).unwrap_or("");
         if tail.contains("FWOS Bootstrap console") && tail.contains("Reach the UI:") {
-            return;
+            return tail.to_owned();
         }
         assert!(
             Instant::now() < deadline,
@@ -62,6 +70,16 @@ fn assert_bootstrap_https(peer: &NetworkPeer, address: &str) {
             let status: serde_json::Value =
                 serde_json::from_str(body).expect("Bootstrap JSON status");
             assert_eq!(status["bootstrapped"], false);
+            assert_eq!(
+                status["interfaces"],
+                serde_json::json!([]),
+                "temporary reachability must not become Desired interfaces"
+            );
+            assert_eq!(
+                status["ui_exposure"],
+                serde_json::json!([]),
+                "temporary reachability must not become Desired UI exposure"
+            );
             return;
         }
         assert!(
@@ -69,6 +87,172 @@ fn assert_bootstrap_https(peer: &NetworkPeer, address: &str) {
             "private Bootstrap HTTPS at {address}: {response:?}"
         );
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn nic_addresses(status: &str, nic: &str) -> Vec<String> {
+    status
+        .rsplit("NICs:")
+        .next()
+        .unwrap_or("")
+        .split("Reach the UI:")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some(nic)).then(|| fields.map(str::to_owned).collect())
+        })
+        .unwrap_or_else(|| panic!("missing NIC {nic} in public console: {status}"))
+}
+
+fn assert_no_acquisition(peer: &mut NetworkPeer) {
+    let packets = peer
+        .discovery_packets()
+        .expect("live external discovery capture");
+    assert_eq!(
+        (packets.dhcp_v4, packets.dhcp_v6, packets.router_discovery),
+        (0, 0, 0),
+        "unselected NIC emitted address discovery: {packets:?}"
+    );
+}
+
+#[test]
+fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
+    let _guard = guest_lock();
+    let mut peers = [NetworkPeer::new().unwrap(), NetworkPeer::new().unwrap()];
+    let leases = ["10.57.5.100", "10.58.5.100"];
+    let prefixes = ["fd57:1:", "fd57:2:"];
+    for (index, peer) in peers.iter_mut().enumerate() {
+        let octet = 57 + index;
+        peer.add_address(&format!("10.{octet}.0.2/16")).unwrap();
+        peer.add_address(&format!("fd57:{}::2/64", index + 1))
+            .unwrap();
+        peer.advertise(
+            leases[index],
+            "255.255.0.0",
+            &format!("fd57:{}::", index + 1),
+        )
+        .expect("real isolated DHCP/RA service with capture ready before boot");
+    }
+    let guest = Guest::boot_published_host_image_with_peers(&[&peers[0], &peers[1]])
+        .expect("two-NIC published appliance");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 2);
+    thread::sleep(Duration::from_secs(5));
+    let status = console_command(&guest, "status");
+    for (index, peer) in peers.iter_mut().enumerate() {
+        assert_no_acquisition(peer);
+        assert!(
+            peer.https_response(leases[index]).unwrap().is_none(),
+            "no pre-opt HTTPS on either NIC"
+        );
+    }
+    for nic in &nics {
+        assert!(
+            nic_addresses(&status, nic)
+                .iter()
+                .all(|address| address.starts_with("fe80:")),
+            "passive peer RA must not configure an unselected NIC: {status}"
+        );
+    }
+
+    let dhcp = console_command(&guest, &format!("dhcp {}", nics[0]));
+    let selected = leases
+        .iter()
+        .position(|lease| {
+            nic_addresses(&dhcp, &nics[0])
+                .iter()
+                .any(|addr| addr == lease)
+        })
+        .unwrap_or_else(|| panic!("selected NIC did not acquire an advertised DHCP lease: {dhcp}"));
+    let other = 1 - selected;
+    assert_bootstrap_https(&peers[selected], leases[selected]);
+    assert!(
+        peers[selected].discovery_packets().unwrap().dhcp_v4 > 0,
+        "positive control: capture must observe the real selected DHCP exchange"
+    );
+    assert_no_acquisition(&mut peers[other]);
+    assert!(
+        nic_addresses(&dhcp, &nics[1])
+            .iter()
+            .all(|address| address.starts_with("fe80:")),
+        "unselected NIC must ignore passive RA: {dhcp}"
+    );
+
+    let slaac = console_command(&guest, &format!("slaac {}", nics[0]));
+    let first_ula = nic_addresses(&slaac, &nics[0])
+        .into_iter()
+        .find(|address| address.starts_with(prefixes[selected]))
+        .unwrap_or_else(|| panic!("selected NIC did not acquire advertised ULA: {slaac}"));
+    assert_bootstrap_https(&peers[selected], &first_ula);
+    assert!(
+        peers[selected]
+            .https_response(leases[selected])
+            .unwrap()
+            .is_none(),
+        "mode replacement removes DHCP exposure"
+    );
+    assert_no_acquisition(&mut peers[other]);
+
+    let replacement = console_command(&guest, &format!("slaac {}", nics[1]));
+    let current_ula = nic_addresses(&replacement, &nics[1])
+        .into_iter()
+        .find(|address| address.starts_with(prefixes[other]))
+        .unwrap_or_else(|| panic!("replacement NIC did not acquire advertised ULA: {replacement}"));
+    assert_bootstrap_https(&peers[other], &current_ula);
+    assert!(
+        peers[selected]
+            .https_response(&first_ula)
+            .unwrap()
+            .is_none(),
+        "NIC replacement removes old HTTPS exposure"
+    );
+    assert!(
+        nic_addresses(&replacement, &nics[0])
+            .iter()
+            .all(|address| address.starts_with("fe80:")),
+        "previously selected NIC must become unconfigured: {replacement}"
+    );
+    let previous_capture = peers[selected].discovery_packets().unwrap();
+
+    let before = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("external appliance reset on same disk");
+    wait_console_since(&guest, before, Duration::from_secs(120));
+    thread::sleep(Duration::from_secs(5));
+    let rebooted = console_command(&guest, "status");
+    assert!(
+        nic_addresses(&rebooted, &nics[1]).contains(&current_ula),
+        "temporary selection must survive pre-Bootstrap reboot: {rebooted}"
+    );
+    assert!(
+        nic_addresses(&rebooted, &nics[0])
+            .iter()
+            .all(|address| address.starts_with("fe80:")),
+        "old NIC must ignore RA after reboot: {rebooted}"
+    );
+    assert_bootstrap_https(&peers[other], &current_ula);
+    assert!(peers[selected]
+        .https_response(&first_ula)
+        .unwrap()
+        .is_none());
+    let after = peers[selected].discovery_packets().unwrap();
+    assert_eq!(
+        (after.dhcp_v4, after.dhcp_v6, after.router_discovery),
+        (
+            previous_capture.dhcp_v4,
+            previous_capture.dhcp_v6,
+            previous_capture.router_discovery
+        ),
+        "deselected NIC must remain quiet through reboot"
+    );
+    for peer in &mut peers {
+        assert!(
+            peer.discovery_packets().unwrap().neighbor_discovery > 0,
+            "positive control: both captures must observe real selected IPv6 traffic"
+        );
     }
 }
 

@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod peer;
-pub use peer::{NetworkPeer, PendingHttps};
+pub use peer::{DiscoveryPackets, NetworkPeer, PendingHttps};
 
 static PROGRESS: AtomicBool = AtomicBool::new(false);
 
