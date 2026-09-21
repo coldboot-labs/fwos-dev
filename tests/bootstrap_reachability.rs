@@ -117,6 +117,24 @@ fn assert_no_acquisition(peer: &mut NetworkPeer) {
     );
 }
 
+fn wait_for_advertised_ula(guest: &Guest, nic: &str, prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = console_command(guest, "status");
+        if let Some(address) = nic_addresses(&status, nic)
+            .into_iter()
+            .find(|address| address.starts_with(prefix))
+        {
+            return address;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "selected NIC must acquire advertised ULA: {status}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 #[test]
 fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
     let _guard = guest_lock();
@@ -201,11 +219,8 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
         "unselected NIC must remain unconfigured after DHCP reboot: {dhcp_rebooted}"
     );
 
-    let slaac = console_command(&guest, &format!("slaac {}", nics[0]));
-    let first_ula = nic_addresses(&slaac, &nics[0])
-        .into_iter()
-        .find(|address| address.starts_with(prefixes[selected]))
-        .unwrap_or_else(|| panic!("selected NIC did not acquire advertised ULA: {slaac}"));
+    console_command(&guest, &format!("slaac {}", nics[0]));
+    let first_ula = wait_for_advertised_ula(&guest, &nics[0], prefixes[selected]);
     assert_bootstrap_https(&peers[selected], &first_ula);
     assert!(
         peers[selected]
@@ -217,10 +232,7 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
     assert_no_acquisition(&mut peers[other]);
 
     let replacement = console_command(&guest, &format!("slaac {}", nics[1]));
-    let current_ula = nic_addresses(&replacement, &nics[1])
-        .into_iter()
-        .find(|address| address.starts_with(prefixes[other]))
-        .unwrap_or_else(|| panic!("replacement NIC did not acquire advertised ULA: {replacement}"));
+    let current_ula = wait_for_advertised_ula(&guest, &nics[1], prefixes[other]);
     assert_bootstrap_https(&peers[other], &current_ula);
     assert!(
         peers[selected]
@@ -244,12 +256,7 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
     wait_console_since(&guest, before, Duration::from_secs(120));
     thread::sleep(Duration::from_secs(5));
     let rebooted = console_command(&guest, "status");
-    let rebooted_ula = nic_addresses(&rebooted, &nics[1])
-        .into_iter()
-        .find(|address| address.starts_with(prefixes[other]))
-        .unwrap_or_else(|| {
-            panic!("selected SLAAC NIC must reacquire an advertised ULA: {rebooted}")
-        });
+    let rebooted_ula = wait_for_advertised_ula(&guest, &nics[1], prefixes[other]);
     assert!(
         nic_addresses(&rebooted, &nics[0])
             .iter()
