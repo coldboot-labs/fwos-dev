@@ -1,6 +1,8 @@
 use super::{current_uid_gid, Error};
-use std::process::Command;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT_PEER: AtomicU32 = AtomicU32::new(0);
 
@@ -197,6 +199,30 @@ impl NetworkPeer {
         )))
     }
 
+    /// Establish real TLS and hold an incomplete HTTP request across a network change.
+    pub fn begin_https_request(&self, address: &str) -> Result<PendingHttps, Error> {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/pending-https.mjs");
+        let mut child = self
+            .command("node")
+            .arg(script)
+            .arg(address)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::from_io("starting pending HTTPS request", e))?;
+        let stdout = child.stdout.take().expect("piped pending HTTPS stdout");
+        let mut pending = PendingHttps {
+            child,
+            output: BufReader::new(stdout),
+        };
+        if pending.message()?["ready"] != true {
+            return Err(Error::from_message("pending HTTPS TLS handshake failed"));
+        }
+        Ok(pending)
+    }
+
     /// Inspect the external peer's neighbor discovery result after real traffic.
     /// This does not require the appliance to offer ICMP Echo service.
     pub fn neighbor_resolved(&self, address: &str) -> Result<bool, Error> {
@@ -232,6 +258,66 @@ impl NetworkPeer {
         let mut command = Command::new("sudo");
         command.args(["-n", "ip", "netns", "exec", &self.namespace, executable]);
         command
+    }
+}
+
+/// A real external HTTPS request that has not finished sending its headers.
+pub struct PendingHttps {
+    child: Child,
+    output: BufReader<ChildStdout>,
+}
+
+impl PendingHttps {
+    fn message(&mut self) -> Result<serde_json::Value, Error> {
+        let mut line = String::new();
+        self.output
+            .read_line(&mut line)
+            .map_err(|e| Error::from_io("reading pending HTTPS result", e))?;
+        let message: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|_| Error::from_message("pending HTTPS driver returned no valid result"))?;
+        if message.get("error").is_some() {
+            return Err(Error::from_message("pending HTTPS driver failed"));
+        }
+        Ok(message)
+    }
+
+    pub fn finish(mut self) -> Result<Option<u16>, Error> {
+        self.child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::from_message("pending HTTPS stdin missing"))?
+            .write_all(b"finish\n")
+            .map_err(|e| Error::from_io("completing pending HTTPS request", e))?;
+        let result = self.message()?;
+        match result.get("status") {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|code| (100..=599).contains(code))
+                .map(|code| Some(code as u16))
+                .ok_or_else(|| Error::from_message("invalid pending HTTPS status")),
+            None => Err(Error::from_message("pending HTTPS result has no status")),
+        }
+    }
+}
+
+impl Drop for PendingHttps {
+    fn drop(&mut self) {
+        // EOF tells the bounded driver to destroy its socket, including when a
+        // test panics between handshake and completion.
+        self.child.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

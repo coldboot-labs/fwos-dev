@@ -182,3 +182,36 @@ fn bootstrap_https_cannot_bypass_exposure_by_routing_to_internal_addresses() {
         );
     }
 }
+
+#[test]
+fn replacing_an_address_revokes_an_already_connected_bootstrap_request() {
+    let _guard = guest_lock();
+    let peer = NetworkPeer::new().expect("isolated external peer");
+    peer.add_address("10.56.0.2/24").expect("IPv4 peer");
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer]).expect("published appliance");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 1);
+    select_static(&guest, &nics[0], "10.56.0.1/24");
+    assert_bootstrap_https(&peer, "10.56.0.1");
+    let pending = peer
+        .begin_https_request("10.56.0.1")
+        .expect("establish HTTPS before replacing address");
+    select_static(&guest, &nics[0], "10.56.0.9/24");
+    assert_bootstrap_https(&peer, "10.56.0.9");
+    assert_eq!(
+        pending
+            .finish()
+            .expect("finish request over the prior connection"),
+        None,
+        "an existing connection to the previous address must not retain Bootstrap exposure"
+    );
+    let current = peer
+        .begin_https_request("10.56.0.9")
+        .expect("establish HTTPS on current address");
+    assert_eq!(
+        current
+            .finish()
+            .expect("positive control for held HTTP requests"),
+        Some(200)
+    );
+}
