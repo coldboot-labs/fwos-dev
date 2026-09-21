@@ -180,6 +180,27 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
         "unselected NIC must ignore passive RA: {dhcp}"
     );
 
+    let before = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("reboot persisted DHCP selection");
+    wait_console_since(&guest, before, Duration::from_secs(120));
+    let dhcp_rebooted = console_command(&guest, "status");
+    assert!(
+        nic_addresses(&dhcp_rebooted, &nics[0])
+            .iter()
+            .any(|address| address == leases[selected]),
+        "persisted DHCP mode must reacquire the fixture's lease: {dhcp_rebooted}"
+    );
+    assert_bootstrap_https(&peers[selected], leases[selected]);
+    assert_no_acquisition(&mut peers[other]);
+    assert!(
+        nic_addresses(&dhcp_rebooted, &nics[1])
+            .iter()
+            .all(|address| address.starts_with("fe80:")),
+        "unselected NIC must remain unconfigured after DHCP reboot: {dhcp_rebooted}"
+    );
+
     let slaac = console_command(&guest, &format!("slaac {}", nics[0]));
     let first_ula = nic_addresses(&slaac, &nics[0])
         .into_iter()
@@ -223,17 +244,19 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
     wait_console_since(&guest, before, Duration::from_secs(120));
     thread::sleep(Duration::from_secs(5));
     let rebooted = console_command(&guest, "status");
-    assert!(
-        nic_addresses(&rebooted, &nics[1]).contains(&current_ula),
-        "temporary selection must survive pre-Bootstrap reboot: {rebooted}"
-    );
+    let rebooted_ula = nic_addresses(&rebooted, &nics[1])
+        .into_iter()
+        .find(|address| address.starts_with(prefixes[other]))
+        .unwrap_or_else(|| {
+            panic!("selected SLAAC NIC must reacquire an advertised ULA: {rebooted}")
+        });
     assert!(
         nic_addresses(&rebooted, &nics[0])
             .iter()
             .all(|address| address.starts_with("fe80:")),
         "old NIC must ignore RA after reboot: {rebooted}"
     );
-    assert_bootstrap_https(&peers[other], &current_ula);
+    assert_bootstrap_https(&peers[other], &rebooted_ula);
     assert!(peers[selected]
         .https_response(&first_ula)
         .unwrap()
