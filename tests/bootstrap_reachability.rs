@@ -287,6 +287,33 @@ fn temporary_dynamic_selection_keeps_other_nics_quiet_and_survives_reboot() {
 }
 
 #[test]
+fn temporary_selection_rejects_non_traffic_links_without_losing_current_reachability() {
+    let _guard = guest_lock();
+    let peer = NetworkPeer::new().expect("isolated external peer");
+    peer.add_address("10.56.0.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer]).expect("published appliance");
+    let nics = console_nics(&guest);
+    assert_eq!(nics.len(), 1);
+    select_static(&guest, &nics[0], "10.56.0.1/24");
+    assert_bootstrap_https(&peer, "10.56.0.1");
+    for invalid in ["lo", "f0mgmt"] {
+        // A rejected command need not redraw status, so request it explicitly.
+        let response = console_command(&guest, &format!("static {invalid} 10.56.0.9/24\nstatus"));
+        assert!(
+            response.contains("not a Traffic NIC"),
+            "non-Traffic link must be rejected: {response}"
+        );
+        assert!(
+            nic_addresses(&response, &nics[0])
+                .iter()
+                .any(|address| address == "10.56.0.1"),
+            "invalid selection must preserve current temporary address: {response}"
+        );
+        assert_bootstrap_https(&peer, "10.56.0.1");
+    }
+}
+
+#[test]
 fn bootstrap_slaac_exposes_a_ula_advertised_after_console_selection_finishes() {
     let _guard = guest_lock();
     let mut peer = NetworkPeer::new().expect("isolated late-RA peer");
