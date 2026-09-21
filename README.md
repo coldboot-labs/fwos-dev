@@ -39,3 +39,27 @@ or raw browser errors. The scenario has a two-minute deadline and up to five
 seconds to close an unresponsive browser. Browser debug logging is disabled to
 keep form values out of test output. No SSH, guest shell, authentication shortcuts, or mocked appliance
 internals are involved.
+
+## External network acceptance checks
+
+`cargo test --test bootstrap_reachability -- --test-threads=1` drives the same
+published QEMU appliance over its serial console and real Ethernet peers. In
+addition to the image prerequisites, install `iproute`, `curl`, `dnsmasq`,
+`tcpdump`, `coreutils` (`timeout`), and Node.js. Non-interactive `sudo` is required
+for task-owned TAP/bridge/veth links, peer network namespaces, and the DHCP/RA
+and packet-capture helpers running inside those namespaces. QEMU itself runs as
+the current user; no SSH, guest shell, injected credentials, or local HTTPS
+relay is used.
+
+Each peer has unique link/namespace names and its own temporary files. Only those
+resources are cleaned up. The fixture does not change existing interfaces,
+Workstation addresses/routes, default IPv6 settings, or system services. IPv6
+is disabled individually on its owned host-facing links, and peer-only settings
+prevent advertisements from configuring the Workstation. DHCP/RA ignores system
+configuration and binds only the peer interface. Capture starts before guest
+boot and observes incoming guest discovery packets; later real DHCP and IPv6
+traffic provide positive controls. HTTP error responses count as exposed HTTPS,
+while failed fixture commands fail the test.
+
+Serialize appliance test runs across checkouts: the normal image builder uses
+shared local Podman image tags even when `XDG_CACHE_HOME` is different.
