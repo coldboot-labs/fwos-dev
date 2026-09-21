@@ -9,6 +9,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod peer;
+pub use peer::NetworkPeer;
+
 static PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Phase lines on stderr for `fwos-dev build` / `run`. Tests stay quiet.
@@ -65,6 +68,7 @@ struct QemuStart<'a> {
     cdrom: Option<&'a Path>,
     linux: Option<&'a IsoLinux>,
     extra_nics: u8,
+    peer_taps: &'a [&'a str],
     port_22: u16,
     https_port: u16,
     extra_https_port: Option<u16>,
@@ -188,6 +192,17 @@ impl Guest {
         Self::boot_disk(&disk_path, 2)
     }
 
+    /// Attach Traffic NICs directly to isolated external peers, without NAT or a relay.
+    /// Keep the peers alive until the Guest has stopped.
+    pub fn boot_published_host_image_with_peers(peers: &[&NetworkPeer]) -> Result<Self, Error> {
+        if peers.is_empty() {
+            return Err(Error::from_message("at least one network peer is required"));
+        }
+        let disk_path = build_published_host_image_disk()?;
+        let taps: Vec<&str> = peers.iter().map(|peer| peer.tap()).collect();
+        Self::boot_disk_with_peers(&disk_path, 0, &taps)
+    }
+
     /// Boot the Installer ISO against an empty virt disk, then observe the installed guest.
     pub fn install_from_iso() -> Result<Self, Error> {
         let disk_path = install_host_image_disk()?;
@@ -237,6 +252,7 @@ impl Guest {
             cdrom: Some(&iso),
             linux: Some(&linux),
             extra_nics: 0,
+            peer_taps: &[],
             port_22: port,
             https_port,
             extra_https_port: None,
@@ -251,6 +267,14 @@ impl Guest {
     }
 
     fn boot_disk(disk_path: &Path, extra_nics: u8) -> Result<Self, Error> {
+        Self::boot_disk_with_peers(disk_path, extra_nics, &[])
+    }
+
+    fn boot_disk_with_peers(
+        disk_path: &Path,
+        extra_nics: u8,
+        peer_taps: &[&str],
+    ) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
         let port = free_localhost_port()?;
@@ -272,6 +296,7 @@ impl Guest {
             cdrom: None,
             linux: None,
             extra_nics,
+            peer_taps,
             port_22: port,
             https_port,
             extra_https_port,
@@ -1488,25 +1513,36 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
     if opts.no_reboot {
         cmd.arg("-no-reboot");
     }
-    cmd.args([
-        "-netdev",
-        &format!(
-            "user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22,hostfwd=tcp:127.0.0.1:{}-:443",
-            opts.port_22, opts.https_port
-        ),
-    ])
-    .args(["-device", "virtio-net-pci,netdev=net0"]);
-    for i in 0..opts.extra_nics {
-        let id = format!("net{}", i + 1);
-        let net = format!("10.0.{}.0/24", i + 3);
-        let mut netdev = format!("user,id={id},net={net}");
-        if i == 0 {
-            if let Some(port) = opts.extra_https_port {
-                netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
-            }
+    if !opts.peer_taps.is_empty() {
+        for (index, tap) in opts.peer_taps.iter().enumerate() {
+            cmd.args([
+                "-netdev",
+                &format!("tap,id=peer{index},ifname={tap},script=no,downscript=no"),
+                "-device",
+                &format!("virtio-net-pci,netdev=peer{index}"),
+            ]);
         }
-        cmd.args(["-netdev", &netdev])
-            .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
+    } else {
+        cmd.args([
+            "-netdev",
+            &format!(
+                "user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22,hostfwd=tcp:127.0.0.1:{}-:443",
+                opts.port_22, opts.https_port
+            ),
+        ])
+        .args(["-device", "virtio-net-pci,netdev=net0"]);
+        for i in 0..opts.extra_nics {
+            let id = format!("net{}", i + 1);
+            let net = format!("10.0.{}.0/24", i + 3);
+            let mut netdev = format!("user,id={id},net={net}");
+            if i == 0 {
+                if let Some(port) = opts.extra_https_port {
+                    netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
+                }
+            }
+            cmd.args(["-netdev", &netdev])
+                .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
+        }
     }
     let child = cmd
         .args(["-device", "virtio-rng-pci"])
@@ -1642,6 +1678,7 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         cdrom: Some(iso),
         linux: Some(&linux),
         extra_nics: 0,
+        peer_taps: &[],
         port_22: port,
         https_port,
         extra_https_port: None,
