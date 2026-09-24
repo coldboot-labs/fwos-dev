@@ -1,3 +1,5 @@
+use std::io::{BufRead, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use fwos_dev::{Guest, LocalRegistry};
@@ -2018,6 +2020,213 @@ fn opt_user_net(guest: &Guest) -> String {
 }
 
 #[test]
+fn incomplete_bootstrap_apply_restores_console_selection_and_allows_new_owner() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without an injected credential");
+    let selected = opt_user_net(&guest);
+    let wan = other_console_nic(&guest, &selected);
+    let abandoned = serde_json::json!({
+        "hostname": "abandoned-box",
+        "admin": "abandoned",
+        "password": "abandoned-passphrase",
+        "interfaces": [
+            {"name": selected, "role": "lan"},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [selected],
+        "lan_prefix": "invalid-prefix"
+    });
+    let attempt = guest.https_exchange("POST", "/api/bootstrap", Some(&abandoned.to_string()), 90);
+    assert!(
+        matches!(&attempt, Ok((502, body)) if body.contains("lan_prefix has no v4 host")),
+        "the malformed LAN prefix must fail after network apply starts: {attempt:?}"
+    );
+    let mut resumed = false;
+    for _ in 0..15 {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 3) {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&body) {
+                resumed = status["bootstrapped"] == false
+                    && status["interfaces"] == serde_json::json!([])
+                    && status["ui_exposure"] == serde_json::json!([]);
+                if resumed {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(
+        resumed,
+        "failed apply must restore the console-selected HTTPS and empty Desired state in the same boot"
+    );
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("externally reset failed Bootstrap attempt");
+    let after = serial_wait(&guest, from, 240, |text| {
+        text.contains("FWOS Bootstrap console")
+    });
+    assert!(
+        after.contains("FWOS Bootstrap console"),
+        "incomplete attempt must return to Bootstrap console: {after}"
+    );
+
+    let mut status = String::new();
+    for _ in 0..90 {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 5) {
+            status = body;
+            if status.contains("\"bootstrapped\":false")
+                || status.contains("\"bootstrapped\": false")
+            {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let status: serde_json::Value = serde_json::from_str(&status)
+        .expect("console-selected HTTPS and status must return after incomplete attempt");
+    assert_eq!(status["bootstrapped"], false);
+    assert_eq!(status["interfaces"], serde_json::json!([]));
+    assert_eq!(status["ui_exposure"], serde_json::json!([]));
+    assert_ne!(status["hostname"], "abandoned-box");
+
+    let retry = wan_lan_bootstrap_json(&selected, &wan);
+    https_bootstrap(&guest, &retry);
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert!(session.get("/api/status").is_ok());
+    let abandoned_login = serde_json::json!({
+        "source": "local", "username": "abandoned", "password": "abandoned-passphrase"
+    });
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&abandoned_login.to_string()), 15)
+        .expect("abandoned administrator login must get a response");
+    assert_eq!(code, 401, "retry must not reuse tentative credentials");
+}
+
+fn post_bootstrap_in_flight(guest: &Guest, payload: &str) -> Child {
+    let mut child = Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/browser/bootstrap-in-flight.mjs"
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start external HTTPS Bootstrap sender");
+    let input = serde_json::json!({"port": guest.https_port(), "payload": payload});
+    child
+        .stdin
+        .take()
+        .expect("sender stdin")
+        .write_all(input.to_string().as_bytes())
+        .expect("send Bootstrap payload to external TLS client");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("sender stdout"))
+        .read_line(&mut line)
+        .expect("sender progress line");
+    assert_eq!(
+        line.trim(),
+        "sent",
+        "external TLS client must send Bootstrap before reset"
+    );
+    child
+}
+
+#[test]
+fn external_reset_during_bootstrap_yields_either_clean_retry_or_completed_owner() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (selected, wan) = published_user_net_and_extra(&guest);
+    let mut first: serde_json::Value =
+        serde_json::from_str(&wan_lan_bootstrap_json(&selected, &wan))
+            .expect("valid first Bootstrap payload");
+    first["hostname"] = "interrupted-box".into();
+    first["admin"] = "first_owner".into();
+    first["password"] = "first-passphrase".into();
+    let mut sender = post_bootstrap_in_flight(&guest, &first.to_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut entered_transition = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 1) {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&body) {
+                entered_transition =
+                    status["hostname"] == "interrupted-box" && status["bootstrapped"] == false;
+                if entered_transition {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !entered_transition {
+        let _ = sender.kill();
+        let _ = sender.wait();
+        panic!("public status must show tentative hostname before the external power cut");
+    }
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("externally cut power during HTTPS Bootstrap request");
+    let _ = sender
+        .wait()
+        .expect("external TLS sender exits after reset");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.contains("FWOS Bootstrap console") || text.contains("FWOS Appliance CLI")
+    });
+    assert!(
+        rebooted.contains("FWOS Bootstrap console") || rebooted.contains("FWOS Appliance CLI"),
+        "reboot after interrupted request must reach a console mode: {rebooted}"
+    );
+    if rebooted.contains("FWOS Appliance CLI") {
+        println!("external Bootstrap reset observed durable ownership after reboot");
+        assert!(
+            !rebooted.contains("FWOS Bootstrap console"),
+            "durable ownership must not reopen Bootstrap"
+        );
+        let session = https_login_admin(&guest, "first_owner", "first-passphrase");
+        assert!(session.get("/api/status").is_ok());
+        let (code, _) = guest
+            .https_exchange("POST", "/api/bootstrap", Some(&first.to_string()), 15)
+            .expect("completed appliance must reject unauthenticated Bootstrap");
+        assert_eq!(code, 409);
+    } else {
+        println!("external Bootstrap reset observed clean incomplete retry after reboot");
+        let mut recovered = false;
+        for _ in 0..90 {
+            if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 5) {
+                if let Ok(status) = serde_json::from_str::<serde_json::Value>(&body) {
+                    recovered = status["bootstrapped"] == false
+                        && status["interfaces"] == serde_json::json!([])
+                        && status["ui_exposure"] == serde_json::json!([]);
+                    if recovered {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        assert!(
+            recovered,
+            "interrupted attempt must restore temporary HTTPS and empty Desired state"
+        );
+        let abandoned = serde_json::json!({
+            "source": "local", "username": "first_owner", "password": "first-passphrase"
+        });
+        let (code, _) = guest
+            .https_exchange("POST", "/api/login", Some(&abandoned.to_string()), 15)
+            .expect("tentative credentials must be rejected");
+        assert_eq!(code, 401);
+        https_bootstrap(&guest, &wan_lan_bootstrap_json(&selected, &wan));
+        assert!(https_login_admin(&guest, "alice", "secret12")
+            .get("/api/status")
+            .is_ok());
+    }
+}
+
+#[test]
 fn published_console_opt_survives_reboot_before_bootstrap() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image()
@@ -2206,6 +2415,9 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
             && wizard.contains("Apply still proceeds"),
         "one-NIC wizard must warn that untagged first-boot HTTPS leaves when untagged is not in post-apply UI exposure; last={wizard_err}; body:\n{wizard}"
     );
+    guest
+        .browser_one_nic_bootstrap_warning()
+        .expect("rendered wizard warning follows the untagged WAN choice");
 
     // Untagged becomes WAN; workstation HTTPS on 10.0.2.15 leaves with it.
     post_bootstrap_observe_serial(&guest, &payload);
@@ -2259,6 +2471,27 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
         !shown.contains("stick"),
         "one-NIC WAN+LAN Desired state has no stick role, serial:\n{shown}"
     );
+    let from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("authenticated console reboot after losing untagged HTTPS");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.contains("FWOS Appliance CLI")
+    });
+    assert!(
+        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        "durable one-NIC ownership must survive reboot without unauthenticated Bootstrap: {rebooted}"
+    );
+    https_must_not_answer(
+        &guest,
+        5,
+        "reboot must not re-expose temporary HTTPS on the untagged WAN",
+    );
+    serial_login_admin_from(&guest, "alice", "secret12", from);
+    let after = serial_cmd(&guest, "show\n", 20, |text| {
+        text.contains("role = \"wan\"") && text.contains("role = \"lan\"")
+    });
+    assert!(after.contains(&lan) && after.contains("ui_exposure"));
 }
 
 #[test]

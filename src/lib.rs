@@ -439,6 +439,39 @@ impl Guest {
             .ok_or_else(|| Error::from_message("rendered UI driver omitted browser version"))
     }
 
+    /// Check the rendered one-NIC warning as the operator changes WAN tagging.
+    pub fn browser_one_nic_bootstrap_warning(&self) -> Result<String, Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+        }))
+        .map_err(|_| Error::from_message("encode Bootstrap warning browser input"))?;
+        let mut command = Command::new("node");
+        command.arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/browser/bootstrap-warning.mjs"
+        ));
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run rendered Bootstrap warning driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("Bootstrap warning browser driver returned no valid result")
+        })?;
+        if !output.status.success()
+            || result["ok"] != true
+            || result["scenario"] != "one-nic-warning"
+        {
+            let stage = result["stage"].as_str().unwrap_or("driver");
+            return Err(Error::from_message(format!(
+                "rendered one-NIC Bootstrap warning failed at {stage}"
+            )));
+        }
+        result["browser"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::from_message("Bootstrap warning browser driver omitted browser version")
+            })
+    }
+
     /// Create a second administrator through the rendered HTTPS UI.
     pub fn browser_create_administrator(
         &self,
