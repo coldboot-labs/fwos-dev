@@ -578,6 +578,20 @@ impl Guest {
         }
     }
 
+    /// Exchange HTTPS with the configured UI over the extra Traffic NIC.
+    pub fn https_exchange_extra(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<(u16, String), Error> {
+        let port = self
+            .extra_https_port
+            .ok_or_else(|| Error::from_message("guest has no extra NIC HTTPS hostfwd"))?;
+        self.https_exchange_at("10.0.3.15", port, method, path, body, timeout_secs)
+    }
+
     /// HTTPS from the Workstation; returns status and body for any complete HTTP response.
     pub fn https_exchange(
         &self,
