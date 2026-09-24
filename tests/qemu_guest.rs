@@ -153,6 +153,177 @@ fn published_local_identity_protects_https_management() {
 }
 
 #[test]
+fn published_administrator_creates_distinct_local_login_in_rendered_ui() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let initial_status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/status").expect("initial network status"))
+            .expect("status JSON");
+
+    let (anonymous_code, _) = guest
+        .https_exchange("GET", "/api/administrators", None, 15)
+        .expect("anonymous account-list response");
+    assert_eq!(anonymous_code, 401, "account list requires sign in");
+    let (anonymous_change, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/administrators",
+            Some(r#"{"username":"mallory","password":"nope"}"#),
+            15,
+        )
+        .expect("anonymous account-create response");
+    assert_eq!(anonymous_change, 401, "account creation requires sign in");
+
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("rendered UI creates a distinct administrator");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let status = bob
+        .get("/api/status")
+        .expect("new administrator has management access");
+    assert_eq!(
+        json_string_field(&status, "username").as_deref(),
+        Some("bob")
+    );
+    assert!(
+        status.contains("192.168.1.0/24"),
+        "administrator can see management status"
+    );
+
+    guest
+        .browser_change_administrator_password("alice", "secret12", "bob", "new-bob-secret")
+        .expect("rendered UI changes another administrator's password");
+    let (stale_code, _) = bob
+        .exchange("GET", "/api/status", None, 15)
+        .expect("prior session response after password change");
+    assert_eq!(
+        stale_code, 401,
+        "changing credentials revokes the prior session"
+    );
+    let (old_code, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/login",
+            Some(r#"{"source":"local","username":"bob","password":"bob-secret"}"#),
+            15,
+        )
+        .expect("obsolete-password login response");
+    assert_eq!(old_code, 401, "obsolete password must fail");
+    let changed = https_login_admin(&guest, "bob", "new-bob-secret");
+    assert!(
+        changed.get("/api/status").is_ok(),
+        "replacement password must authenticate"
+    );
+
+    guest
+        .browser_remove_administrator("bob", "new-bob-secret", "alice")
+        .expect("a second administrator can remove the Bootstrap administrator");
+    let (removed_session_code, _) = alice
+        .exchange("GET", "/api/status", None, 15)
+        .expect("removed administrator's prior session response");
+    assert_eq!(
+        removed_session_code, 401,
+        "removal revokes existing sessions"
+    );
+    let (removed_login_code, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/login",
+            Some(r#"{"source":"local","username":"alice","password":"secret12"}"#),
+            15,
+        )
+        .expect("removed administrator login response");
+    assert_eq!(
+        removed_login_code, 401,
+        "removed administrator cannot sign in"
+    );
+    let final_status = changed
+        .get("/api/status")
+        .expect("remaining administrator retains access");
+    let final_status_json: serde_json::Value =
+        serde_json::from_str(&final_status).expect("status JSON");
+    for field in [
+        "interfaces",
+        "ui_exposure",
+        "lan_prefix",
+        "dhcp_pool",
+        "wan_pd",
+    ] {
+        assert_eq!(
+            initial_status[field], final_status_json[field],
+            "account changes must not change public network {field}"
+        );
+    }
+    let account_list = changed
+        .get("/api/administrators")
+        .expect("remaining administrator lists accounts");
+    let account_list_json: serde_json::Value =
+        serde_json::from_str(&account_list).expect("account-list JSON");
+    assert_eq!(
+        account_list_json["administrators"],
+        serde_json::json!(["bob"])
+    );
+    for ordinary_response in [&final_status, &account_list] {
+        assert!(
+            !ordinary_response.contains("$y$")
+                && !ordinary_response.contains("password_hash")
+                && !ordinary_response.contains("new-bob-secret")
+                && !ordinary_response.contains("secret12"),
+            "routine responses must never disclose a password or hash"
+        );
+    }
+    let (last_code, _) = changed
+        .exchange(
+            "POST",
+            "/api/administrators/remove",
+            Some(r#"{"username":"bob"}"#),
+            15,
+        )
+        .expect("last-administrator removal response");
+    assert_eq!(last_code, 409, "final administrator must not be removable");
+    assert!(
+        changed.get("/api/status").is_ok(),
+        "rejected removal leaves administrator access intact"
+    );
+
+    let admin_ready = serial_wait(&guest, 0, 90, |text| {
+        text.contains("FWOS Appliance CLI") && text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        admin_ready.contains("FWOS Appliance CLI"),
+        "Appliance console must offer administrator login"
+    );
+    let password_prompt = serial_cmd(&guest, "alice\n", 15, |text| text.contains("password:"));
+    assert!(
+        password_prompt.contains("password:"),
+        "removed administrator attempt reaches password prompt"
+    );
+    let before_denial = guest.serial().len();
+    guest
+        .serial_write("secret12\n")
+        .expect("submit removed administrator's prior password");
+    let denied = serial_wait(&guest, before_denial, 15, |text| {
+        text.contains("login failed")
+    });
+    assert!(
+        denied.contains("login failed"),
+        "removed account must fail Appliance console login"
+    );
+    serial_login_admin(&guest, "bob", "new-bob-secret");
+    assert!(
+        !guest.serial().contains("new-bob-secret"),
+        "Appliance console must not echo the changed password"
+    );
+    guest
+        .browser_login("bob", "new-bob-secret")
+        .expect("remaining administrator's replacement password signs in through rendered UI");
+}
+
+#[test]
 fn published_bootstrap_credentials_work_on_https_and_console() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()

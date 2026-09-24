@@ -40,6 +40,12 @@ seconds to close an unresponsive browser. Browser debug logging is disabled to
 keep form values out of test output. No SSH, guest shell, authentication shortcuts, or mocked appliance
 internals are involved.
 
+`tests/browser/administrators.mjs` uses the same isolated Firefox and stdin-only
+credential handoff to create, change, and remove local administrators through
+rendered controls. The Rust guest test checks each account's HTTPS login and
+session behavior, then verifies removed and changed credentials on serial.
+The driver reports only a fixed stage name and browser version, never form values.
+
 ## External network acceptance checks
 
 `cargo test --test bootstrap_reachability -- --test-threads=1` drives the same

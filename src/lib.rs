@@ -439,6 +439,86 @@ impl Guest {
             .ok_or_else(|| Error::from_message("rendered UI driver omitted browser version"))
     }
 
+    /// Create a second administrator through the rendered HTTPS UI.
+    pub fn browser_create_administrator(
+        &self,
+        username: &str,
+        password: &str,
+        new_username: &str,
+        new_password: &str,
+    ) -> Result<String, Error> {
+        self.browser_administrator_action("create", username, password, new_username, new_password)
+    }
+
+    pub fn browser_change_administrator_password(
+        &self,
+        username: &str,
+        password: &str,
+        target_username: &str,
+        new_password: &str,
+    ) -> Result<String, Error> {
+        self.browser_administrator_action(
+            "change",
+            username,
+            password,
+            target_username,
+            new_password,
+        )
+    }
+
+    pub fn browser_remove_administrator(
+        &self,
+        username: &str,
+        password: &str,
+        target_username: &str,
+    ) -> Result<String, Error> {
+        self.browser_administrator_action("remove", username, password, target_username, "")
+    }
+
+    fn browser_administrator_action(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        new_username: &str,
+        new_password: &str,
+    ) -> Result<String, Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "newUsername": new_username,
+            "newPassword": new_password,
+        }))
+        .map_err(|_| Error::from_message("encode administrator browser input"))?;
+        let mut command = Command::new("node");
+        command.arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/browser/administrators.mjs"
+        ));
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run administrator browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("administrator browser driver returned no valid result")
+        })?;
+        if !output.status.success()
+            || result["ok"] != true
+            || result["scenario"] != format!("{action}-administrator")
+        {
+            let stage = result["stage"].as_str().unwrap_or("driver");
+            return Err(Error::from_message(format!(
+                "rendered administrator {action} failed at {stage}"
+            )));
+        }
+        result["browser"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::from_message("administrator browser driver omitted browser version")
+            })
+    }
+
     /// GET `path` on the extra virtio-net (10.0.3.15) over HTTPS.
     pub fn https_get_extra(&self, path: &str) -> Result<String, Error> {
         let port = self
