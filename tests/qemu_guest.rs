@@ -2214,6 +2214,100 @@ fn external_reset_before_desired_persist_restores_clean_bootstrap_retry() {
 }
 
 #[test]
+fn external_reset_after_opt_teardown_restores_clean_bootstrap_retry() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (selected, lan) = published_user_net_and_extra(&guest);
+    let mut interfaces = vec![
+        serde_json::json!({"name": selected, "role": "wan", "addresses": ["192.0.2.1/24"]}),
+        serde_json::json!({"name": lan, "role": "lan", "addresses": ["10.0.3.15/24"]}),
+    ];
+    // These are valid, distinct Linux VLAN links. Their real creation keeps
+    // netd in apply long enough to cut power after opt teardown but before
+    // it can persist Desired and durably commit ownership.
+    interfaces.extend((1000..1256).map(|vid| {
+        serde_json::json!({
+            "name": format!("{selected}.{vid}"),
+            "role": "unused",
+            "parent": selected,
+            "vlan": vid
+        })
+    }));
+    let first = serde_json::json!({
+        "hostname": "interrupted-network",
+        "admin": "abandoned",
+        "password": "abandoned-passphrase",
+        "interfaces": interfaces,
+        "ui_exposure": [lan],
+        "lan_prefix": "10.0.3.0/24",
+        "dhcp_pool": "10.0.3.100-10.0.3.200"
+    });
+    assert!(
+        https_up(&guest),
+        "temporary selected HTTPS starts available"
+    );
+    let mut sender = post_bootstrap_in_flight(&guest, &first.to_string());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut failed_probes = 0;
+    while std::time::Instant::now() < deadline && failed_probes < 2 {
+        if guest.https_exchange("GET", "/", None, 1).is_err() {
+            failed_probes += 1;
+        } else {
+            failed_probes = 0;
+        }
+    }
+    if failed_probes < 2 {
+        let _ = sender.kill();
+        let _ = sender.wait();
+        panic!("workstation must observe selected HTTPS disappear after opt teardown");
+    }
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("externally cut power during real VLAN apply");
+    let _ = sender
+        .wait()
+        .expect("external TLS sender exits after reset");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.contains("FWOS Bootstrap console") || text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.contains("FWOS Bootstrap console")
+            && !rebooted.lines().any(|line| line.trim() == "admin:"),
+        "interrupted network apply must not commit ownership: {rebooted}"
+    );
+
+    let mut status = serde_json::Value::Null;
+    for _ in 0..90 {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 5) {
+            if let Ok(current) = serde_json::from_str::<serde_json::Value>(&body) {
+                if current["bootstrapped"] == false {
+                    status = current;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(status["bootstrapped"], false, "selected HTTPS must return");
+    assert_eq!(status["interfaces"], serde_json::json!([]));
+    assert_eq!(status["ui_exposure"], serde_json::json!([]));
+    assert_ne!(status["hostname"], "interrupted-network");
+    let abandoned = serde_json::json!({
+        "source": "local", "username": "abandoned", "password": "abandoned-passphrase"
+    });
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&abandoned.to_string()), 15)
+        .expect("tentative administrator login must receive a response");
+    assert_eq!(code, 401, "tentative Identity must be discarded");
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&selected, &lan));
+    assert!(https_login_admin(&guest, "alice", "secret12")
+        .get("/api/status")
+        .is_ok());
+}
+
+#[test]
 fn external_reset_during_bootstrap_yields_either_clean_retry_or_completed_owner() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
