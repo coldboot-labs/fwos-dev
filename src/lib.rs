@@ -333,6 +333,46 @@ impl Guest {
         Ok(())
     }
 
+    /// Remove QEMU's second physical NIC while the appliance is running.
+    pub fn qemu_unplug_extra_nic(&self) -> Result<(), Error> {
+        let mut stream = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut reply = [0u8; 4096];
+        let mut welcome = String::new();
+        while !welcome.ends_with("(qemu) ") {
+            let n = stream
+                .read(&mut reply)
+                .map_err(|e| Error::from_io("reading QEMU monitor prompt", e))?;
+            if n == 0 {
+                return Err(Error::from_message("QEMU monitor closed before prompt"));
+            }
+            welcome.push_str(&String::from_utf8_lossy(&reply[..n]));
+        }
+        stream
+            .write_all(b"device_del fwos-extra0\n")
+            .and_then(|_| stream.flush())
+            .map_err(|e| Error::from_io("QEMU extra NIC hot-unplug", e))?;
+        let mut response = String::new();
+        while !response.ends_with("(qemu) ") {
+            let n = stream
+                .read(&mut reply)
+                .map_err(|e| Error::from_io("reading QEMU hot-unplug reply", e))?;
+            if n == 0 {
+                return Err(Error::from_message("QEMU monitor closed during hot-unplug"));
+            }
+            response.push_str(&String::from_utf8_lossy(&reply[..n]));
+        }
+        if let Some(error) = response.split("Error:").nth(1) {
+            let message = error.split("\r\n").next().unwrap_or(error).trim();
+            return Err(Error::from_message(format!(
+                "QEMU extra NIC hot-unplug failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Write bytes to the guest serial console.
     pub fn serial_write(&self, data: &str) -> Result<(), Error> {
         let mut serial = self
@@ -1676,8 +1716,21 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
                     netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
                 }
             }
-            cmd.args(["-netdev", &netdev])
-                .args(["-device", &format!("virtio-net-pci,netdev={id}")]);
+            if i == 0 {
+                cmd.args([
+                    "-device",
+                    "pcie-root-port,id=fwos-hotplug-port0,chassis=1,slot=1",
+                ]);
+            }
+            let bus = if i == 0 {
+                ",bus=fwos-hotplug-port0"
+            } else {
+                ""
+            };
+            cmd.args(["-netdev", &netdev]).args([
+                "-device",
+                &format!("virtio-net-pci,netdev={id},id=fwos-extra{i}{bus}"),
+            ]);
         }
     }
     let child = cmd

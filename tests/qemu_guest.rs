@@ -2101,6 +2101,14 @@ fn invalid_bootstrap_values_preserve_console_selection_and_allow_new_owner() {
 }
 
 fn post_bootstrap_in_flight(guest: &Guest, payload: &str) -> Child {
+    start_bootstrap_sender(guest, payload, false).0
+}
+
+fn start_bootstrap_sender(
+    guest: &Guest,
+    payload: &str,
+    report_response: bool,
+) -> (Child, std::io::BufReader<std::process::ChildStdout>) {
     let mut child = Command::new("node")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2111,7 +2119,9 @@ fn post_bootstrap_in_flight(guest: &Guest, payload: &str) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("start external HTTPS Bootstrap sender");
-    let input = serde_json::json!({"port": guest.https_port(), "payload": payload});
+    let input = serde_json::json!({
+        "port": guest.https_port(), "payload": payload, "reportResponse": report_response
+    });
     child
         .stdin
         .take()
@@ -2119,15 +2129,14 @@ fn post_bootstrap_in_flight(guest: &Guest, payload: &str) -> Child {
         .write_all(input.to_string().as_bytes())
         .expect("send Bootstrap payload to external TLS client");
     let mut line = String::new();
-    std::io::BufReader::new(child.stdout.take().expect("sender stdout"))
-        .read_line(&mut line)
-        .expect("sender progress line");
+    let mut reader = std::io::BufReader::new(child.stdout.take().expect("sender stdout"));
+    reader.read_line(&mut line).expect("sender progress line");
     assert_eq!(
         line.trim(),
         "sent",
         "external TLS client must send Bootstrap before reset"
     );
-    child
+    (child, reader)
 }
 
 #[test]
@@ -2214,61 +2223,69 @@ fn external_reset_before_desired_persist_restores_clean_bootstrap_retry() {
 }
 
 #[test]
-fn external_reset_after_opt_teardown_restores_clean_bootstrap_retry() {
+fn externally_removed_wan_during_bootstrap_restores_clean_retry_after_reset() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
         .expect("published Disk image must boot without injected credentials");
-    let (selected, lan) = published_user_net_and_extra(&guest);
-    let mut interfaces = vec![
-        serde_json::json!({"name": selected, "role": "wan", "addresses": ["192.0.2.1/24"]}),
-        serde_json::json!({"name": lan, "role": "lan", "addresses": ["10.0.3.15/24"]}),
-    ];
-    // These are valid, distinct Linux VLAN links. Their real creation keeps
-    // netd in apply long enough to cut power after opt teardown but before
-    // it can persist Desired and durably commit ownership.
-    interfaces.extend((1000..1256).map(|vid| {
-        serde_json::json!({
-            "name": format!("{selected}.{vid}"),
-            "role": "unused",
-            "parent": selected,
-            "vlan": vid
-        })
-    }));
+    let (selected, wan) = published_user_net_and_extra(&guest);
     let first = serde_json::json!({
         "hostname": "interrupted-network",
         "admin": "abandoned",
         "password": "abandoned-passphrase",
-        "interfaces": interfaces,
-        "ui_exposure": [lan],
-        "lan_prefix": "10.0.3.0/24",
-        "dhcp_pool": "10.0.3.100-10.0.3.200"
+        "interfaces": [
+            {"name": selected, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": format!("{wan}.42"), "role": "wan", "parent": wan, "vlan": 42, "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [selected],
+        "lan_prefix": "10.0.2.0/24",
+        "dhcp_pool": "10.0.2.100-10.0.2.200"
     });
+    let (mut sender, mut response) = start_bootstrap_sender(&guest, &first.to_string(), true);
+    guest
+        .qemu_unplug_extra_nic()
+        .expect("externally remove physical WAN parent after valid Bootstrap request was sent");
+    let mut line = String::new();
+    response
+        .read_line(&mut line)
+        .expect("Bootstrap response code");
+    sender
+        .wait()
+        .expect("external HTTPS Bootstrap sender exits");
+    let raw = line
+        .trim()
+        .strip_prefix("response:502:")
+        .unwrap_or_else(|| {
+            panic!("missing tagged WAN parent must fail after apply begins: {line}")
+        });
+    let failure: serde_json::Value = serde_json::from_str(raw).expect("late apply error JSON");
     assert!(
-        https_up(&guest),
-        "temporary selected HTTPS starts available"
+        failure["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&format!("ip link add link {wan}"))),
+        "late failure must identify tagged WAN link creation, after journal and opt teardown: {failure}"
     );
-    let mut sender = post_bootstrap_in_flight(&guest, &first.to_string());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut failed_probes = 0;
-    while std::time::Instant::now() < deadline && failed_probes < 2 {
-        if guest.https_exchange("GET", "/", None, 1).is_err() {
-            failed_probes += 1;
-        } else {
-            failed_probes = 0;
-        }
-    }
-    if failed_probes < 2 {
-        let _ = sender.kill();
-        let _ = sender.wait();
-        panic!("workstation must observe selected HTTPS disappear after opt teardown");
-    }
+    let (code, body) = guest
+        .https_exchange("GET", "/api/status", None, 15)
+        .expect("selected temporary HTTPS must be restored after failed apply");
+    assert_eq!(code, 200);
+    let failed_status: serde_json::Value = serde_json::from_str(&body).expect("status JSON");
+    assert_eq!(failed_status["bootstrapped"], false);
+    assert_eq!(failed_status["interfaces"], serde_json::json!([]));
+    assert_eq!(failed_status["ui_exposure"], serde_json::json!([]));
+    let abandoned = serde_json::json!({
+        "source": "local", "username": "abandoned", "password": "abandoned-passphrase"
+    });
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&abandoned.to_string()), 15)
+        .expect("same-boot failed administrator login must receive a response");
+    assert_eq!(
+        code, 401,
+        "failed apply must discard tentative Identity immediately"
+    );
     let from = guest.serial().len();
     guest
         .qemu_system_reset()
-        .expect("externally cut power during real VLAN apply");
-    let _ = sender
-        .wait()
-        .expect("external TLS sender exits after reset");
+        .expect("externally reset after failed network apply");
     let rebooted = serial_wait(&guest, from, 300, |text| {
         text.contains("FWOS Bootstrap console") || text.lines().any(|line| line.trim() == "admin:")
     });
@@ -2294,14 +2311,23 @@ fn external_reset_after_opt_teardown_restores_clean_bootstrap_retry() {
     assert_eq!(status["interfaces"], serde_json::json!([]));
     assert_eq!(status["ui_exposure"], serde_json::json!([]));
     assert_ne!(status["hostname"], "interrupted-network");
-    let abandoned = serde_json::json!({
-        "source": "local", "username": "abandoned", "password": "abandoned-passphrase"
-    });
     let (code, _) = guest
         .https_exchange("POST", "/api/login", Some(&abandoned.to_string()), 15)
         .expect("tentative administrator login must receive a response");
     assert_eq!(code, 401, "tentative Identity must be discarded");
-    https_bootstrap(&guest, &wan_lan_bootstrap_json(&selected, &lan));
+    let retry = serde_json::json!({
+        "hostname": "new-owner",
+        "admin": "alice",
+        "password": "secret12",
+        "interfaces": [
+            {"name": selected, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": format!("{selected}.10"), "role": "wan", "parent": selected, "vlan": 10, "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [selected],
+        "lan_prefix": "10.0.2.0/24",
+        "dhcp_pool": "10.0.2.100-10.0.2.200"
+    });
+    https_bootstrap(&guest, &retry.to_string());
     assert!(https_login_admin(&guest, "alice", "secret12")
         .get("/api/status")
         .is_ok());
