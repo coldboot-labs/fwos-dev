@@ -2131,6 +2131,89 @@ fn post_bootstrap_in_flight(guest: &Guest, payload: &str) -> Child {
 }
 
 #[test]
+fn external_reset_before_desired_persist_restores_clean_bootstrap_retry() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (selected, wan) = published_user_net_and_extra(&guest);
+    let mut first: serde_json::Value =
+        serde_json::from_str(&wan_lan_bootstrap_json(&selected, &wan))
+            .expect("valid first Bootstrap payload");
+    first["hostname"] = "interrupted-early".into();
+    first["admin"] = "abandoned".into();
+    first["password"] = "abandoned-passphrase".into();
+    let mut sender = post_bootstrap_in_flight(&guest, &first.to_string());
+
+    // Status reads Desired after its netd NIC request. An empty Desired in a
+    // response that already shows the tentative hostname is an externally
+    // visible pre-persist transition, not merely bytes sent by our client.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut observed = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 1) {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(&body) {
+                observed = status["hostname"] == "interrupted-early"
+                    && status["bootstrapped"] == false
+                    && status["interfaces"] == serde_json::json!([])
+                    && status["ui_exposure"] == serde_json::json!([]);
+                if observed {
+                    break;
+                }
+            }
+        }
+    }
+    if !observed {
+        let _ = sender.kill();
+        let _ = sender.wait();
+        panic!("public status must show tentative hostname but no persisted Desired before reset");
+    }
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("externally interrupt Bootstrap before Desired persistence");
+    let _ = sender
+        .wait()
+        .expect("external TLS sender exits after reset");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.contains("FWOS Bootstrap console") || text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.contains("FWOS Bootstrap console")
+            && !rebooted.lines().any(|line| line.trim() == "admin:"),
+        "pre-persist interruption must return to Bootstrap, not durable owner: {rebooted}"
+    );
+
+    let mut status = serde_json::Value::Null;
+    for _ in 0..90 {
+        if let Ok((200, body)) = guest.https_exchange("GET", "/api/status", None, 5) {
+            if let Ok(current) = serde_json::from_str::<serde_json::Value>(&body) {
+                if current["bootstrapped"] == false {
+                    status = current;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(status["bootstrapped"], false, "selected HTTPS must return");
+    assert_eq!(status["interfaces"], serde_json::json!([]));
+    assert_eq!(status["ui_exposure"], serde_json::json!([]));
+    assert_ne!(status["hostname"], "interrupted-early");
+
+    let abandoned = serde_json::json!({
+        "source": "local", "username": "abandoned", "password": "abandoned-passphrase"
+    });
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&abandoned.to_string()), 15)
+        .expect("tentative administrator login must receive a response");
+    assert_eq!(code, 401, "interrupted Identity must not survive");
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&selected, &wan));
+    assert!(https_login_admin(&guest, "alice", "secret12")
+        .get("/api/status")
+        .is_ok());
+}
+
+#[test]
 fn external_reset_during_bootstrap_yields_either_clean_retry_or_completed_owner() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
