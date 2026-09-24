@@ -18,7 +18,7 @@ const deadline = setTimeout(() => {
 
 try {
   const { url, action, username, password, newUsername, newPassword } = JSON.parse(readFileSync(0, "utf8"));
-  assert.ok(["create", "change", "remove"].includes(action));
+  assert.ok(["create", "change", "change-self", "remove"].includes(action));
   scenario = `${action}-administrator`;
   const target = new URL(url);
   assert.equal(target.protocol, "https:");
@@ -59,7 +59,7 @@ try {
     await page.getByLabel("New administrator password", { exact: true }).fill(newPassword);
     await page.getByRole("button", { name: "Create administrator", exact: true }).click();
     await page.locator("#administrator-list").getByText(newUsername, { exact: true }).waitFor();
-  } else if (action === "change") {
+  } else if (action === "change" || action === "change-self") {
     stage = "change-list";
     await page.locator("#administrator-list").getByText(newUsername, { exact: true }).waitFor();
     stage = "change-select";
@@ -69,7 +69,12 @@ try {
     stage = "change-click";
     await page.getByRole("button", { name: "Change password", exact: true }).click();
     stage = "change-result";
-    await page.getByText("Password changed", { exact: true }).waitFor();
+    if (action === "change-self") {
+      await page.getByRole("heading", { name: "Sign in", exact: true }).waitFor();
+      assert.equal(await page.getByRole("heading", { name: "Status", exact: true }).isVisible(), false);
+    } else {
+      await page.getByText("Password changed", { exact: true }).waitFor();
+    }
   } else {
     stage = "remove-list";
     await page.locator("#administrator-list").getByText(newUsername, { exact: true }).waitFor();

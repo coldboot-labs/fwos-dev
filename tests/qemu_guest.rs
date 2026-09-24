@@ -324,6 +324,38 @@ fn published_administrator_creates_distinct_local_login_in_rendered_ui() {
 }
 
 #[test]
+fn published_administrator_changing_own_password_returns_to_sign_in() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image must boot without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    let old_session = https_login_admin(&guest, "alice", "secret12");
+
+    guest
+        .browser_change_own_administrator_password("alice", "secret12", "alice-new-secret")
+        .expect("changing one's own password immediately shows rendered sign-in");
+    let (old_cookie_code, _) = old_session
+        .exchange("GET", "/api/status", None, 15)
+        .expect("old session response after self password change");
+    assert_eq!(old_cookie_code, 401, "old session must be revoked");
+    let (old_password_code, _) = guest
+        .https_exchange(
+            "POST",
+            "/api/login",
+            Some(r#"{"source":"local","username":"alice","password":"secret12"}"#),
+            15,
+        )
+        .expect("old-password login response");
+    assert_eq!(old_password_code, 401, "old password must be rejected");
+    let current = https_login_admin(&guest, "alice", "alice-new-secret");
+    assert!(
+        current.get("/api/status").is_ok(),
+        "replacement password must sign in"
+    );
+}
+
+#[test]
 fn published_bootstrap_credentials_work_on_https_and_console() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()

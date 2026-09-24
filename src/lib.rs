@@ -466,6 +466,15 @@ impl Guest {
         )
     }
 
+    pub fn browser_change_own_administrator_password(
+        &self,
+        username: &str,
+        password: &str,
+        new_password: &str,
+    ) -> Result<String, Error> {
+        self.browser_administrator_action("change-self", username, password, username, new_password)
+    }
+
     pub fn browser_remove_administrator(
         &self,
         username: &str,
