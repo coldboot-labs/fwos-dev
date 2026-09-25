@@ -59,7 +59,7 @@ complete Desired state (including network secrets) stays on the appliance.
 `cargo test --test bootstrap_reachability -- --test-threads=1` drives the same
 published QEMU appliance over its serial console and real Ethernet peers. In
 addition to the image prerequisites, install `iproute`, `curl`, `dnsmasq`,
-`tcpdump`, `coreutils` (`timeout`), and Node.js. Non-interactive `sudo` is required
+`tcpdump`, `coreutils` (`timeout`), Node.js, and Python 3. Non-interactive `sudo` is required
 for task-owned TAP/bridge/veth links, peer network namespaces, and the DHCP/RA
 and packet-capture helpers running inside those namespaces. QEMU itself runs as
 the current user; no SSH, guest shell, injected credentials, or local HTTPS

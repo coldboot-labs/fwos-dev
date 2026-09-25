@@ -175,6 +175,51 @@ impl NetworkPeer {
         }
     }
 
+    /// Request a real DHCPv4 offer from this external LAN segment.
+    pub fn dhcp_offer(&self) -> Result<bool, Error> {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/dhcp-discover.py");
+        let output = self
+            .command("python3")
+            .arg(script)
+            .output()
+            .map_err(|error| Error::from_io("external-peer DHCP discover", error))?;
+        if !output.status.success() {
+            return Err(Error::from_message(format!(
+                "external-peer DHCP discover failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| Error::from_message(format!("external-peer DHCP result: {error}")))?;
+        result["offer"]
+            .as_bool()
+            .ok_or_else(|| Error::from_message("external-peer DHCP result has no offer status"))
+    }
+
+    /// Capture only externally visible DHCP packets while probing this peer.
+    pub fn dhcp_offer_with_trace(&self) -> Result<(bool, String), Error> {
+        let capture = self
+            .command("timeout")
+            .args([
+                "5", "tcpdump", "-n", "-i", "eth0", "-l", "udp", "port", "67", "or", "udp", "port",
+                "68",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| Error::from_io("external DHCP packet capture", error))?;
+        std::thread::sleep(Duration::from_millis(200));
+        let offered = self.dhcp_offer()?;
+        let output = capture
+            .wait_with_output()
+            .map_err(|error| Error::from_io("external DHCP packet capture", error))?;
+        Ok((
+            offered,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        ))
+    }
+
     /// Request the appliance directly over this Ethernet segment.
     pub fn https_get(&self, address: &str, path: &str) -> Result<String, Error> {
         let output = self

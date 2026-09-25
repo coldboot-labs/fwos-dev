@@ -80,14 +80,17 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
     let bootstrap = serde_json::json!({
         "hostname": "fwos-box", "admin": "alice", "password": "secret12",
         "interfaces": [
-            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
             {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
             {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
         ],
         "ui_exposure": [ui_nic],
-        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200"
+        "lan_prefix": "10.56.0.0/24"
     });
     https_bootstrap(&guest, &bootstrap.to_string());
+    assert!(!lan_peer
+        .dhcp_offer()
+        .expect("no DHCP service before enablement"));
     guest
         .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
         .expect("administrator accepts the initial route in rendered UI");
@@ -187,12 +190,12 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "revision": 2,
         "hostname": "fwos-box",
         "interfaces": [
-            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
             {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
             {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24", "192.0.2.3/24"]}
         ],
         "ui_exposure": [ui_nic],
-        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200",
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.100-10.56.0.200",
         "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}],
         "wireguard": [{"name": wan_nic, "private_key": WG_PRIVATE, "addresses": ["10.13.13.1/24"]}]
     });
@@ -220,6 +223,39 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
     assert!(lan_peer
         .ping("198.51.100.2")
         .expect("Accepted traffic after WAN alias recovery"));
+    assert!(
+        !lan_peer.dhcp_offer().expect("DHCP after failed enablement"),
+        "tentative Kea config must not launch a DHCP service"
+    );
+
+    let mut enable_dhcp = invalid_runtime.clone();
+    enable_dhcp["interfaces"][2]["addresses"] = serde_json::json!(["192.0.2.1/24"]);
+    enable_dhcp["wireguard"] = serde_json::json!([]);
+    let accepted = serial_cmd(&guest, &format!("apply {enable_dhcp}\n"), 90, |text| {
+        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
+    });
+    assert!(
+        accepted.contains("\"outcome\":\"accepted\"")
+            || accepted.contains("\"outcome\": \"accepted\""),
+        "accepted DHCP enablement: {accepted}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut offered = false;
+    let mut packet_trace = String::new();
+    while std::time::Instant::now() < deadline {
+        let (seen, trace) = lan_peer
+            .dhcp_offer_with_trace()
+            .expect("DHCP after accepted enablement");
+        packet_trace.push_str(&trace);
+        if seen {
+            offered = true;
+            break;
+        }
+    }
+    assert!(
+        offered,
+        "accepted Kea config must launch DHCP service; external packets: {packet_trace}"
+    );
 }
 
 #[test]
