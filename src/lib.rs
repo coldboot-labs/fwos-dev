@@ -1025,6 +1025,7 @@ fn temp_work_dir(prefix: &str, err: &str) -> Result<PathBuf, Error> {
 }
 
 struct HostImageParts {
+    src: PathBuf,
     image_dir: PathBuf,
     addons: PathBuf,
     binary: PathBuf,
@@ -1034,11 +1035,10 @@ struct HostImageParts {
     update: PathBuf,
 }
 
-fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
+fn host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
     let src = src_dir()?;
     progress("building host programs");
     let binary = build_host_program(&src)?;
-    build_host_program_image(&src, &binary)?;
     let netd = src.join("target/release/netd");
     if !netd.is_file() {
         return Err(Error::from_message(format!(
@@ -1047,8 +1047,6 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         )));
     }
     let addons = builtin_addons_dir()?;
-    progress("building Built-in addons");
-    build_netd_image(&addons, &netd)?;
     let cli = src.join("target/release/fwos");
     if !cli.is_file() {
         return Err(Error::from_message(format!(
@@ -1056,7 +1054,6 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
             cli.display()
         )));
     }
-    build_cli_image(&addons, &cli)?;
     let ui = src.join("target/release/fwos-ui");
     if !ui.is_file() {
         return Err(Error::from_message(format!(
@@ -1064,7 +1061,6 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
             ui.display()
         )));
     }
-    build_ui_image(&addons, &ui)?;
     let update = src.join("target/release/fwos-update");
     if !update.is_file() {
         return Err(Error::from_message(format!(
@@ -1072,9 +1068,8 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
             update.display()
         )));
     }
-    build_vendor_image(&addons.join("kea"), KEA_IMAGE_TAG)?;
-    build_vendor_image(&addons.join("unbound"), UNBOUND_IMAGE_TAG)?;
     Ok(HostImageParts {
+        src,
         image_dir: image_dir.to_path_buf(),
         addons,
         binary,
@@ -1086,6 +1081,16 @@ fn prepare_host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
 }
 
 impl HostImageParts {
+    fn build_images(&self) -> Result<(), Error> {
+        build_host_program_image(&self.src, &self.binary)?;
+        progress("building Built-in addons");
+        build_netd_image(&self.addons, &self.netd)?;
+        build_cli_image(&self.addons, &self.cli)?;
+        build_ui_image(&self.addons, &self.ui)?;
+        build_vendor_image(&self.addons.join("kea"), KEA_IMAGE_TAG)?;
+        build_vendor_image(&self.addons.join("unbound"), UNBOUND_IMAGE_TAG)
+    }
+
     fn stale(&self, artifact: &Path) -> Result<bool, Error> {
         Ok(!artifact.exists()
             || artifact.metadata().map(|m| m.len() == 0).unwrap_or(true)
@@ -1108,20 +1113,22 @@ impl HostImageParts {
 }
 
 fn ensure_host_qcow2(disk: &Path, image_dir: &Path) -> Result<(), Error> {
-    let parts = prepare_host_image_parts(image_dir)?;
+    let parts = host_image_parts(image_dir)?;
     if !parts.stale(disk)? {
         return Ok(());
     }
+    parts.build_images()?;
     build_host_container(image_dir)?;
     build_qcow2(disk, image_dir, HOST_IMAGE_TAG)
 }
 
 fn ensure_host_iso(iso: &Path, image_dir: &Path) -> Result<(), Error> {
-    let parts = prepare_host_image_parts(image_dir)?;
+    let parts = host_image_parts(image_dir)?;
     let installer_toml = image_dir.join("installer.toml");
     if !parts.stale(iso)? && !optional_newer(&installer_toml, iso)? {
         return Ok(());
     }
+    parts.build_images()?;
     build_host_container(image_dir)?;
     build_anaconda_iso(iso, image_dir)
 }
@@ -2352,7 +2359,8 @@ impl LocalRegistry {
 
     fn publish(dead_netd: bool) -> Result<Self, Error> {
         let image_dir = host_image_dir()?;
-        let _parts = prepare_host_image_parts(&image_dir)?;
+        let parts = host_image_parts(&image_dir)?;
+        parts.build_images()?;
         build_host_container(&image_dir)?;
         build_next_release(dead_netd)?;
         let port = free_localhost_port()?;
