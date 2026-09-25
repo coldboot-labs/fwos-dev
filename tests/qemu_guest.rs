@@ -15,6 +15,29 @@ fn guest_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn wait_dhcp_offer(peer: &NetworkPeer) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut packet_trace = String::new();
+    while std::time::Instant::now() < deadline {
+        let (address, trace) = peer
+            .dhcp_offer_with_trace()
+            .expect("external LAN DHCP offer");
+        packet_trace.push_str(&trace);
+        if let Some(address) = address {
+            return address;
+        }
+    }
+    panic!("accepted Kea config must offer an address; external packets: {packet_trace}");
+}
+
+fn offer_octet(address: &str) -> u8 {
+    address
+        .strip_prefix("10.56.0.")
+        .unwrap_or_else(|| panic!("unexpected DHCP offer subnet: {address}"))
+        .parse()
+        .expect("DHCP offer last octet")
+}
+
 #[test]
 fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
     let _guard = guest_lock();
@@ -88,9 +111,10 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "lan_prefix": "10.56.0.0/24"
     });
     https_bootstrap(&guest, &bootstrap.to_string());
-    assert!(!lan_peer
+    assert!(lan_peer
         .dhcp_offer()
-        .expect("no DHCP service before enablement"));
+        .expect("no DHCP service before enablement")
+        .is_none());
     guest
         .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
         .expect("administrator accepts the initial route in rendered UI");
@@ -195,7 +219,7 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
             {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24", "192.0.2.3/24"]}
         ],
         "ui_exposure": [ui_nic],
-        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.100-10.56.0.200",
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.100-10.56.0.129",
         "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}],
         "wireguard": [{"name": wan_nic, "private_key": WG_PRIVATE, "addresses": ["10.13.13.1/24"]}]
     });
@@ -224,7 +248,10 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         .ping("198.51.100.2")
         .expect("Accepted traffic after WAN alias recovery"));
     assert!(
-        !lan_peer.dhcp_offer().expect("DHCP after failed enablement"),
+        lan_peer
+            .dhcp_offer()
+            .expect("DHCP after failed enablement")
+            .is_none(),
         "tentative Kea config must not launch a DHCP service"
     );
 
@@ -239,22 +266,111 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
             || accepted.contains("\"outcome\": \"accepted\""),
         "accepted DHCP enablement: {accepted}"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut offered = false;
-    let mut packet_trace = String::new();
-    while std::time::Instant::now() < deadline {
-        let (seen, trace) = lan_peer
-            .dhcp_offer_with_trace()
-            .expect("DHCP after accepted enablement");
-        packet_trace.push_str(&trace);
-        if seen {
-            offered = true;
-            break;
-        }
-    }
+    let offer_a = wait_dhcp_offer(&lan_peer);
     assert!(
-        offered,
-        "accepted Kea config must launch DHCP service; external packets: {packet_trace}"
+        (100..=129).contains(&offer_octet(&offer_a)),
+        "pool A offer: {offer_a}"
+    );
+
+    let mut edit_dhcp = enable_dhcp.clone();
+    edit_dhcp["revision"] = serde_json::json!(3);
+    edit_dhcp["dhcp_pool"] = serde_json::json!("10.56.0.170-10.56.0.199");
+    let edited = serial_cmd(&guest, &format!("apply {edit_dhcp}\n"), 90, |text| {
+        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
+    });
+    assert!(
+        edited.contains("\"outcome\":\"accepted\"") || edited.contains("\"outcome\": \"accepted\""),
+        "accepted DHCP pool edit: {edited}"
+    );
+    let offer_b = lan_peer
+        .dhcp_offer()
+        .expect("DHCP immediately after accepted B")
+        .expect("Host acknowledgement must follow working DHCP service B");
+    assert!(
+        (170..=199).contains(&offer_octet(&offer_b)),
+        "pool B offer after accepted edit: {offer_b}"
+    );
+
+    // Empty pool currently passes preflight but Kea rejects its generated
+    // config. Host activation must fail before netd can accept this revision,
+    // and both the former service process and Accepted B must be restored.
+    let mut invalid_host_config = edit_dhcp.clone();
+    invalid_host_config["revision"] = serde_json::json!(4);
+    invalid_host_config["dhcp_pool"] = serde_json::json!("");
+    let host_failure = serial_cmd(
+        &guest,
+        &format!("apply {invalid_host_config}\n"),
+        90,
+        |text| text.contains("\"restoration\"") || text.contains("\"outcome\""),
+    );
+    assert!(
+        host_failure.contains("\"restoration\":\"restored\"")
+            || host_failure.contains("\"restoration\": \"restored\""),
+        "Host activation failure must restore B: {host_failure}"
+    );
+    let offer_after_host_failure = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (170..=199).contains(&offer_octet(&offer_after_host_failure)),
+        "pool B offer after rejected Kea config: {offer_after_host_failure}"
+    );
+
+    let mut failed_pool = edit_dhcp.clone();
+    failed_pool["revision"] = serde_json::json!(4);
+    failed_pool["dhcp_pool"] = serde_json::json!("10.56.0.130-10.56.0.159");
+    failed_pool["wireguard"] = invalid_runtime["wireguard"].clone();
+    let failed = serial_cmd(&guest, &format!("apply {failed_pool}\n"), 90, |text| {
+        text.contains("\"restoration\"") || text.contains("\"outcome\"")
+    });
+    assert!(
+        failed.contains("\"restoration\":\"restored\"")
+            || failed.contains("\"restoration\": \"restored\""),
+        "failed DHCP pool edit must restore B: {failed}"
+    );
+    let offer_after_failure = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (170..=199).contains(&offer_octet(&offer_after_failure)),
+        "pool B offer after failed C edit: {offer_after_failure}"
+    );
+
+    let reboot_from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("appliance console reboot");
+    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+        text.contains("FWOS Appliance CLI")
+    });
+    assert!(
+        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        "Accepted B must boot as an owned appliance: {rebooted}"
+    );
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let after_reboot: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(after_reboot["revision"], 4, "Accepted B survives reboot");
+    let reboot_offer = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (170..=199).contains(&offer_octet(&reboot_offer)),
+        "Host worker must reactivate Accepted B after reboot: {reboot_offer}"
+    );
+    serial_login_admin_from(&guest, "alice", "secret12", reboot_from);
+
+    let mut disable_dhcp = edit_dhcp.clone();
+    disable_dhcp["revision"] = serde_json::json!(4);
+    disable_dhcp["dhcp_pool"] = serde_json::Value::Null;
+    let disabled = serial_cmd(&guest, &format!("apply {disable_dhcp}\n"), 90, |text| {
+        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
+    });
+    assert!(
+        disabled.contains("\"outcome\":\"accepted\"")
+            || disabled.contains("\"outcome\": \"accepted\""),
+        "accepted DHCP disablement: {disabled}"
+    );
+    assert!(
+        lan_peer
+            .dhcp_offer()
+            .expect("DHCP after accepted disablement")
+            .is_none(),
+        "accepted removal must stop the former DHCP service"
     );
 }
 

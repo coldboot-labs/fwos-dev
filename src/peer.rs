@@ -176,7 +176,7 @@ impl NetworkPeer {
     }
 
     /// Request a real DHCPv4 offer from this external LAN segment.
-    pub fn dhcp_offer(&self) -> Result<bool, Error> {
+    pub fn dhcp_offer(&self) -> Result<Option<String>, Error> {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/dhcp-discover.py");
         let output = self
@@ -192,13 +192,17 @@ impl NetworkPeer {
         }
         let result: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| Error::from_message(format!("external-peer DHCP result: {error}")))?;
-        result["offer"]
-            .as_bool()
-            .ok_or_else(|| Error::from_message("external-peer DHCP result has no offer status"))
+        match &result["address"] {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(address) => Ok(Some(address.clone())),
+            _ => Err(Error::from_message(
+                "external-peer DHCP result has no offer address",
+            )),
+        }
     }
 
     /// Capture only externally visible DHCP packets while probing this peer.
-    pub fn dhcp_offer_with_trace(&self) -> Result<(bool, String), Error> {
+    pub fn dhcp_offer_with_trace(&self) -> Result<(Option<String>, String), Error> {
         let capture = self
             .command("timeout")
             .args([

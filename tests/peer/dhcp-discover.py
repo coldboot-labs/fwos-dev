@@ -30,7 +30,11 @@ bootp[0:3] = bytes([1, 1, 6])
 bootp[4:8] = xid
 bootp[10:12] = struct.pack("!H", 0x8000)
 bootp[28:34] = mac
-bootp[236:248] = bytes([99, 130, 83, 99, 53, 1, 1, 55, 2, 1, 3, 255])
+client_id = bytearray(os.urandom(6))
+client_id[0] = (client_id[0] | 2) & 0xFE
+options = bytes([99, 130, 83, 99, 53, 1, 1, 55, 2, 1, 3, 61, 7, 1])
+options += client_id + bytes([255])
+bootp[236:236 + len(options)] = options
 udp = struct.pack("!HHHH", 68, 67, 8 + len(bootp), 0)
 ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp) + len(bootp),
                  int.from_bytes(os.urandom(2)), 0, 64, 17, 0,
@@ -38,10 +42,10 @@ ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp) + len(bootp),
 ip = ip[:10] + struct.pack("!H", checksum(ip)) + ip[12:]
 frame = b"\xff" * 6 + mac + struct.pack("!H", 0x0800) + ip + udp + bootp
 
-offer = False
+offer_address = None
 deadline = time.monotonic() + 4
 next_send = 0
-while time.monotonic() < deadline and not offer:
+while time.monotonic() < deadline and offer_address is None:
     now = time.monotonic()
     if now >= next_send:
         sender.send(frame)
@@ -69,6 +73,6 @@ while time.monotonic() < deadline and not offer:
                 if index + length > len(packet):
                     break
                 if kind == 53 and length == 1 and packet[index] == 2:
-                    offer = True
+                    offer_address = ".".join(str(octet) for octet in packet[16:20])
                 index += length
-print(json.dumps({"offer": offer}))
+print(json.dumps({"address": offer_address}))
