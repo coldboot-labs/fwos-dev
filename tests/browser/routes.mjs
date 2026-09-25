@@ -23,7 +23,7 @@ try {
   await page.getByRole("heading", { name: "Status", exact: true }).waitFor();
   stage = "edit";
   await page.getByRole("heading", { name: "Static routes", exact: true }).waitFor();
-  if (action === "apply-draft" || action === "apply-stale-draft") {
+  if (action === "apply-draft" || action === "apply-stale-draft" || action === "apply-failed-draft") {
     await page.getByRole("button", { name: "Review pending draft", exact: true }).click();
     stage = "draft-review";
     await page.getByRole("heading", { name: "Review pending draft", exact: true }).waitFor();
@@ -33,7 +33,9 @@ try {
     }
     stage = "draft-apply";
     await page.getByRole("button", { name: "Apply reviewed draft", exact: true }).click();
-    await page.locator("#route-result").getByText(action === "apply-stale-draft" ? "Stale draft" : "Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
+    const expected = action === "apply-stale-draft" ? "Stale draft"
+      : action === "apply-failed-draft" ? "Previous Accepted network restored" : "Accepted revision";
+    await page.locator("#route-result").getByText(expected, { exact: false }).waitFor({ timeout: 60_000 });
     result = { ok: true };
   } else if (action === "reconcile-draft") {
     await page.getByRole("button", { name: "Review reconciliation", exact: true }).click();

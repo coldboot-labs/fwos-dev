@@ -48,6 +48,181 @@ fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
 }
 
 #[test]
+fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    for destination in ["198.51.100.0/24", "203.0.113.0/24"] {
+        lan_peer
+            .add_route(destination, "10.56.0.1")
+            .expect("LAN peer route through appliance");
+    }
+    wan_peer.add_address("192.0.2.2/24").expect("WAN next hop");
+    wan_peer
+        .add_address("198.51.100.2/24")
+        .expect("Accepted destination behind WAN peer");
+    wan_peer
+        .add_address("203.0.113.2/24")
+        .expect("tentative destination behind WAN peer");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peer_nics: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peer_nics.len(), 2);
+    let (lan_nic, wan_nic) = (&peer_nics[0], &peer_nics[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    guest
+        .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
+        .expect("administrator accepts the initial route in rendered UI");
+    assert!(lan_peer
+        .ping("198.51.100.2")
+        .expect("Accepted peer traffic"));
+    assert!(!lan_peer
+        .ping("203.0.113.2")
+        .expect("no tentative peer route"));
+
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let accepted_before: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted_before["revision"], 2);
+    let proposal = serde_json::json!({
+        "base_revision": 2,
+        "routes": [
+            {"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            {"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            // The WAN subnet's directed-broadcast address is syntactically
+            // on-link, but Linux rejects it as a route next hop at runtime.
+            {"to": "203.0.114.0/24", "via": "192.0.2.255", "dev": wan_nic}
+        ]
+    });
+    let (code, body) = session
+        .exchange("POST", "/api/routes/apply", Some(&proposal.to_string()), 90)
+        .expect("authenticated apply reports its outcome");
+    assert_eq!(
+        code, 502,
+        "runtime apply must fail after validation: {body}"
+    );
+    let outcome: serde_json::Value = serde_json::from_str(&body).expect("apply outcome JSON");
+    assert_eq!(
+        outcome["outcome"], "failed",
+        "not a validation rejection: {body}"
+    );
+    assert_eq!(
+        outcome["restoration"], "restored",
+        "operator-visible recovery: {body}"
+    );
+    assert_eq!(outcome["revision"], 2, "Accepted revision remains current");
+    assert!(lan_peer
+        .ping("198.51.100.2")
+        .expect("prior traffic after recovery"));
+    assert!(!lan_peer
+        .ping("203.0.113.2")
+        .expect("tentative traffic after recovery"));
+    let accepted_after: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted_after["revision"], accepted_before["revision"]);
+    assert_eq!(accepted_after["routes"], accepted_before["routes"]);
+    let status: serde_json::Value =
+        serde_json::from_str(&session.get("/api/status").unwrap()).unwrap();
+    assert_eq!(
+        status["bootstrapped"], true,
+        "recovery never reopens Bootstrap"
+    );
+    let fresh = https_login_admin(&guest, "alice", "secret12");
+    assert!(
+        fresh.get("/api/routes").is_ok(),
+        "current Identity still authenticates"
+    );
+
+    let draft_change = serde_json::json!({
+        "base_revision": 2,
+        "routes": proposal["routes"]
+    });
+    let (draft_code, draft_body) = session
+        .exchange(
+            "POST",
+            "/api/draft/save",
+            Some(&draft_change.to_string()),
+            15,
+        )
+        .expect("save a private reviewable failed-apply draft");
+    assert_eq!(draft_code, 200, "save failed-apply draft: {draft_body}");
+    guest
+        .browser_static_route_action(
+            "apply-failed-draft",
+            "alice",
+            "secret12",
+            "",
+            "203.0.114.0/24",
+            "",
+            wan_nic,
+        )
+        .expect("rendered UI reports previous Accepted network restored");
+    let retained: serde_json::Value =
+        serde_json::from_str(&session.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(retained["status"], "pending", "failed draft stays private");
+
+    // A complete-state caller can change more than routes. Add a WAN alias,
+    // then induce a later WireGuard runtime failure by targeting the real WAN
+    // NIC as though it were a WireGuard link. Recovery must remove the alias.
+    serial_login_admin(&guest, "alice", "secret12");
+    let invalid_runtime = serde_json::json!({
+        "revision": 2,
+        "hostname": "fwos-box",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24", "192.0.2.3/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200",
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}],
+        "wireguard": [{"name": wan_nic, "private_key": WG_PRIVATE, "addresses": ["10.13.13.1/24"]}]
+    });
+    let failed = serial_cmd(&guest, &format!("apply {invalid_runtime}\n"), 90, |text| {
+        text.contains("\"restoration\"") || text.contains("\"outcome\"")
+    });
+    assert!(
+        failed.contains("\"outcome\":\"failed\"") || failed.contains("\"outcome\": \"failed\""),
+        "complete-state apply must fail at runtime: {failed}"
+    );
+    assert!(
+        failed.contains("\"restoration\":\"restored\"")
+            || failed.contains("\"restoration\": \"restored\""),
+        "complete-state apply must report restoration: {failed}"
+    );
+    wan_peer
+        .ping("192.0.2.3")
+        .expect("probe tentative WAN alias");
+    assert!(
+        !wan_peer
+            .neighbor_resolved("192.0.2.3")
+            .expect("observe WAN alias externally"),
+        "failed complete-state apply left a tentative address active: {failed}"
+    );
+    assert!(lan_peer
+        .ping("198.51.100.2")
+        .expect("Accepted traffic after WAN alias recovery"));
+}
+
+#[test]
 fn saved_private_draft_does_not_activate_or_change_accepted_desired() {
     let _guard = guest_lock();
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
