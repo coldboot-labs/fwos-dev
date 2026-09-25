@@ -158,6 +158,23 @@ impl NetworkPeer {
         ])
     }
 
+    /// Observe packet forwarding from the isolated peer, outside the guest.
+    pub fn ping(&self, address: &str) -> Result<bool, Error> {
+        let output = self
+            .command("ping")
+            .args(["-n", "-c", "1", "-W", "2", address])
+            .output()
+            .map_err(|e| Error::from_io("external-peer ICMP probe", e))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(Error::from_message(format!(
+                "external-peer ICMP probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+        }
+    }
+
     /// Request the appliance directly over this Ethernet segment.
     pub fn https_get(&self, address: &str, path: &str) -> Result<String, Error> {
         let output = self

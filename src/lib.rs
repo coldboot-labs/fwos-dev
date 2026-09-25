@@ -69,6 +69,7 @@ struct QemuStart<'a> {
     linux: Option<&'a IsoLinux>,
     extra_nics: u8,
     peer_taps: &'a [&'a str],
+    user_net_with_peers: bool,
     port_22: u16,
     https_port: u16,
     extra_https_port: Option<u16>,
@@ -200,7 +201,19 @@ impl Guest {
         }
         let disk_path = build_published_host_image_disk()?;
         let taps: Vec<&str> = peers.iter().map(|peer| peer.tap()).collect();
-        Self::boot_disk_with_peers(&disk_path, 0, &taps)
+        Self::boot_disk_with_peers(&disk_path, 0, &taps, false)
+    }
+
+    /// Boot with the regular HTTPS user network and task-owned external peers.
+    pub fn boot_published_host_image_with_user_net_and_peers(
+        peers: &[&NetworkPeer],
+    ) -> Result<Self, Error> {
+        if peers.is_empty() {
+            return Err(Error::from_message("at least one network peer is required"));
+        }
+        let disk_path = build_published_host_image_disk()?;
+        let taps: Vec<&str> = peers.iter().map(|peer| peer.tap()).collect();
+        Self::boot_disk_with_peers(&disk_path, 0, &taps, true)
     }
 
     /// Boot the Installer ISO against an empty virt disk, then observe the installed guest.
@@ -253,6 +266,7 @@ impl Guest {
             linux: Some(&linux),
             extra_nics: 0,
             peer_taps: &[],
+            user_net_with_peers: false,
             port_22: port,
             https_port,
             extra_https_port: None,
@@ -267,13 +281,14 @@ impl Guest {
     }
 
     fn boot_disk(disk_path: &Path, extra_nics: u8) -> Result<Self, Error> {
-        Self::boot_disk_with_peers(disk_path, extra_nics, &[])
+        Self::boot_disk_with_peers(disk_path, extra_nics, &[], false)
     }
 
     fn boot_disk_with_peers(
         disk_path: &Path,
         extra_nics: u8,
         peer_taps: &[&str],
+        user_net_with_peers: bool,
     ) -> Result<Self, Error> {
         ensure_kvm_usable()?;
         ensure_ovmf()?;
@@ -297,6 +312,7 @@ impl Guest {
             linux: None,
             extra_nics,
             peer_taps,
+            user_net_with_peers,
             port_22: port,
             https_port,
             extra_https_port,
@@ -477,6 +493,68 @@ impl Guest {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| Error::from_message("rendered UI driver omitted browser version"))
+    }
+
+    /// Drive the published route editor through rendered HTTPS controls.
+    pub fn browser_add_static_route(
+        &self,
+        username: &str,
+        password: &str,
+        destination: &str,
+        gateway: &str,
+        device: &str,
+    ) -> Result<(), Error> {
+        self.browser_static_route_action(
+            "add",
+            username,
+            password,
+            "",
+            destination,
+            gateway,
+            device,
+        )
+    }
+
+    pub fn browser_static_route_action(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        existing_destination: &str,
+        destination: &str,
+        gateway: &str,
+        device: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "existingDestination": existing_destination,
+            "destination": destination,
+            "gateway": gateway,
+            "device": device,
+        }))
+        .map_err(|_| Error::from_message("encode route browser input"))?;
+        let output = output_with_input(
+            Command::new("node").arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/browser/routes.mjs"
+            )),
+            &input,
+        )
+        .map_err(|error| Error::from_io("run route browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| Error::from_message("route browser driver returned no valid result"))?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered route apply failed at {}: {}; route result: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail"),
+                result["routeResult"].as_str().unwrap_or("")
+            )));
+        }
+        Ok(())
     }
 
     /// Check the rendered one-NIC warning as the operator changes WAN tagging.
@@ -1689,6 +1767,16 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
     if opts.no_reboot {
         cmd.arg("-no-reboot");
     }
+    if opts.peer_taps.is_empty() || opts.user_net_with_peers {
+        cmd.args([
+            "-netdev",
+            &format!(
+                "user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22,hostfwd=tcp:127.0.0.1:{}-:443",
+                opts.port_22, opts.https_port
+            ),
+        ])
+        .args(["-device", "virtio-net-pci,netdev=net0"]);
+    }
     if !opts.peer_taps.is_empty() {
         for (index, tap) in opts.peer_taps.iter().enumerate() {
             cmd.args([
@@ -1699,14 +1787,6 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
             ]);
         }
     } else {
-        cmd.args([
-            "-netdev",
-            &format!(
-                "user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22,hostfwd=tcp:127.0.0.1:{}-:443",
-                opts.port_22, opts.https_port
-            ),
-        ])
-        .args(["-device", "virtio-net-pci,netdev=net0"]);
         for i in 0..opts.extra_nics {
             let id = format!("net{}", i + 1);
             let net = format!("10.0.{}.0/24", i + 3);
@@ -1868,6 +1948,7 @@ fn run_iso_install(iso: &Path, disk: &Path) -> Result<(), Error> {
         linux: Some(&linux),
         extra_nics: 0,
         peer_taps: &[],
+        user_net_with_peers: false,
         port_22: port,
         https_port,
         extra_https_port: None,

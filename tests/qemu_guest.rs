@@ -2,7 +2,7 @@ use std::io::{BufRead, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-use fwos_dev::{Guest, LocalRegistry};
+use fwos_dev::{Guest, LocalRegistry, NetworkPeer};
 
 // WireGuard test vector (docs.wireguard.com).
 const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
@@ -13,6 +13,224 @@ fn guest_lock() -> std::sync::MutexGuard<'static, ()> {
     GUEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let initial = session
+        .get("/api/routes")
+        .expect("authenticated route view");
+    assert!(
+        initial.contains("\"revision\":1"),
+        "initial route view: {initial}"
+    );
+    guest
+        .browser_add_static_route(
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("rendered administrator reviews and applies a static route");
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let desired: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").expect("accepted route view"))
+            .expect("route view JSON");
+    assert_eq!(desired["routes"][0]["to"], "198.51.100.0/24");
+    assert_eq!(desired["status"], "accepted");
+}
+
+#[test]
+fn published_graphical_static_route_changes_external_peer_forwarding() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    lan_peer
+        .add_route("198.51.100.0/24", "10.56.0.1")
+        .expect("LAN test route");
+    lan_peer
+        .add_route("203.0.113.0/24", "10.56.0.1")
+        .expect("second LAN test route");
+    wan_peer.add_address("192.0.2.2/24").expect("WAN next hop");
+    wan_peer
+        .add_address("198.51.100.2/24")
+        .expect("destination behind WAN next hop");
+    wan_peer
+        .add_address("203.0.113.2/24")
+        .expect("replacement destination behind WAN next hop");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peers.len(), 2);
+    let (lan_nic, wan_nic) = (&peers[0], &peers[1]);
+    let payload = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200"
+    });
+    https_bootstrap(&guest, &payload.to_string());
+    let initial_session = https_login_admin(&guest, "alice", "secret12");
+    let initial_status: serde_json::Value =
+        serde_json::from_str(&initial_session.get("/api/status").unwrap()).unwrap();
+    assert!(!lan_peer
+        .ping("198.51.100.2")
+        .expect("peer probe before route"));
+    guest
+        .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
+        .expect("graphical review and apply of forwarding route");
+    assert!(lan_peer
+        .ping("198.51.100.2")
+        .expect("peer probe after route"));
+    assert!(!lan_peer
+        .ping("203.0.113.2")
+        .expect("peer probe before replacement route"));
+
+    guest
+        .browser_static_route_action(
+            "change",
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            wan_nic,
+        )
+        .expect("graphical review and apply of replacement route");
+    assert!(!lan_peer
+        .ping("198.51.100.2")
+        .expect("old route removed after change"));
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("new route forwards after change"));
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 3);
+    assert_eq!(accepted["routes"][0]["to"], "203.0.113.0/24");
+    let after_route_status: serde_json::Value =
+        serde_json::from_str(&session.get("/api/status").unwrap()).unwrap();
+    for field in [
+        "hostname",
+        "lan_prefix",
+        "dhcp_pool",
+        "ui_exposure",
+        "interfaces",
+    ] {
+        assert_eq!(
+            after_route_status[field], initial_status[field],
+            "route editor preserves {field}"
+        );
+    }
+
+    serial_login_admin(&guest, "alice", "secret12");
+    let malformed = serial_cmd(
+        &guest,
+        "apply {\"interfaces\":[],\"ui_exposure\":[],\"routes\":[]}\n",
+        20,
+        |text| text.contains("rejected"),
+    );
+    assert!(
+        malformed.contains("rejected"),
+        "malformed complete Desired state must be rejected: {malformed}"
+    );
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("legacy rejected apply leaves forwarding intact"));
+    let reboot_from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("normal Appliance console reboot");
+    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+        text.contains("FWOS Appliance CLI")
+    });
+    assert!(
+        rebooted.contains("FWOS Appliance CLI"),
+        "Accepted Desired state reboot: {rebooted}"
+    );
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let after_reboot: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(
+        after_reboot["revision"], 3,
+        "Accepted revision survives reboot"
+    );
+    assert_eq!(after_reboot["routes"][0]["to"], "203.0.113.0/24");
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("Accepted route forwards after reboot"));
+
+    guest
+        .browser_static_route_action(
+            "reject",
+            "alice",
+            "secret12",
+            "",
+            "not-a-cidr",
+            "192.0.2.2",
+            wan_nic,
+        )
+        .expect("graphical invalid-route review receives rejection");
+    let after_rejection: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(
+        after_rejection["revision"], 3,
+        "invalid route does not advance Accepted revision"
+    );
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("accepted route still forwards after rejection"));
+
+    let (stale_code, stale_body) = session
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(r#"{"base_revision":1,"routes":[]}"#),
+            15,
+        )
+        .expect("stale route apply response");
+    assert_eq!(stale_code, 409, "stale base must be rejected: {stale_body}");
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("stale apply leaves forwarding intact"));
+
+    guest
+        .browser_static_route_action(
+            "remove",
+            "alice",
+            "secret12",
+            "203.0.113.0/24",
+            "",
+            "192.0.2.2",
+            wan_nic,
+        )
+        .expect("graphical review and apply of route removal");
+    assert!(!lan_peer
+        .ping("203.0.113.2")
+        .expect("peer probe after route removal"));
+    let removed: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(removed["revision"], 4);
+    assert_eq!(removed["routes"], serde_json::json!([]));
 }
 
 #[test]
