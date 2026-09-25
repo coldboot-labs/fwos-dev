@@ -9,6 +9,152 @@ const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn authenticated_console_restores_previous_network_after_ui_reply_path_is_lost() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    for destination in ["198.51.100.0/24", "203.0.113.0/24"] {
+        lan_peer
+            .add_route(destination, "10.56.0.1")
+            .expect("LAN route through appliance");
+    }
+    wan_peer.add_address("192.0.2.2/24").expect("WAN next hop");
+    wan_peer
+        .add_address("198.51.100.2/24")
+        .expect("A destination");
+    wan_peer
+        .add_address("203.0.113.2/24")
+        .expect("B destination");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peer_nics: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peer_nics.len(), 2);
+    let (lan_nic, wan_nic) = (&peer_nics[0], &peer_nics[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic]
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    guest
+        .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
+        .expect("administrator accepts reachable network A through rendered UI");
+    assert!(lan_peer.ping("198.51.100.2").expect("A traffic"));
+    assert!(!lan_peer.ping("203.0.113.2").expect("no B route yet"));
+
+    // Identity changes after A is accepted are outside the network predecessor.
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("create current administrator through rendered UI");
+    guest
+        .browser_change_administrator_password("alice", "secret12", "bob", "new-bob-secret")
+        .expect("change password after accepting A");
+    guest
+        .browser_remove_administrator("bob", "new-bob-secret", "alice")
+        .expect("remove former administrator after accepting A");
+    let bob = https_login_admin(&guest, "bob", "new-bob-secret");
+    let bad_routes = serde_json::json!({
+        "base_revision": 2,
+        "routes": [
+            {"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            // More specific than the connected QEMU user-net route: valid,
+            // but HTTPS replies to the Workstation now leave by the WAN.
+            {"to": "10.0.2.2/32", "via": "192.0.2.2", "dev": wan_nic}
+        ]
+    });
+    let _ = bob.exchange(
+        "POST",
+        "/api/routes/apply",
+        Some(&bad_routes.to_string()),
+        15,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !lan_peer.ping("203.0.113.2").expect("B traffic") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unsuitable network B never became live; serial:\n{}",
+            guest.serial()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(!lan_peer.ping("198.51.100.2").expect("A route removed"));
+    https_must_not_answer(&guest, 3, "after accepted route hijacks UI reply path");
+
+    // Neither obsolete identity can reach the recovery operation.
+    for (user, password) in [("alice", "secret12"), ("bob", "bob-secret")] {
+        let prompt = serial_cmd(&guest, &format!("{user}\n"), 15, |text| {
+            text.contains("password:")
+        });
+        assert!(
+            prompt.contains("password:"),
+            "console login prompt: {prompt}"
+        );
+        let from = guest.serial().len();
+        guest
+            .serial_write(&format!("{password}\n"))
+            .expect("submit obsolete console password");
+        let denied = serial_wait(&guest, from, 15, |text| text.contains("login failed"));
+        assert!(
+            denied.contains("login failed"),
+            "obsolete identity denied: {denied}"
+        );
+    }
+    assert!(lan_peer
+        .ping("203.0.113.2")
+        .expect("failed auth cannot restore A"));
+    serial_login_admin(&guest, "bob", "new-bob-secret");
+    let help = serial_cmd(&guest, "help\n", 15, |text| {
+        text.contains("restore-previous")
+    });
+    assert!(help.contains("restore-previous"), "recovery menu: {help}");
+    assert!(!help.contains("apply <"), "v1 menu is limited: {help}");
+    let restored = serial_cmd(&guest, "restore-previous\n", 120, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        restored.contains("\"outcome\":\"accepted\"")
+            || restored.contains("\"outcome\": \"accepted\""),
+        "console restoration outcome: {restored}"
+    );
+    assert!(lan_peer.ping("198.51.100.2").expect("A traffic restored"));
+    assert!(!lan_peer.ping("203.0.113.2").expect("B route removed"));
+    let current = https_login_admin(&guest, "bob", "new-bob-secret");
+    let status: serde_json::Value =
+        serde_json::from_str(&current.get("/api/status").unwrap()).unwrap();
+    assert_eq!(
+        status["bootstrapped"], true,
+        "recovery cannot reopen Bootstrap"
+    );
+    let routes: serde_json::Value =
+        serde_json::from_str(&current.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(
+        routes["revision"], 4,
+        "restoration is a new Accepted revision"
+    );
+    assert_eq!(routes["routes"][0]["to"], "198.51.100.0/24");
+    for (user, password) in [("alice", "secret12"), ("bob", "bob-secret")] {
+        let credentials =
+            serde_json::json!({"source": "local", "username": user, "password": password});
+        let (code, _) = guest
+            .https_exchange("POST", "/api/login", Some(&credentials.to_string()), 15)
+            .expect("obsolete identity response after restoration");
+        assert_eq!(code, 401, "network recovery must preserve current Identity");
+    }
+}
+
 fn guest_lock() -> std::sync::MutexGuard<'static, ()> {
     GUEST_LOCK
         .lock()
@@ -2387,11 +2533,16 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         "Desired state that fails to apply must not roll back the Host image, serial:\n{still_next}"
     );
 
-    let help = serial_cmd(&guest, "help\n", 10, |t| t.contains("rollback"));
+    let help = serial_cmd(&guest, "help\n", 10, |t| t.contains("logout"));
     assert!(
-        help.contains("rollback"),
-        "manual rollback via Appliance CLI must remain, serial:\n{help}"
+        help.contains("status")
+            && help.contains("restore-previous")
+            && help.contains("reboot")
+            && !help.contains("rollback")
+            && !help.contains("apply <"),
+        "v1 recovery help must stay limited while legacy commands remain callable, serial:\n{help}"
     );
+    // The old full-CLI adapter stays callable until its separate retirement.
     let rolled = serial_cmd(&guest, "rollback\n", 60, |t| {
         (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
             && t.to_ascii_lowercase().contains("reboot_required")
