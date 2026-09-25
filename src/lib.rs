@@ -216,6 +216,18 @@ impl Guest {
         Self::boot_disk_with_peers(&disk_path, 0, &taps, true)
     }
 
+    /// The extra Traffic NIC can be removed by QEMU while LAN and WAN peers stay connected.
+    pub fn boot_published_host_image_with_user_net_peers_and_extra_nic(
+        peers: &[&NetworkPeer],
+    ) -> Result<Self, Error> {
+        if peers.is_empty() {
+            return Err(Error::from_message("at least one network peer is required"));
+        }
+        let disk_path = build_published_host_image_disk()?;
+        let taps: Vec<&str> = peers.iter().map(|peer| peer.tap()).collect();
+        Self::boot_disk_with_peers(&disk_path, 1, &taps, true)
+    }
+
     /// Boot the Installer ISO against an empty virt disk, then observe the installed guest.
     pub fn install_from_iso() -> Result<Self, Error> {
         let disk_path = install_host_image_disk()?;
@@ -384,6 +396,48 @@ impl Guest {
             let message = error.split("\r\n").next().unwrap_or(error).trim();
             return Err(Error::from_message(format!(
                 "QEMU extra NIC hot-unplug failed: {message}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restore the task-owned QEMU extra NIC; network startup sees it on the next reset.
+    pub fn qemu_replug_extra_nic(&self) -> Result<(), Error> {
+        let mut stream = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut reply = [0u8; 4096];
+        let mut response = String::new();
+        while !response.ends_with("(qemu) ") {
+            let n = stream
+                .read(&mut reply)
+                .map_err(|e| Error::from_io("reading QEMU monitor prompt", e))?;
+            if n == 0 {
+                return Err(Error::from_message("QEMU monitor closed before prompt"));
+            }
+            response.push_str(&String::from_utf8_lossy(&reply[..n]));
+        }
+        stream
+            .write_all(
+                b"device_add virtio-net-pci,netdev=net1,id=fwos-extra0,bus=fwos-hotplug-port0\n",
+            )
+            .and_then(|_| stream.flush())
+            .map_err(|e| Error::from_io("QEMU extra NIC hot-plug", e))?;
+        response.clear();
+        while !response.ends_with("(qemu) ") {
+            let n = stream
+                .read(&mut reply)
+                .map_err(|e| Error::from_io("reading QEMU hot-plug reply", e))?;
+            if n == 0 {
+                return Err(Error::from_message("QEMU monitor closed during hot-plug"));
+            }
+            response.push_str(&String::from_utf8_lossy(&reply[..n]));
+        }
+        if let Some(error) = response.split("Error:").nth(1) {
+            return Err(Error::from_message(format!(
+                "QEMU extra NIC hot-plug failed: {}",
+                error.split("\r\n").next().unwrap_or(error).trim()
             )));
         }
         Ok(())
@@ -1793,32 +1847,31 @@ fn start_qemu(opts: QemuStart<'_>) -> Result<Child, Error> {
                 &format!("virtio-net-pci,netdev=peer{index}"),
             ]);
         }
-    } else {
-        for i in 0..opts.extra_nics {
-            let id = format!("net{}", i + 1);
-            let net = format!("10.0.{}.0/24", i + 3);
-            let mut netdev = format!("user,id={id},net={net}");
-            if i == 0 {
-                if let Some(port) = opts.extra_https_port {
-                    netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
-                }
+    }
+    for i in 0..opts.extra_nics {
+        let id = format!("net{}", i + 1);
+        let net = format!("10.0.{}.0/24", i + 3);
+        let mut netdev = format!("user,id={id},net={net}");
+        if i == 0 {
+            if let Some(port) = opts.extra_https_port {
+                netdev.push_str(&format!(",hostfwd=tcp:127.0.0.1:{port}-:443"));
             }
-            if i == 0 {
-                cmd.args([
-                    "-device",
-                    "pcie-root-port,id=fwos-hotplug-port0,chassis=1,slot=1",
-                ]);
-            }
-            let bus = if i == 0 {
-                ",bus=fwos-hotplug-port0"
-            } else {
-                ""
-            };
-            cmd.args(["-netdev", &netdev]).args([
+        }
+        if i == 0 {
+            cmd.args([
                 "-device",
-                &format!("virtio-net-pci,netdev={id},id=fwos-extra{i}{bus}"),
+                "pcie-root-port,id=fwos-hotplug-port0,chassis=1,slot=1",
             ]);
         }
+        let bus = if i == 0 {
+            ",bus=fwos-hotplug-port0"
+        } else {
+            ""
+        };
+        cmd.args(["-netdev", &netdev]).args([
+            "-device",
+            &format!("virtio-net-pci,netdev={id},id=fwos-extra{i}{bus}"),
+        ]);
     }
     let child = cmd
         .args(["-device", "virtio-rng-pci"])

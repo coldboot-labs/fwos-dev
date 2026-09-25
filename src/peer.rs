@@ -343,6 +343,22 @@ impl NetworkPeer {
         }))
     }
 
+    /// Resolve a fresh neighbor from this isolated peer, even if its ICMP input is blocked.
+    pub fn resolve_neighbor(&self, address: &str) -> Result<bool, Error> {
+        ip(&[
+            "-n",
+            &self.namespace,
+            "neigh",
+            "flush",
+            "to",
+            address,
+            "dev",
+            "eth0",
+        ])?;
+        let _ = self.ping(address)?;
+        self.neighbor_resolved(address)
+    }
+
     fn command(&self, executable: &str) -> Command {
         let mut command = Command::new("sudo");
         command.args(["-n", "ip", "netns", "exec", &self.namespace, executable]);

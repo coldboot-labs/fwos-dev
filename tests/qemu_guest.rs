@@ -10,6 +10,306 @@ const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn interrupted_apply_restores_accepted_route_after_external_reset() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("198.51.100.0/24", "10.56.0.1").unwrap();
+    lan_peer.add_route("203.0.113.0/24", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("198.51.100.2/24").unwrap();
+    wan_peer.add_address("203.0.113.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peer_nics: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    let (lan_nic, wan_nic) = (&peer_nics[0], &peer_nics[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic], "lan_prefix": "10.56.0.0/24"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    guest
+        .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
+        .expect("accept A through rendered UI");
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    assert!(!lan_peer.ping("203.0.113.2").unwrap());
+    serial_login_admin(&guest, "alice", "secret12");
+    let replacement = serde_json::json!({
+        "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
+        "ui_exposure": [ui_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
+        "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
+    let from = guest.serial().len();
+    guest
+        .serial_write(&format!("apply {replacement}\n"))
+        .expect("send complete Desired state over authenticated serial console");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !lan_peer
+        .ping("203.0.113.2")
+        .expect("external replacement probe")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement never forwarded before cut; serial: {}",
+            guest.serial()
+        );
+    }
+    let before_cut = guest.serial();
+    assert!(
+        !before_cut[from..].contains("\"outcome\""),
+        "apply completed before external cut: {}",
+        &before_cut[from..]
+    );
+    guest
+        .qemu_system_reset()
+        .expect("externally cut power during mutation and Host service reconciliation");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.lines().any(|line| line.trim() == "admin:"),
+        "owned appliance must reach authenticated console: {rebooted}"
+    );
+    assert!(
+        lan_peer.ping("198.51.100.2").unwrap(),
+        "previous Accepted route must forward after restart"
+    );
+    assert!(
+        !lan_peer.ping("203.0.113.2").unwrap(),
+        "tentative route must not forward after restart"
+    );
+    let current = https_login_admin(&guest, "alice", "secret12");
+    let routes: serde_json::Value =
+        serde_json::from_str(&current.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(
+        routes["revision"], 2,
+        "interrupted replacement must not become Accepted"
+    );
+    serial_login_admin(&guest, "alice", "secret12");
+    let status = serial_cmd(&guest, "status\n", 15, |text| {
+        text.contains("Previous accepted network revision:")
+    });
+    assert!(
+        status.contains("Previous accepted network revision: 1"),
+        "interrupted B must retain A's manual predecessor P: {status}"
+    );
+}
+
+#[test]
+fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_console() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.0/24", "10.56.0.1").unwrap();
+    lan_peer.add_route("198.51.100.0/24", "10.56.0.1").unwrap();
+    lan_peer.add_route("203.0.113.0/24", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("198.51.100.2/24").unwrap();
+    wan_peer.add_address("203.0.113.2/24").unwrap();
+    let guest =
+        Guest::boot_published_host_image_with_user_net_peers_and_extra_nic(&[&lan_peer, &wan_peer])
+            .expect("published Disk image with independent LAN, WAN and removable required NIC");
+    let ui_nic = opt_user_net(&guest);
+    let discovered = wait_console_nics(&guest);
+    let extra_nics: Vec<String> = discovered
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(extra_nics.len(), 3, "two peers plus removable required NIC");
+    let (lan_nic, wan_nic, required_nic) = (&extra_nics[0], &extra_nics[1], &extra_nics[2]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]},
+            {"name": required_nic, "role": "mgmt", "addresses": ["10.0.3.15/24"]}
+        ],
+        "ui_exposure": [ui_nic, required_nic], "lan_prefix": "10.56.0.0/24"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    guest
+        .browser_add_static_route("alice", "secret12", "198.51.100.0/24", "192.0.2.2", wan_nic)
+        .expect("accept A through rendered UI");
+    assert!(
+        lan_peer.ping("192.0.2.2").unwrap(),
+        "intact LAN to WAN path forwards before cut"
+    );
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    assert!(
+        !wan_peer.ping("192.0.2.1").unwrap(),
+        "Accepted firewall blocks unsolicited WAN input before recovery"
+    );
+    guest
+        .browser_change_own_administrator_password("alice", "secret12", "new-secret12")
+        .expect("current Identity changes after A is accepted");
+    serial_login_admin(&guest, "alice", "new-secret12");
+    let replacement = serde_json::json!({
+        "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
+        "ui_exposure": [ui_nic, required_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
+        "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
+    let from = guest.serial().len();
+    guest
+        .serial_write(&format!("apply {replacement}\n"))
+        .expect("submit replacement from authenticated console");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !lan_peer
+        .ping("203.0.113.2")
+        .expect("replacement traffic from external LAN")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement never forwarded; serial: {}",
+            guest.serial()
+        );
+    }
+    let before_cut = guest.serial();
+    assert!(
+        !before_cut[from..].contains("\"outcome\""),
+        "apply completed before cut: {}",
+        &before_cut[from..]
+    );
+    guest
+        .qemu_unplug_extra_nic()
+        .expect("externally remove only the required spare NIC before restart");
+    let after_unplug = guest.serial();
+    assert!(
+        !after_unplug[from..].contains("\"outcome\""),
+        "apply completed before power cut: {}",
+        &after_unplug[from..]
+    );
+    let reboot_from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("externally cut VM power during replacement");
+    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+        text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.lines().any(|line| line.trim() == "admin:"),
+        "authenticated console after failed restoration: {rebooted}"
+    );
+    let lan_local = lan_peer.ping("10.56.0.1").unwrap();
+    let wan_local = wan_peer.resolve_neighbor("192.0.2.1").unwrap();
+    let forwarded = lan_peer.ping("192.0.2.2").unwrap();
+    assert!(lan_local, "LAN link and appliance address remain present");
+    assert!(
+        wan_local,
+        "WAN peer must resolve the appliance address on its intact link"
+    );
+    assert!(
+        !wan_peer.ping("192.0.2.1").unwrap(),
+        "WAN input must remain blocked while restoration is incomplete"
+    );
+    assert!(
+        !forwarded,
+        "forwarding must be blocked even though LAN and WAN remain connected"
+    );
+    let wrong = serial_cmd(&guest, "alice\n", 15, |text| text.contains("password:"));
+    assert!(
+        wrong.contains("password:"),
+        "current administrator is prompted: {wrong}"
+    );
+    let denied_from = guest.serial().len();
+    guest.serial_write("secret12\n").unwrap();
+    let denied = serial_wait(&guest, denied_from, 15, |text| {
+        text.contains("login failed")
+    });
+    assert!(
+        denied.contains("login failed"),
+        "obsolete password cannot access recovery: {denied}"
+    );
+    serial_login_admin(&guest, "alice", "new-secret12");
+    let status = serial_cmd(&guest, "status\n", 15, |text| {
+        text.contains("Recovery required")
+    });
+    assert!(
+        status.contains("Recovery required"),
+        "console must name in-flight recovery: {status}"
+    );
+    let excluded = serial_cmd(&guest, &format!("apply {replacement}\n"), 15, |text| {
+        text.contains("\"restoration\"")
+    });
+    assert!(
+        excluded.contains("\"required\""),
+        "another apply must be excluded throughout recovery: {excluded}"
+    );
+    let retry = serial_cmd(&guest, "restore-previous\n", 30, |text| {
+        text.contains("\"restoration\"")
+    });
+    assert!(
+        retry.contains("\"required\""),
+        "retry stays blocked while required NIC is absent: {retry}"
+    );
+    assert!(
+        !lan_peer.ping("192.0.2.2").unwrap(),
+        "failed retry remains fail closed"
+    );
+    guest
+        .qemu_replug_extra_nic()
+        .expect("externally repair the required NIC");
+    let repaired_from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("reboot so network startup moves repaired NIC into fwd");
+    let repaired = serial_wait(&guest, repaired_from, 300, |text| {
+        text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        repaired.lines().any(|line| line.trim() == "admin:"),
+        "repaired appliance console: {repaired}"
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").unwrap(),
+        "forwarding resumes only after successful recovery"
+    );
+    assert!(
+        lan_peer.ping("198.51.100.2").unwrap(),
+        "A restored after repair"
+    );
+    assert!(
+        !lan_peer.ping("203.0.113.2").unwrap(),
+        "B never became Accepted"
+    );
+    let current = https_login_admin(&guest, "alice", "new-secret12");
+    let routes: serde_json::Value =
+        serde_json::from_str(&current.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(routes["revision"], 2);
+    let old = serde_json::json!({"source":"local", "username":"alice", "password":"secret12"});
+    let (code, _) = guest
+        .https_exchange("POST", "/api/login", Some(&old.to_string()), 15)
+        .unwrap();
+    assert_eq!(code, 401, "network recovery must preserve current Identity");
+    guest
+        .browser_add_static_route(
+            "alice",
+            "new-secret12",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            wan_nic,
+        )
+        .expect("new apply is allowed only after successful recovery");
+    assert!(
+        lan_peer.ping("203.0.113.2").unwrap(),
+        "normal forwarding resumes with newly accepted B"
+    );
+}
+
+#[test]
 fn authenticated_console_restores_previous_network_after_ui_reply_path_is_lost() {
     let _guard = guest_lock();
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
