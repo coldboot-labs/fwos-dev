@@ -23,6 +23,32 @@ try {
   await page.getByRole("heading", { name: "Status", exact: true }).waitFor();
   stage = "edit";
   await page.getByRole("heading", { name: "Static routes", exact: true }).waitFor();
+  if (action === "apply-draft" || action === "apply-stale-draft") {
+    await page.getByRole("button", { name: "Review pending draft", exact: true }).click();
+    stage = "draft-review";
+    await page.getByRole("heading", { name: "Review pending draft", exact: true }).waitFor();
+    const review = await page.locator("#draft-review-summary").textContent();
+    if (!review?.includes("Accepted revision") || !review?.includes(destination)) {
+      throw new Error("draft review omits base revision or proposed route");
+    }
+    stage = "draft-apply";
+    await page.getByRole("button", { name: "Apply reviewed draft", exact: true }).click();
+    await page.locator("#route-result").getByText(action === "apply-stale-draft" ? "Stale draft" : "Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
+    result = { ok: true };
+  } else if (action === "reconcile-draft") {
+    await page.getByRole("button", { name: "Review reconciliation", exact: true }).click();
+    stage = "reconcile-review";
+    await page.getByRole("heading", { name: "Review reconciliation", exact: true }).waitFor();
+    const review = await page.locator("#draft-review-summary").textContent();
+    if (!review?.includes("Accepted revision") ||
+        !review?.includes(existingDestination) || !review?.includes(destination)) {
+      throw new Error("reconciliation omits current or proposed routes or revision");
+    }
+    stage = "reconcile-save";
+    await page.getByRole("button", { name: "Save reconciled draft", exact: true }).click();
+    await page.locator("#route-result").getByText("Reconciled draft saved", { exact: false }).waitFor({ timeout: 60_000 });
+    result = { ok: true };
+  } else {
   if (action === "change" || action === "remove") {
     const row = page.locator("#route-list li").filter({ hasText: existingDestination });
     await row.getByRole("button", { name: action === "remove" ? "Remove" : "Edit", exact: true }).click();
@@ -40,9 +66,15 @@ try {
     throw new Error(`incorrect route review: ${summary}`);
   }
   stage = "apply";
-  await page.getByRole("button", { name: "Apply route change", exact: true }).click();
-  await page.locator("#route-result").getByText(action === "reject" ? "Rejected:" : "Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
+  if (action === "save") {
+    await page.getByRole("button", { name: "Save draft", exact: true }).click();
+    await page.locator("#route-result").getByText("Draft saved", { exact: false }).waitFor({ timeout: 60_000 });
+  } else {
+    await page.getByRole("button", { name: "Apply route change", exact: true }).click();
+    await page.locator("#route-result").getByText(action === "reject" ? "Rejected:" : "Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
+  }
   result = { ok: true };
+  }
 } catch (error) {
   result = {
     ok: false,

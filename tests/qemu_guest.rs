@@ -48,6 +48,289 @@ fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
 }
 
 #[test]
+fn saved_private_draft_does_not_activate_or_change_accepted_desired() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    lan_peer
+        .add_route("198.51.100.0/24", "10.56.0.1")
+        .expect("peer route through appliance");
+    wan_peer.add_address("192.0.2.2/24").expect("WAN next hop");
+    wan_peer
+        .add_address("198.51.100.2/24")
+        .expect("destination behind WAN next hop");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peers.len(), 2);
+    let (lan_nic, wan_nic) = (&peers[0], &peers[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    assert!(!lan_peer
+        .ping("198.51.100.2")
+        .expect("peer probe before draft"));
+    guest
+        .browser_static_route_action(
+            "save",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("rendered administrator saves a draft");
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 1);
+    assert_eq!(accepted["routes"], serde_json::json!([]));
+    assert!(!lan_peer
+        .ping("198.51.100.2")
+        .expect("peer probe after draft"));
+    let draft: serde_json::Value =
+        serde_json::from_str(&session.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(draft["status"], "pending");
+    assert_eq!(draft["base_revision"], 1);
+    assert_eq!(draft["routes"][0]["to"], "198.51.100.0/24");
+    assert!(!session.get("/api/draft").unwrap().contains("private_key"));
+    let (logout_status, _) = session
+        .exchange("POST", "/api/logout", Some("{}"), 15)
+        .expect("explicit logout");
+    assert_eq!(logout_status, 200);
+    let fresh_session = https_login_admin(&guest, "alice", "secret12");
+    let after_logout: serde_json::Value =
+        serde_json::from_str(&fresh_session.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(after_logout["version"], draft["version"]);
+    assert_eq!(after_logout["routes"], draft["routes"]);
+    assert!(!lan_peer
+        .ping("198.51.100.2")
+        .expect("peer probe after logout"));
+}
+
+#[test]
+fn two_administrators_reconcile_private_drafts_after_accepted_revision_changes() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("first administrator creates a second administrator");
+    for (username, password, destination) in [
+        ("alice", "secret12", "198.51.100.0/24"),
+        ("bob", "bob-secret", "203.0.113.0/24"),
+    ] {
+        guest
+            .browser_static_route_action(
+                "save",
+                username,
+                password,
+                "",
+                destination,
+                "192.0.2.2",
+                &wan_nic,
+            )
+            .expect("each administrator saves a private route draft");
+    }
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let alice_draft: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    let bob_draft: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(alice_draft["routes"][0]["to"], "198.51.100.0/24");
+    assert_eq!(bob_draft["routes"][0]["to"], "203.0.113.0/24");
+    assert!(!bob.get("/api/draft").unwrap().contains("198.51.100.0/24"));
+    let owner_hint: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft?owner=alice").unwrap()).unwrap();
+    assert_eq!(owner_hint["routes"][0]["to"], "203.0.113.0/24");
+    let stolen_reference = serde_json::json!({
+        "base_revision": 1, "version": alice_draft["version"]
+    });
+    let (stolen_code, _) = bob
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&stolen_reference.to_string()),
+            15,
+        )
+        .expect("Bob cannot apply Alice's draft using her version");
+    assert_eq!(stolen_code, 409);
+    let refreshed_alice = serde_json::json!({
+        "base_revision": 1,
+        "version": alice_draft["version"],
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
+    let (refresh_code, _) = alice
+        .exchange(
+            "POST",
+            "/api/draft/save",
+            Some(&refreshed_alice.to_string()),
+            15,
+        )
+        .expect("Alice saves a newer version of her own draft");
+    assert_eq!(refresh_code, 200);
+    let old_tab_save = serde_json::json!({
+        "base_revision": 1,
+        "version": alice_draft["version"],
+        "routes": [{"to": "198.51.101.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
+    let (old_tab_save_code, _) = alice
+        .exchange(
+            "POST",
+            "/api/draft/save",
+            Some(&old_tab_save.to_string()),
+            15,
+        )
+        .expect("old tab save response");
+    assert_eq!(
+        old_tab_save_code, 409,
+        "old tab cannot overwrite newer draft"
+    );
+    let (old_tab_code, _) = alice
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&stolen_reference.to_string()),
+            15,
+        )
+        .expect("stale tab apply response");
+    assert_eq!(
+        old_tab_code, 409,
+        "old review cannot apply a newer private draft"
+    );
+    let current_alice: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_ne!(current_alice["version"], alice_draft["version"]);
+    assert_eq!(current_alice["routes"][0]["to"], "198.51.100.0/24");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 1);
+    assert_eq!(accepted["routes"], serde_json::json!([]));
+    let (quick_code, _) = bob
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(r#"{"base_revision":1,"routes":[]}"#),
+            15,
+        )
+        .expect("pending work restricts quick apply");
+    assert_eq!(
+        quick_code, 409,
+        "Bob's quick apply must not bundle his draft"
+    );
+
+    guest
+        .browser_static_route_action(
+            "apply-draft",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Alice reviews and applies only her own draft");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 2);
+    assert_eq!(accepted["routes"][0]["to"], "198.51.100.0/24");
+    guest
+        .browser_static_route_action(
+            "apply-stale-draft",
+            "bob",
+            "bob-secret",
+            "",
+            "203.0.113.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Bob's stale apply is rejected after explicit review");
+    let retained: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(retained["base_revision"], 1);
+    assert_eq!(retained["accepted_revision"], 2);
+    assert_eq!(retained["stale"], true);
+    assert_eq!(retained["routes"][0]["to"], "203.0.113.0/24");
+    assert_eq!(retained["version"], bob_draft["version"]);
+
+    serial_login_admin(&guest, "alice", "secret12");
+    let reboot_from = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("Appliance console reboot");
+    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+        text.contains("FWOS Appliance CLI")
+    });
+    assert!(rebooted.contains("FWOS Appliance CLI"));
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let after_reboot: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(after_reboot["revision"], 2);
+    assert_eq!(after_reboot["routes"][0]["to"], "198.51.100.0/24");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(persisted["base_revision"], 1);
+    assert_eq!(persisted["routes"][0]["to"], "203.0.113.0/24");
+    assert_eq!(persisted["version"], retained["version"]);
+
+    guest
+        .browser_static_route_action(
+            "reconcile-draft",
+            "bob",
+            "bob-secret",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Bob explicitly reviews reconciliation against new Accepted state");
+    let reconciled: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(reconciled["base_revision"], 2);
+    assert_eq!(reconciled["routes"][0]["to"], "203.0.113.0/24");
+    assert_ne!(reconciled["version"], persisted["version"]);
+    let not_yet_applied: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(not_yet_applied["revision"], 2);
+    assert_eq!(not_yet_applied["routes"][0]["to"], "198.51.100.0/24");
+    guest
+        .browser_static_route_action(
+            "apply-draft",
+            "bob",
+            "bob-secret",
+            "",
+            "203.0.113.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Bob reviews the reconciled draft and applies it");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 3);
+    assert_eq!(accepted["routes"][0]["to"], "203.0.113.0/24");
+}
+
+#[test]
 fn published_graphical_static_route_changes_external_peer_forwarding() {
     let _guard = guest_lock();
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");

@@ -46,6 +46,14 @@ rendered controls. The Rust guest test checks each account's HTTPS login and
 session behavior, then verifies removed and changed credentials on serial.
 The driver reports only a fixed stage name and browser version, never form values.
 
+`tests/browser/routes.mjs` also drives private Draft Desired state through the
+rendered route controls. The QEMU guest tests use two separately authenticated
+administrators to verify private draft ownership, stale-base rejection,
+reconciliation, logout/reboot persistence without activation, and fresh review
+before applying. An external LAN/WAN peer checks that saving a draft does not
+change forwarding. The browser receives route/revision projections only; the
+complete Desired state (including network secrets) stays on the appliance.
+
 ## External network acceptance checks
 
 `cargo test --test bootstrap_reachability -- --test-threads=1` drives the same
