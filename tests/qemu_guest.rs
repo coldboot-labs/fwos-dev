@@ -39,6 +39,81 @@ fn offer_octet(address: &str) -> u8 {
 }
 
 #[test]
+fn accepted_removal_of_lan_prefix_and_pool_stops_dhcp_on_external_lan() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    wan_peer
+        .add_address("192.0.2.2/24")
+        .expect("WAN peer address");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peer_nics: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peer_nics.len(), 2);
+    let (lan_nic, wan_nic) = (&peer_nics[0], &peer_nics[1]);
+    let initial = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.56.0.0/24"
+    });
+    https_bootstrap(&guest, &initial.to_string());
+    serial_login_admin(&guest, "alice", "secret12");
+    let enabled = serde_json::json!({
+        "revision": 1, "hostname": "fwos-box",
+        "interfaces": initial["interfaces"],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.170-10.56.0.199"
+    });
+    let enabled_result = serial_cmd(&guest, &format!("apply {enabled}\n"), 90, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        enabled_result.contains("\"outcome\":\"accepted\"")
+            || enabled_result.contains("\"outcome\": \"accepted\""),
+        "valid DHCP enablement must be Accepted after Host activation: {enabled_result}"
+    );
+    let offer = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (170..=199).contains(&offer_octet(&offer)),
+        "initial pool offer: {offer}"
+    );
+
+    let disabled = serde_json::json!({
+        "revision": 2, "hostname": "fwos-box",
+        "interfaces": initial["interfaces"],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": null, "dhcp_pool": null
+    });
+    let result = serial_cmd(&guest, &format!("apply {disabled}\n"), 90, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        result.contains("\"outcome\":\"accepted\"") || result.contains("\"outcome\": \"accepted\""),
+        "valid complete-state DHCP disablement must be accepted: {result}"
+    );
+    let unexpected_offer = lan_peer
+        .dhcp_offer()
+        .expect("DHCP after accepted disablement");
+    assert!(
+        unexpected_offer.is_none(),
+        "accepted removal must stop DHCP; external peer still received {unexpected_offer:?}"
+    );
+}
+
+#[test]
 fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
@@ -356,6 +431,7 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
 
     let mut disable_dhcp = edit_dhcp.clone();
     disable_dhcp["revision"] = serde_json::json!(4);
+    disable_dhcp["lan_prefix"] = serde_json::Value::Null;
     disable_dhcp["dhcp_pool"] = serde_json::Value::Null;
     let disabled = serial_cmd(&guest, &format!("apply {disable_dhcp}\n"), 90, |text| {
         text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
