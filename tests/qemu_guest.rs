@@ -4679,6 +4679,113 @@ fn published_lan_services_move_dhcp_and_dns_with_a_vlan_draft() {
     );
 }
 
+#[test]
+fn published_firewall_policy_blocks_lan_input_and_keeps_forwarding() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.2/32", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [mgmt],
+        "lan_prefix": "10.56.0.0/24",
+        "dhcp_pool": "10.56.0.100-10.56.0.140"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    assert!(
+        lan_peer.ping("10.56.0.1").expect("LAN input probe"),
+        "LAN input starts permitted"
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("forwarded probe"),
+        "LAN-to-WAN forwarding starts permitted"
+    );
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let routes: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    let draft = serde_json::json!({
+        "base_revision": routes["revision"].as_u64().unwrap(),
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan}],
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/draft/save", Some(&draft.to_string()), 20)
+        .unwrap();
+    assert_eq!(code, 200, "route draft failed: {body}");
+    guest
+        .browser_configure_policy(
+            "save-draft",
+            "alice",
+            "secret12",
+            &lan,
+            "10.56.0.2",
+            "icmp",
+            "drop",
+            "",
+        )
+        .expect("firewall rule joins the private route draft");
+    guest
+        .browser_configure_policy(
+            "apply-draft",
+            "alice",
+            "secret12",
+            "",
+            "",
+            "any",
+            "drop",
+            "10.56.0.2",
+        )
+        .expect("reviewed draft applies the route and firewall policy together");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let applied = alice.get("/api/routes").unwrap();
+    assert!(applied.contains("198.51.100.0/24"), "{applied}");
+    assert!(
+        !lan_peer.ping("10.56.0.1").expect("blocked LAN input"),
+        "the firewall rule must drop the LAN peer echo"
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("forwarded probe after policy"),
+        "forwarded LAN-to-WAN traffic stays permitted"
+    );
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+
+    guest
+        .browser_configure_policy(
+            "reject",
+            "alice",
+            "secret12",
+            &wan,
+            "",
+            "any",
+            "accept",
+            "",
+        )
+        .expect("WAN input accept is rejected");
+    assert!(
+        !lan_peer.ping("10.56.0.1").unwrap(),
+        "rejected policy must leave the drop in place"
+    );
+    assert!(lan_peer.ping("192.0.2.2").unwrap(), "forwarding stays in place");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+}
+
 fn https_bootstrap(guest: &Guest, payload: &str) {
     opt_user_net(guest);
     let mut page = String::new();

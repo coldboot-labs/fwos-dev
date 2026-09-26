@@ -714,6 +714,48 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive the published firewall policy editor through rendered HTTPS controls.
+    pub fn browser_configure_policy(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        interface: &str,
+        source: &str,
+        protocol: &str,
+        verdict: &str,
+        expect_in_review: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "actionName": action,
+            "username": username,
+            "password": password,
+            "interface": interface,
+            "source": source,
+            "protocol": protocol,
+            "action": verdict,
+            "expectInReview": expect_in_review,
+        }))
+        .map_err(|_| Error::from_message("encode firewall browser input"))?;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/policy.mjs");
+        let mut command = Command::new("node");
+        command.arg(script);
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run firewall browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("firewall browser driver returned no valid result")
+        })?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered firewall edit failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(())
+    }
+
     /// Drive optional Apply confirmation through the rendered HTTPS UI.
     pub fn browser_apply_confirmation_action(
         &self,
