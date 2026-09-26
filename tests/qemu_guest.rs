@@ -1281,6 +1281,17 @@ fn standalone_route_shortcut_uses_reviewed_apply_lifecycle_without_other_drafts(
     assert!(apply["pending"].is_null());
     guest
         .browser_static_route_action(
+            "quick-switch-dirty-unavailable",
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("a second route cannot replace an unfinished edit until it is canceled");
+    guest
+        .browser_static_route_action(
             "quick-remove-dirty",
             "alice",
             "secret12",
@@ -1417,6 +1428,55 @@ fn standalone_route_shortcut_recovers_failed_apply_and_uses_shared_confirmation(
         .expect("normal reviewed route Apply establishes Accepted forwarding");
     assert!(lan_peer.ping("198.51.100.2").unwrap());
     assert!(!lan_peer.ping("203.0.113.2").unwrap());
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let before_validation: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    let invalid_route = serde_json::json!({
+        "to": "not-a-network", "via": "192.0.2.2", "dev": wan_nic
+    });
+    let normal_invalid = serde_json::json!({
+        "base_revision": 2,
+        "routes": [before_validation["routes"][0], invalid_route]
+    });
+    let (normal_code, normal_body) = alice
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(&normal_invalid.to_string()),
+            15,
+        )
+        .expect("normal Apply validation response");
+    let shortcut_invalid = serde_json::json!({
+        "base_revision": 2, "action": "add", "route": invalid_route
+    });
+    let (shortcut_code, shortcut_body) = alice
+        .exchange(
+            "POST",
+            "/api/routes/save-and-apply",
+            Some(&shortcut_invalid.to_string()),
+            15,
+        )
+        .expect("shortcut Apply validation response");
+    assert_eq!(
+        normal_code, 400,
+        "normal validation response: {normal_body}"
+    );
+    assert_eq!(
+        shortcut_code, normal_code,
+        "shortcut validation response: {shortcut_body}"
+    );
+    let normal_rejected: serde_json::Value = serde_json::from_str(&normal_body).unwrap();
+    let shortcut_rejected: serde_json::Value = serde_json::from_str(&shortcut_body).unwrap();
+    assert_eq!(normal_rejected["outcome"], "rejected");
+    assert_eq!(shortcut_rejected["outcome"], normal_rejected["outcome"]);
+    assert_eq!(shortcut_rejected["error"], normal_rejected["error"]);
+    assert_eq!(shortcut_rejected["revision"], normal_rejected["revision"]);
+    let after_validation: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(after_validation["revision"], 2);
+    assert_eq!(after_validation["routes"], before_validation["routes"]);
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    assert!(!lan_peer.ping("203.0.113.2").unwrap());
     guest
         .browser_static_route_action(
             "quick-failed",
@@ -1428,7 +1488,6 @@ fn standalone_route_shortcut_recovers_failed_apply_and_uses_shared_confirmation(
             &wan_nic,
         )
         .expect("shortcut reports recovery after runtime route failure");
-    let alice = https_login_admin(&guest, "alice", "secret12");
     let restored: serde_json::Value =
         serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
     assert_eq!(restored["revision"], 2);

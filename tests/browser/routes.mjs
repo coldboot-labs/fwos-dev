@@ -51,16 +51,46 @@ try {
     await page.getByRole("button", { name: "Save reconciled draft", exact: true }).click();
     await page.locator("#route-result").getByText("Reconciled draft saved", { exact: false }).waitFor({ timeout: 60_000 });
     result = { ok: true };
-  } else {
-  if (action === "change" || action === "remove" || action === "quick-change" || action === "quick-change-stale" || action === "quick-remove" || action === "quick-remove-dirty") {
-    const row = page.locator("#route-list li").filter({ hasText: existingDestination });
-    if (action === "quick-remove-dirty") {
-      await page.getByLabel("Destination", { exact: true }).fill(destination);
-      await page.getByLabel("Next hop", { exact: true }).fill(gateway);
+  } else if (action === "quick-switch-dirty-unavailable") {
+    stage = "unfinished-route-edit";
+    const first = page.locator("#route-list li").filter({ hasText: existingDestination });
+    const second = page.locator("#route-list li").filter({ hasText: destination });
+    await first.getByRole("button", { name: "Edit", exact: true }).click();
+    await page.getByLabel("Next hop", { exact: true }).fill(gateway);
+    for (const name of ["Edit", "Remove"]) {
+      if (!(await second.getByRole("button", { name, exact: true }).isDisabled())) {
+        throw new Error(`${name} available with another unfinished route edit`);
+      }
     }
-    await row.getByRole("button", { name: action === "remove" || action === "quick-remove" || action === "quick-remove-dirty" ? "Remove" : "Edit", exact: true }).click();
+    if ((await page.getByLabel("Destination", { exact: true }).inputValue()) !== existingDestination) {
+      throw new Error("unfinished route edit was replaced");
+    }
+    await page.getByRole("button", { name: "Cancel route edit", exact: true }).click();
+    for (const name of ["Edit", "Remove"]) {
+      if (await second.getByRole("button", { name, exact: true }).isDisabled()) {
+        throw new Error(`${name} remained unavailable after canceling route edit`);
+      }
+    }
+    result = { ok: true };
+  } else if (action === "quick-remove-dirty") {
+    stage = "unfinished-route-form";
+    await page.getByLabel("Destination", { exact: true }).fill(destination);
+    await page.getByLabel("Next hop", { exact: true }).fill(gateway);
+    const row = page.locator("#route-list li").filter({ hasText: existingDestination });
+    if (!(await row.getByRole("button", { name: "Remove", exact: true }).isDisabled())) {
+      throw new Error("Remove available with an unfinished route form");
+    }
+    await page.getByRole("button", { name: "Cancel route edit", exact: true }).click();
+    if (await row.getByRole("button", { name: "Remove", exact: true }).isDisabled()) {
+      throw new Error("Remove remained unavailable after canceling route edit");
+    }
+    result = { ok: true };
+  } else {
+  if (action === "change" || action === "remove" || action === "quick-change" || action === "quick-change-stale" || action === "quick-remove") {
+    const row = page.locator("#route-list li").filter({ hasText: existingDestination });
+    await row.getByRole("button", { name: action === "remove" || action === "quick-remove" ? "Remove" : "Edit", exact: true }).click();
   }
-  if (action !== "remove" && action !== "quick-remove" && action !== "quick-remove-dirty") {
+  if (action !== "remove" && action !== "quick-remove") {
     await page.getByLabel("Destination", { exact: true }).fill(destination);
     await page.getByLabel("Next hop", { exact: true }).fill(gateway);
     await page.locator("#route-interface").selectOption(device);
@@ -94,12 +124,6 @@ try {
     stage = "shortcut";
     await page.locator("#route-remove-save-and-apply").click();
     await page.locator("#route-result").getByText("Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
-    result = { ok: true };
-  } else if (action === "quick-remove-dirty") {
-    stage = "shortcut-availability";
-    if (!(await page.locator("#route-remove-save-and-apply").isDisabled())) {
-      throw new Error("removal shortcut available with another unfinished route edit");
-    }
     result = { ok: true };
   } else {
   if (action !== "remove") {
