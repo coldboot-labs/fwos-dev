@@ -164,6 +164,18 @@ fn another_administrator_reviews_and_confirms_pending_apply_while_drafts_continu
         setting["last_accepted"]["confirming"]["subject"]
     );
     assert!(lan_peer.ping("198.51.100.2").unwrap());
+    let (setting_shortcut_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/configure",
+            Some(r#"{"base_revision":3,"enabled":false}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(
+        setting_shortcut_status, 409,
+        "Bob's private pending draft excludes the standalone setting Apply shortcut"
+    );
     guest
         .browser_apply_confirmation_action("disable", "alice", "secret12")
         .expect("disabling an enabled safeguard itself waits for confirmation");
@@ -178,11 +190,15 @@ fn another_administrator_reviews_and_confirms_pending_apply_while_drafts_continu
         pending_off["pending"]["proposed_review"]["apply_confirmation"],
         false
     );
+    let wrong_revision = serde_json::json!({
+        "revision": 3,
+        "confirmation_id": pending_off["pending"]["confirmation_id"],
+    });
     let (wrong_status, _) = bob
         .exchange(
             "POST",
             "/api/apply-confirmation/confirm",
-            Some(r#"{"revision":3}"#),
+            Some(&wrong_revision.to_string()),
             15,
         )
         .unwrap();
@@ -298,7 +314,13 @@ fn pending_apply_expires_after_two_minutes_and_restores_accepted_network_without
         .exchange(
             "POST",
             "/api/apply-confirmation/confirm",
-            Some(r#"{"revision":3}"#),
+            Some(
+                &serde_json::json!({
+                    "revision": 3,
+                    "confirmation_id": pending["pending"]["confirmation_id"],
+                })
+                .to_string(),
+            ),
             15,
         )
         .unwrap();
@@ -315,6 +337,100 @@ fn pending_apply_expires_after_two_minutes_and_restores_accepted_network_without
     let setting: serde_json::Value =
         serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
     assert_eq!(setting["last_accepted"]["revision"], 2);
+    let apply_reference = serde_json::json!({
+        "base_revision": draft_after["base_revision"],
+        "version": draft_after["version"],
+    });
+    let (reapply_status, reapply_body) = alice
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&apply_reference.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(reapply_status, 200);
+    let reapplied: serde_json::Value = serde_json::from_str(&reapply_body).unwrap();
+    assert_eq!(reapplied["outcome"], "pending_confirmation");
+    guest
+        .browser_apply_confirmation_action("confirm", "bob", "bob-secret")
+        .expect("Bob confirms Alice's recovered draft after her UI session ends");
+    let accepted_draft: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(
+        accepted_draft["status"], "none",
+        "an unchanged applied draft is no longer pending once Accepted"
+    );
+    guest
+        .browser_static_route_action(
+            "save",
+            "alice",
+            "secret12",
+            "",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice saves another private proposal");
+    let next_draft: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(next_draft["base_revision"], 3);
+    let next_reference = serde_json::json!({
+        "base_revision": 3,
+        "version": next_draft["version"],
+    });
+    let (next_apply_status, next_apply_body) = alice
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&next_reference.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(next_apply_status, 200);
+    let next_apply: serde_json::Value = serde_json::from_str(&next_apply_body).unwrap();
+    assert_eq!(next_apply["outcome"], "pending_confirmation");
+    assert_eq!(next_apply["revision"], 4);
+    let edited_routes = serde_json::json!([
+        next_draft["routes"][0],
+        {"to": "203.0.114.0/24", "via": "192.0.2.2", "dev": wan_nic},
+    ]);
+    let edit = serde_json::json!({
+        "base_revision": 3,
+        "version": next_draft["version"],
+        "routes": edited_routes,
+    });
+    let (edit_status, _) = alice
+        .exchange("POST", "/api/draft/save", Some(&edit.to_string()), 15)
+        .unwrap();
+    assert_eq!(
+        edit_status, 200,
+        "private editing continues while Apply is pending"
+    );
+    let edited: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_ne!(edited["version"], next_draft["version"]);
+    let pending_next: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    let confirmation = serde_json::json!({
+        "revision": 4,
+        "confirmation_id": pending_next["pending"]["confirmation_id"],
+    });
+    let (confirm_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(&confirmation.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(confirm_status, 200);
+    let preserved: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(preserved["status"], "pending");
+    assert_eq!(preserved["version"], edited["version"]);
+    assert_eq!(preserved["routes"], edited_routes);
+    assert_eq!(preserved["stale"], true);
 }
 
 #[test]
@@ -343,6 +459,10 @@ fn external_reset_during_pending_apply_restores_accepted_network_and_current_ide
     let before: serde_json::Value =
         serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
     assert_eq!(before["pending"]["revision"], 3);
+    let old_confirmation_id = before["pending"]["confirmation_id"]
+        .as_str()
+        .expect("pending Apply exposes an operation-specific confirmation ID")
+        .to_owned();
     let from = guest.serial().len();
     guest
         .qemu_system_reset()
@@ -378,6 +498,53 @@ fn external_reset_during_pending_apply_restores_accepted_network_and_current_ide
     assert_eq!(setting["last_accepted"]["applying"]["username"], "alice");
     let status: serde_json::Value = serde_json::from_str(&bob.get("/api/status").unwrap()).unwrap();
     assert_eq!(status["principal"]["username"], "bob");
+    guest
+        .browser_static_route_action(
+            "add-pending",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("a new pending Apply may reuse the rolled-back revision number");
+    let new_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(new_pending["pending"]["revision"], 3);
+    let new_confirmation_id = new_pending["pending"]["confirmation_id"]
+        .as_str()
+        .expect("new pending Apply exposes its own confirmation ID");
+    assert_ne!(new_confirmation_id, old_confirmation_id);
+    let stale = serde_json::json!({
+        "revision": 3,
+        "confirmation_id": old_confirmation_id,
+    });
+    let (stale_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(&stale.to_string()),
+            15,
+        )
+        .unwrap();
+    assert_eq!(
+        stale_status, 409,
+        "old confirmation must not accept new Apply"
+    );
+    let still_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(
+        still_pending["pending"]["confirmation_id"],
+        new_confirmation_id
+    );
+    guest
+        .browser_apply_confirmation_action("confirm", "bob", "bob-secret")
+        .expect("Bob reviews and confirms the new Apply through the rendered UI");
+    let accepted_new: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(accepted_new["accepted_revision"], 3);
+    assert!(accepted_new["pending"].is_null());
 }
 
 #[test]

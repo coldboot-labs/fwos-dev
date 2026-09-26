@@ -40,6 +40,11 @@ try {
     const pendingText = await page.locator("#pending-apply-status").textContent();
     const revision = pendingText?.match(/Pending revision (\d+)/)?.[1];
     if (!revision) throw new Error("pending revision is not visible");
+    const status = await page.evaluate(async () => (await fetch("/api/apply-confirmation")).json());
+    const confirmationId = status.pending?.confirmation_id;
+    if (!confirmationId || String(status.pending.revision) !== revision) {
+      throw new Error("pending review is not bound to a confirmation operation");
+    }
     await page.getByRole("button", { name: "Review pending revision", exact: true }).click();
     const review = page.locator("#pending-apply-review");
     await review.getByRole("heading", { name: `Review applied revision ${revision}`, exact: true }).waitFor();
@@ -48,7 +53,8 @@ try {
       ? "Apply confirmation setting: enabled → disabled"
       : "Apply confirmation setting: enabled → enabled";
     const expectedRoutes = action === "confirm-setting" ? "Routes: [{" : "Routes: [] →";
-    if (!details?.includes(expectedSetting) ||
+    if (!details?.includes(`Confirmation ID: ${confirmationId}`) ||
+        !details?.includes(expectedSetting) ||
         !details?.includes(expectedRoutes) ||
         !details?.includes("198.51.100.0/24") ||
         !details?.includes("Applied by alice")) {
