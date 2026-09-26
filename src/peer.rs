@@ -137,6 +137,20 @@ impl NetworkPeer {
         ])
     }
 
+    /// Add an address on a named interface in this peer.
+    pub fn add_address_on(&self, device: &str, cidr: &str) -> Result<(), Error> {
+        ip(&[
+            "-n",
+            &self.namespace,
+            "address",
+            "add",
+            cidr,
+            "dev",
+            device,
+            "nodad",
+        ])
+    }
+
     /// Add a tagged interface on this peer so it can reach a VLAN on the attached NIC.
     pub fn add_vlan(&self, id: u16, cidr: &str) -> Result<(), Error> {
         let name = format!("eth0.{id}");
@@ -205,13 +219,35 @@ impl NetworkPeer {
         }
     }
 
+    /// Ask the appliance DNS resolver and report whether it sends a DNS answer.
+    pub fn dns_resolves(&self, server: &str, name: &str, source: &str) -> Result<bool, Error> {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/dns-query.py");
+        let output = self
+            .command("python3")
+            .arg(script)
+            .arg(server)
+            .arg(name)
+            .arg(source)
+            .output()
+            .map_err(|error| Error::from_io("external-peer DNS query", error))?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("resolved"))
+    }
+
     /// Request a real DHCPv4 offer from this external LAN segment.
     pub fn dhcp_offer(&self) -> Result<Option<String>, Error> {
+        self.dhcp_offer_on("eth0")
+    }
+
+    /// Request a real DHCPv4 offer on one interface, such as a VLAN subinterface.
+    pub fn dhcp_offer_on(&self, device: &str) -> Result<Option<String>, Error> {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/dhcp-discover.py");
         let output = self
             .command("python3")
             .arg(script)
+            .arg(device)
             .output()
             .map_err(|error| Error::from_io("external-peer DHCP discover", error))?;
         if !output.status.success() {

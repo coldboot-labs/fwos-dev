@@ -46,6 +46,10 @@ rendered controls. The Rust guest test checks each account's HTTPS login and
 session behavior, then verifies removed and changed credentials on serial.
 The driver reports only a fixed stage name and browser version, never form values.
 
+`tests/browser/services.mjs` drives post-bootstrap LAN DHCP and DNS settings
+through the same draft and apply controls, including a VLAN and its services
+in one revision. Peers check address leases and DNS answers before and after.
+
 `tests/browser/interfaces.mjs` drives post-bootstrap interface, VLAN, role, and UI
 exposure edits through the same private draft, review, and apply controls.
 QEMU guests check two-NIC, VLAN-on-one-NIC, and Management NIC topologies with

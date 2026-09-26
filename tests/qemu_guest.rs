@@ -4537,6 +4537,148 @@ fn published_management_nic_exposure_moves_with_peer_traffic() {
     );
 }
 
+fn wait_dns(peer: &NetworkPeer, server: &str, source: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if peer
+            .dns_resolves(server, "localhost", source)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    false
+}
+
+fn wait_vlan_offer(peer: &NetworkPeer, device: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(address)) = peer.dhcp_offer_on(device) {
+            return address;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!("VLAN DHCP did not offer an address on {device}");
+}
+
+#[test]
+fn published_lan_services_move_dhcp_and_dns_with_a_vlan_draft() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [mgmt],
+        "lan_prefix": "10.56.0.0/24",
+        "dhcp_pool": "10.56.0.100-10.56.0.140"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    let initial = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (100..=140).contains(&offer_octet(&initial)),
+        "initial lease: {initial}"
+    );
+    lan_peer
+        .add_address_on("eth0", &format!("{initial}/24"))
+        .expect("use the leased LAN address");
+    assert!(
+        wait_dns(&lan_peer, "10.56.0.1", &initial),
+        "leased client must resolve localhost through the LAN DNS"
+    );
+
+    guest
+        .browser_configure_lan_services(
+            "reject",
+            "alice",
+            "secret12",
+            "10.56.0.0/24",
+            "192.168.9.10-192.168.9.20",
+            "",
+        )
+        .expect("a pool outside the LAN prefix is rejected");
+    let unchanged = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (100..=140).contains(&offer_octet(&unchanged)),
+        "rejected pool must not change leases: {unchanged}"
+    );
+
+    let vlan = format!("{lan}.20");
+    guest
+        .browser_configure_interfaces(
+            "save-draft",
+            "alice",
+            "secret12",
+            &serde_json::json!([
+                {"op": "set", "name": lan, "role": "unused"},
+                {"op": "add-vlan", "name": vlan, "parent": lan, "vlan": 20, "role": "lan", "addresses": "192.168.20.1/24", "expose": false}
+            ]),
+            "",
+        )
+        .expect("VLAN interface joins the private draft");
+    guest
+        .browser_configure_lan_services(
+            "save-draft",
+            "alice",
+            "secret12",
+            "192.168.20.0/24",
+            "192.168.20.50-192.168.20.80",
+            "",
+        )
+        .expect("LAN services join the VLAN draft");
+    guest
+        .browser_configure_lan_services(
+            "apply-draft",
+            "alice",
+            "secret12",
+            "192.168.20.0/24",
+            "192.168.20.50-192.168.20.80",
+            "",
+        )
+        .expect("reviewed draft applies the VLAN and its services together");
+
+    lan_peer.add_vlan(20, "192.168.20.2/24").unwrap();
+    let moved = wait_vlan_offer(&lan_peer, "eth0.20");
+    let last = moved.split('.').next_back().unwrap_or("0").parse::<u8>().unwrap_or(0);
+    assert!(
+        (50..=80).contains(&last),
+        "VLAN lease: {moved}"
+    );
+    lan_peer
+        .add_address_on("eth0.20", &format!("{moved}/24"))
+        .expect("use the leased VLAN address");
+    assert!(
+        wait_dns(&lan_peer, "192.168.20.1", &moved),
+        "leased VLAN client must resolve localhost through the moved DNS"
+    );
+    assert!(
+        !lan_peer
+            .dns_resolves("10.56.0.1", "localhost", "10.56.0.2")
+            .unwrap_or(true),
+        "the previous LAN resolver must stop"
+    );
+    assert!(
+        lan_peer.dhcp_offer().unwrap().is_none(),
+        "the previous LAN must stop leasing"
+    );
+}
+
 fn https_bootstrap(guest: &Guest, payload: &str) {
     opt_user_net(guest);
     let mut page = String::new();
