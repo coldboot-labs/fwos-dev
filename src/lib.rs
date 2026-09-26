@@ -611,6 +611,41 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive optional Apply confirmation through the rendered HTTPS UI.
+    pub fn browser_apply_confirmation_action(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+        }))
+        .map_err(|_| Error::from_message("encode Apply confirmation browser input"))?;
+        let output = output_with_input(
+            Command::new("node").arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/browser/apply-confirmation.mjs"
+            )),
+            &input,
+        )
+        .map_err(|error| Error::from_io("run Apply confirmation browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("Apply confirmation browser driver returned no valid result")
+        })?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered Apply confirmation failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(())
+    }
+
     /// Check the rendered one-NIC warning as the operator changes WAN tagging.
     pub fn browser_one_nic_bootstrap_warning(&self) -> Result<String, Error> {
         let input = serde_json::to_vec(&serde_json::json!({
@@ -1093,7 +1128,8 @@ fn host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
     let src = src_dir()?;
     progress("building host programs");
     let binary = build_host_program(&src)?;
-    let netd = src.join("target/release/netd");
+    let release = source_target_dir(&src).join("release");
+    let netd = release.join("netd");
     if !netd.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
@@ -1101,21 +1137,21 @@ fn host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         )));
     }
     let addons = builtin_addons_dir()?;
-    let cli = src.join("target/release/fwos");
+    let cli = release.join("fwos");
     if !cli.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
             cli.display()
         )));
     }
-    let ui = src.join("target/release/fwos-ui");
+    let ui = release.join("fwos-ui");
     if !ui.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
             ui.display()
         )));
     }
-    let update = src.join("target/release/fwos-update");
+    let update = release.join("fwos-update");
     if !update.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
@@ -1220,7 +1256,7 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let binary = src.join("target/release/fwos-fwd-setup");
+    let binary = source_target_dir(src).join("release/fwos-fwd-setup");
     if !binary.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
@@ -1228,6 +1264,14 @@ fn build_host_program(src: &Path) -> Result<PathBuf, Error> {
         )));
     }
     Ok(binary)
+}
+
+fn source_target_dir(src: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => src.join(path),
+        None => src.join("target"),
+    }
 }
 
 fn build_vendor_image(dir: &Path, tag: &str) -> Result<(), Error> {

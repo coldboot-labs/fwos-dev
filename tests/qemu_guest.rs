@@ -9,6 +9,470 @@ const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn boot_apply_confirmation_route_guest() -> (Guest, NetworkPeer, NetworkPeer, String) {
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("198.51.100.0/24", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("198.51.100.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    let (lan_nic, wan_nic) = (&peers[0], &peers[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic], "lan_prefix": "10.56.0.0/24"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    (guest, lan_peer, wan_peer, wan_nic.clone())
+}
+
+#[test]
+fn apply_confirmation_is_off_by_default_and_route_apply_is_immediately_accepted() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let setting: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(setting["enabled"], false);
+    guest
+        .browser_add_static_route(
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("administrator applies a route through rendered UI");
+    let routes: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(routes["status"], "accepted");
+    assert_eq!(routes["revision"], 2);
+    let setting: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(setting["pending"].is_null());
+}
+
+#[test]
+fn another_administrator_reviews_and_confirms_pending_apply_while_drafts_continue() {
+    let _guard = guest_lock();
+    let (guest, lan_peer, _wan_peer, wan_nic) = boot_apply_confirmation_route_guest();
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Alice creates Bob through the rendered UI");
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Alice enables Apply confirmation through the rendered UI");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let setting: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(setting["enabled"], true);
+    assert_eq!(setting["accepted_revision"], 2);
+    assert!(!lan_peer.ping("198.51.100.2").unwrap());
+    guest
+        .browser_static_route_action(
+            "add-pending",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice applies a route with post-Apply confirmation pending");
+    assert!(
+        lan_peer.ping("198.51.100.2").unwrap(),
+        "pending route is live"
+    );
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 2);
+    assert_eq!(accepted["routes"], serde_json::json!([]));
+    let pending: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(pending["pending"]["revision"], 3);
+    assert_eq!(pending["pending"]["applying"]["username"], "alice");
+    assert_eq!(pending["pending"]["applying"]["source"], "local");
+    assert!(pending["pending"]["applying"]["subject"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    let (overlap_status, _) = alice
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(r#"{"base_revision":2,"routes":[]}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(overlap_status, 409, "another Apply must wait");
+    guest
+        .browser_static_route_action(
+            "save",
+            "bob",
+            "bob-secret",
+            "",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Bob can keep editing his private draft during confirmation");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let draft: serde_json::Value = serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(draft["status"], "pending");
+    assert_eq!(draft["base_revision"], 2);
+    let draft_reference = serde_json::json!({
+        "base_revision": 2, "version": draft["version"]
+    });
+    let (draft_overlap_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&draft_reference.to_string()),
+            15,
+        )
+        .unwrap();
+    assert_eq!(draft_overlap_status, 409, "draft Apply must also wait");
+    guest
+        .browser_apply_confirmation_action("confirm", "bob", "bob-secret")
+        .expect("Bob reviews and confirms the exact pending revision through rendered UI");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 3);
+    assert_eq!(accepted["routes"][0]["to"], "198.51.100.0/24");
+    let setting: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(setting["pending"].is_null());
+    assert_eq!(setting["last_accepted"]["revision"], 3);
+    assert_eq!(setting["last_accepted"]["applying"]["username"], "alice");
+    assert_eq!(setting["last_accepted"]["confirming"]["username"], "bob");
+    assert_ne!(
+        setting["last_accepted"]["applying"]["subject"],
+        setting["last_accepted"]["confirming"]["subject"]
+    );
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    guest
+        .browser_apply_confirmation_action("disable", "alice", "secret12")
+        .expect("disabling an enabled safeguard itself waits for confirmation");
+    let pending_off: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(
+        pending_off["enabled"], true,
+        "Accepted setting stays on until confirmation"
+    );
+    assert_eq!(pending_off["pending"]["revision"], 4);
+    assert_eq!(
+        pending_off["pending"]["proposed_review"]["apply_confirmation"],
+        false
+    );
+    let (wrong_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(r#"{"revision":3}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(
+        wrong_status, 409,
+        "old revision cannot confirm pending revision 4"
+    );
+    let still_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(still_pending["pending"]["revision"], 4);
+    guest
+        .browser_apply_confirmation_action("confirm-setting", "bob", "bob-secret")
+        .expect("Bob reviews and confirms disabling the safeguard");
+    let disabled: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["accepted_revision"], 4);
+    assert!(disabled["pending"].is_null());
+    let next_route = serde_json::json!({
+        "base_revision": 4,
+        "routes": [
+            {"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            {"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}
+        ]
+    });
+    let (next_status, next_body) = alice
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(&next_route.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(next_status, 200);
+    let next: serde_json::Value = serde_json::from_str(&next_body).unwrap();
+    assert_eq!(next["outcome"], "accepted");
+    assert_eq!(next["revision"], 5);
+    let after: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(after["pending"].is_null());
+}
+
+#[test]
+fn pending_apply_expires_after_two_minutes_and_restores_accepted_network_without_losing_identity_or_draft(
+) {
+    let _guard = guest_lock();
+    let (guest, lan_peer, _wan_peer, wan_nic) = boot_apply_confirmation_route_guest();
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Alice enables Apply confirmation");
+    guest
+        .browser_static_route_action(
+            "save",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice saves a private draft");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let draft_before: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    guest
+        .browser_static_route_action(
+            "apply-draft-pending",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Alice reviews and applies her draft, leaving it private until acceptance");
+    assert!(
+        lan_peer.ping("198.51.100.2").unwrap(),
+        "pending route forwards"
+    );
+    let pending: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(pending["pending"]["revision"], 3);
+    let started = std::time::Instant::now();
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Identity changes continue while network confirmation is pending");
+    let deadline = started + std::time::Duration::from_secs(170);
+    loop {
+        let status: serde_json::Value =
+            serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+        if status["pending"].is_null() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending Apply did not expire"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(105),
+        "Apply expired too early"
+    );
+    assert!(
+        !lan_peer.ping("198.51.100.2").unwrap(),
+        "timeout restores previous forwarding"
+    );
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 2);
+    assert_eq!(accepted["routes"], serde_json::json!([]));
+    let (late_status, _) = alice
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(r#"{"revision":3}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(late_status, 409, "expired revision cannot be confirmed");
+    let draft_after: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(draft_after["status"], "pending");
+    assert_eq!(draft_after["version"], draft_before["version"]);
+    assert_eq!(draft_after["routes"], draft_before["routes"]);
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let identity_status: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/status").unwrap()).unwrap();
+    assert_eq!(identity_status["principal"]["username"], "bob");
+    let setting: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(setting["last_accepted"]["revision"], 2);
+}
+
+#[test]
+fn external_reset_during_pending_apply_restores_accepted_network_and_current_identity() {
+    let _guard = guest_lock();
+    let (guest, lan_peer, _wan_peer, wan_nic) = boot_apply_confirmation_route_guest();
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Alice enables Apply confirmation");
+    guest
+        .browser_static_route_action(
+            "add-pending",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice applies the tentative route");
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Bob is created after the network Apply starts");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let before: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(before["pending"]["revision"], 3);
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("external power reset during pending confirmation");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.lines().any(|line| line.trim() == "admin:"),
+        "owned appliance must reach authenticated console: {rebooted}"
+    );
+    let recovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        if !lan_peer.ping("198.51.100.2").unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < recovery_deadline,
+            "tentative forwarding continued after external restart"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 2);
+    assert_eq!(accepted["routes"], serde_json::json!([]));
+    let setting: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(setting["enabled"], true);
+    assert!(setting["pending"].is_null());
+    assert_eq!(setting["last_accepted"]["revision"], 2);
+    assert_eq!(setting["last_accepted"]["applying"]["username"], "alice");
+    let status: serde_json::Value = serde_json::from_str(&bob.get("/api/status").unwrap()).unwrap();
+    assert_eq!(status["principal"]["username"], "bob");
+}
+
+#[test]
+fn authenticated_console_can_restore_previous_network_with_apply_confirmation_enabled() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Apply confirmation is Accepted in revision 2");
+    serial_login_admin(&guest, "alice", "secret12");
+    let restored = serial_cmd(&guest, "restore-previous\n", 120, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        restored.contains("\"outcome\":\"accepted\"")
+            || restored.contains("\"outcome\": \"accepted\""),
+        "authenticated console restoration must be accepted without UI reachability: {restored}"
+    );
+    let status = serial_cmd(&guest, "status\n", 15, |text| {
+        text.contains("Previous accepted network revision:")
+    });
+    assert!(
+        status.contains("Previous accepted network revision: 2"),
+        "restoration retains the displaced Accepted revision: {status}"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let setting: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(setting["accepted_revision"], 3);
+    assert_eq!(setting["enabled"], false, "restored previous Desired state");
+    assert!(setting["pending"].is_null());
+    assert_eq!(setting["last_accepted"]["revision"], 3);
+    assert_eq!(setting["last_accepted"]["applying"]["username"], "alice");
+    assert_eq!(setting["last_accepted"]["applying"]["source"], "local");
+}
+
+#[test]
+fn legacy_full_apply_remains_callable_but_needs_ui_confirmation_when_enabled() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Apply confirmation is Accepted in revision 2");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/status").unwrap()).unwrap();
+    let proposed = serde_json::json!({
+        "revision": 2,
+        "hostname": status["hostname"],
+        "interfaces": status["interfaces"],
+        "ui_exposure": status["ui_exposure"],
+        "lan_prefix": status["lan_prefix"],
+        "dhcp_pool": status["dhcp_pool"],
+        "wan_pd": status["wan_pd"],
+        "apply_confirmation": true,
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
+    serial_login_admin(&guest, "alice", "secret12");
+    let applied = serial_cmd(&guest, &format!("apply {proposed}\n"), 120, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        applied.contains("\"outcome\":\"pending_confirmation\"")
+            || applied.contains("\"outcome\": \"pending_confirmation\""),
+        "legacy Apply remains callable and awaits UI confirmation: {applied}"
+    );
+    let pending: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(pending["pending"]["revision"], 3);
+    assert!(
+        pending["pending"]["applying"].is_null(),
+        "do not invent a legacy actor"
+    );
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(r#"{"revision":3}"#),
+            120,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "authenticated UI acknowledgement: {body}");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(accepted["accepted_revision"], 3);
+    assert!(accepted["last_accepted"]["applying"].is_null());
+    assert_eq!(accepted["last_accepted"]["confirming"]["username"], "alice");
+}
+
 #[test]
 fn interrupted_apply_restores_accepted_route_after_external_reset() {
     let _guard = guest_lock();
