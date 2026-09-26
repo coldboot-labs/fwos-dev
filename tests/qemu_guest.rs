@@ -410,6 +410,19 @@ fn pending_apply_expires_after_two_minutes_and_restores_accepted_network_without
     let edited: serde_json::Value =
         serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
     assert_ne!(edited["version"], next_draft["version"]);
+    let edit_back = serde_json::json!({
+        "base_revision": 3,
+        "version": edited["version"],
+        "routes": next_draft["routes"],
+    });
+    let (edit_back_status, _) = alice
+        .exchange("POST", "/api/draft/save", Some(&edit_back.to_string()), 15)
+        .unwrap();
+    assert_eq!(edit_back_status, 200);
+    let edited_back: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_ne!(edited_back["version"], edited["version"]);
+    assert_eq!(edited_back["routes"], next_draft["routes"]);
     let pending_next: serde_json::Value =
         serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
     let confirmation = serde_json::json!({
@@ -428,9 +441,14 @@ fn pending_apply_expires_after_two_minutes_and_restores_accepted_network_without
     let preserved: serde_json::Value =
         serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
     assert_eq!(preserved["status"], "pending");
-    assert_eq!(preserved["version"], edited["version"]);
-    assert_eq!(preserved["routes"], edited_routes);
+    assert_eq!(preserved["version"], edited_back["version"]);
+    assert_eq!(preserved["routes"], next_draft["routes"]);
     assert_eq!(preserved["stale"], true);
+    let accepted_status: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(accepted_status["last_accepted"]
+        .get("draft_version")
+        .is_none());
 }
 
 #[test]
@@ -1601,6 +1619,54 @@ fn saved_private_draft_does_not_activate_or_change_accepted_desired() {
     assert!(!lan_peer
         .ping("198.51.100.2")
         .expect("peer probe after logout"));
+}
+
+#[test]
+fn identical_network_change_by_another_administrator_does_not_accept_private_draft() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Alice creates Bob through the rendered UI");
+    guest
+        .browser_static_route_action(
+            "save",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice saves a private route draft");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let before: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(before["status"], "pending");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let apply = serde_json::json!({
+        "base_revision": 1,
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}],
+    });
+    let (code, body) = bob
+        .exchange("POST", "/api/routes/apply", Some(&apply.to_string()), 120)
+        .unwrap();
+    assert_eq!(code, 200);
+    let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(result["outcome"], "accepted");
+    assert_eq!(result["revision"], 2);
+    let after: serde_json::Value = serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(
+        after["status"], "pending",
+        "Bob did not apply Alice's draft"
+    );
+    assert_eq!(after["base_revision"], 1);
+    assert_eq!(after["accepted_revision"], 2);
+    assert_eq!(after["stale"], true);
+    assert_eq!(after["version"], before["version"]);
 }
 
 #[test]
