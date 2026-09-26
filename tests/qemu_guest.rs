@@ -47,6 +47,8 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
     serial_login_admin(&guest, "alice", "secret12");
     let replacement = serde_json::json!({
         "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
+        // Preflight accepts this; Kea Host activation rejects it after the
+        // replacement route is live, holding the operation short of Accepted.
         "ui_exposure": [ui_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
         "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
     });
@@ -65,12 +67,6 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
             guest.serial()
         );
     }
-    let before_cut = guest.serial();
-    assert!(
-        !before_cut[from..].contains("\"outcome\""),
-        "apply completed before external cut: {}",
-        &before_cut[from..]
-    );
     guest
         .qemu_system_reset()
         .expect("externally cut power during mutation and Host service reconciliation");
@@ -82,9 +78,18 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
         "owned appliance must reach authenticated console: {rebooted}"
     );
     assert!(
-        lan_peer.ping("198.51.100.2").unwrap(),
-        "previous Accepted route must forward after restart"
+        !rebooted.contains("\"outcome\""),
+        "the interrupted apply returned an outcome before the external cut: {rebooted}"
     );
+    // The serial login prompt can precede netd's recovery and Host ACK.
+    let recovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !lan_peer.ping("198.51.100.2").unwrap() {
+        assert!(
+            std::time::Instant::now() < recovery_deadline,
+            "previous Accepted route did not resume after restart; serial: {}",
+            guest.serial()
+        );
+    }
     assert!(
         !lan_peer.ping("203.0.113.2").unwrap(),
         "tentative route must not forward after restart"
@@ -159,6 +164,8 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
     serial_login_admin(&guest, "alice", "new-secret12");
     let replacement = serde_json::json!({
         "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
+        // The invalid pool delays acceptance until Kea rejects activation;
+        // the B route is externally visible before that Host acknowledgement.
         "ui_exposure": [ui_nic, required_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
         "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
     });
@@ -177,31 +184,22 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
             guest.serial()
         );
     }
-    let before_cut = guest.serial();
-    assert!(
-        !before_cut[from..].contains("\"outcome\""),
-        "apply completed before cut: {}",
-        &before_cut[from..]
-    );
     guest
         .qemu_unplug_extra_nic()
         .expect("externally remove only the required spare NIC before restart");
-    let after_unplug = guest.serial();
-    assert!(
-        !after_unplug[from..].contains("\"outcome\""),
-        "apply completed before power cut: {}",
-        &after_unplug[from..]
-    );
-    let reboot_from = guest.serial().len();
     guest
         .qemu_system_reset()
         .expect("externally cut VM power during replacement");
-    let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
+    let rebooted = serial_wait(&guest, from, 300, |text| {
         text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
         rebooted.lines().any(|line| line.trim() == "admin:"),
         "authenticated console after failed restoration: {rebooted}"
+    );
+    assert!(
+        !rebooted.contains("\"outcome\""),
+        "the interrupted apply returned an outcome before the external cut: {rebooted}"
     );
     let lan_local = lan_peer.ping("10.56.0.1").unwrap();
     let wan_local = wan_peer.resolve_neighbor("192.0.2.1").unwrap();
