@@ -137,6 +137,36 @@ impl NetworkPeer {
         ])
     }
 
+    /// Add a tagged interface on this peer so it can reach a VLAN on the attached NIC.
+    pub fn add_vlan(&self, id: u16, cidr: &str) -> Result<(), Error> {
+        let name = format!("eth0.{id}");
+        ip(&[
+            "-n",
+            &self.namespace,
+            "link",
+            "add",
+            "link",
+            "eth0",
+            "name",
+            &name,
+            "type",
+            "vlan",
+            "id",
+            &id.to_string(),
+        ])?;
+        ip(&["-n", &self.namespace, "link", "set", &name, "up"])?;
+        ip(&[
+            "-n",
+            &self.namespace,
+            "address",
+            "add",
+            cidr,
+            "dev",
+            &name,
+            "nodad",
+        ])
+    }
+
     /// Route test traffic through the appliance using only peer-owned routes.
     pub fn add_route(&self, destination: &str, gateway: &str) -> Result<(), Error> {
         let family = if destination.contains(':') {
@@ -263,6 +293,96 @@ impl NetworkPeer {
             "external-peer HTTPS probe failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )))
+    }
+
+    /// Drive the rendered interface editor from inside this peer's namespace.
+    pub fn browser_configure_interfaces(
+        &self,
+        url: &str,
+        action: &str,
+        username: &str,
+        password: &str,
+        edits: &serde_json::Value,
+        expect_in_review: &str,
+    ) -> Result<(), Error> {
+        super::run_interface_browser(
+            Some(&self.namespace),
+            url,
+            action,
+            username,
+            password,
+            edits,
+            expect_in_review,
+        )
+    }
+
+    /// HTTPS request from this peer, including a non-2xx response body.
+    pub fn https_exchange(
+        &self,
+        method: &str,
+        address: &str,
+        path: &str,
+        body: Option<&str>,
+        cookie: Option<&str>,
+        max_time_secs: u64,
+    ) -> Result<(u16, String), Error> {
+        let max_time = max_time_secs.to_string();
+        let mut command = self.https_command(address, path);
+        command.args([
+            "--http1.1",
+            "-H",
+            "Connection: close",
+            "-H",
+            "Expect:",
+            "-X",
+            method,
+            "--output",
+            "-",
+            "--write-out",
+            "\nhttp_code=%{http_code}",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            &max_time,
+        ]);
+        if let Some(cookie) = cookie {
+            command.args(["--cookie", cookie]);
+        }
+        let body_file = body.map(|body| {
+            let path = std::env::temp_dir().join(format!(
+                "fwos-peer-body-{}-{}",
+                std::process::id(),
+                self.namespace
+            ));
+            (path, body)
+        });
+        if let Some((path, body)) = &body_file {
+            std::fs::write(path, body)
+                .map_err(|error| Error::from_io("writing peer HTTPS body", error))?;
+            command.args(["-H", "Content-Type: application/json", "--data-binary"]);
+            command.arg(format!("@{}", path.display()));
+        }
+        let output = command
+            .output()
+            .map_err(|error| Error::from_io("external-peer HTTPS exchange", error))?;
+        if let Some((path, _)) = &body_file {
+            let _ = std::fs::remove_file(path);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let Some((payload, code)) = text.rsplit_once("http_code=") else {
+            return Err(Error::from_message(format!(
+                "external-peer HTTPS exchange failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        };
+        let code = code.trim().parse::<u16>().unwrap_or(0);
+        if code == 0 {
+            return Err(Error::from_message(format!(
+                "external-peer HTTPS exchange failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok((code, payload.to_string()))
     }
 
     fn https_command(&self, address: &str, path: &str) -> Command {

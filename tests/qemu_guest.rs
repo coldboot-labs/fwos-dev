@@ -4158,6 +4158,385 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
     assert_no_ssh(&guest, "after automatic rollback");
 }
 
+fn peer_https_stays_down(peer: &NetworkPeer, address: &str) {
+    for _ in 0..5 {
+        match peer.https_response(address) {
+            Ok(None) => {}
+            Ok(Some(code)) => panic!("HTTPS answered {code} at {address}"),
+            Err(error) => panic!("peer HTTPS probe failed: {error}"),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn wait_peer_https(peer: &NetworkPeer, address: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut last = String::from("no response");
+    while std::time::Instant::now() < deadline {
+        match peer.https_response(address) {
+            Ok(Some(code)) if (200..500).contains(&code) => return,
+            Ok(Some(code)) => last = format!("http {code}"),
+            Ok(None) => last = "unreachable".into(),
+            Err(error) => last = error.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!("peer HTTPS to {address} did not come up: {last}");
+}
+
+#[test]
+fn published_two_nic_interface_editor_accepts_global_wan_and_rejects_topology() {
+    let _guard = guest_lock();
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("203.0.113.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&wan_peer])
+        .expect("published two-NIC Disk image");
+    let lan = opt_user_net(&guest);
+    let wan = other_console_nic(&guest, &lan);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan, &wan));
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+
+    guest
+        .browser_configure_interfaces(
+            "apply",
+            "alice",
+            "secret12",
+            &serde_json::json!([{
+                "op": "set", "name": wan, "addresses": "203.0.113.1/24"
+            }]),
+            "",
+        )
+        .expect("administrator applies a global WAN address through the rendered editor");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let interfaces = alice.get("/api/interfaces").expect("accepted interfaces");
+    assert!(
+        interfaces.contains("203.0.113.1/24"),
+        "steady-state WAN addressing is not limited to Bootstrap's RFC1918 policy: {interfaces}"
+    );
+    assert!(
+        interfaces.contains(&format!("\"{lan}\"")),
+        "LAN remains in UI exposure: {interfaces}"
+    );
+    peer_https_stays_down(&wan_peer, "203.0.113.1");
+    assert!(
+        alice.get("/api/status").unwrap().contains("bootstrapped"),
+        "LAN UI exposure remains reachable from the workstation"
+    );
+
+    let routes: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    let revision = routes["revision"].as_u64().unwrap();
+    let draft = serde_json::json!({
+        "base_revision": revision,
+        "routes": [{"to": "198.51.100.0/24", "via": "203.0.113.2", "dev": wan}],
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/draft/save", Some(&draft.to_string()), 20)
+        .unwrap();
+    assert_eq!(code, 200, "route draft failed: {body}");
+    guest
+        .browser_configure_interfaces(
+            "save-draft",
+            "alice",
+            "secret12",
+            &serde_json::json!([{
+                "op": "set", "name": lan, "appendAddress": "192.168.1.2/24", "expose": true
+            }]),
+            "",
+        )
+        .expect("interface edit joins the private route draft");
+    guest
+        .browser_configure_interfaces(
+            "apply-draft",
+            "alice",
+            "secret12",
+            &serde_json::json!([]),
+            "198.51.100.0/24",
+        )
+        .expect("reviewed draft applies routes and interfaces together");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let routes = alice.get("/api/routes").unwrap();
+    let interfaces = alice.get("/api/interfaces").unwrap();
+    assert!(routes.contains("198.51.100.0/24"), "{routes}");
+    assert!(interfaces.contains("192.168.1.2/24"), "{interfaces}");
+    assert!(interfaces.contains("203.0.113.1/24"), "{interfaces}");
+    let revision = serde_json::from_str::<serde_json::Value>(&alice.get("/api/interfaces").unwrap())
+        .unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+
+    guest
+        .browser_configure_interfaces(
+            "reject",
+            "alice",
+            "secret12",
+            &serde_json::json!([{"op": "set", "name": lan, "expose": false}]),
+            "",
+        )
+        .expect("empty UI exposure is rejected in the editor");
+    guest
+        .browser_configure_interfaces(
+            "reject",
+            "alice",
+            "secret12",
+            &serde_json::json!([{"op": "set", "name": wan, "role": "unused"}]),
+            "",
+        )
+        .expect("a missing WAN role is rejected before mutation");
+    guest
+        .browser_configure_interfaces(
+            "reject",
+            "alice",
+            "secret12",
+            &serde_json::json!([
+                {"op": "add-vlan", "name": format!("{lan}.10"), "parent": lan, "vlan": 10, "role": "wan", "addresses": "192.0.2.10/24", "expose": false},
+                {"op": "add-vlan", "name": format!("{lan}.10b"), "parent": lan, "vlan": 10, "role": "lan", "addresses": "192.168.10.1/24", "expose": true}
+            ]),
+            "",
+        )
+        .expect("shared parent and tag is rejected before apply");
+    let after = alice.get("/api/interfaces").unwrap();
+    let after_revision = serde_json::from_str::<serde_json::Value>(&after).unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(after_revision, revision, "rejected topology must not change Accepted state: {after}");
+    assert!(after.contains("192.168.1.2/24"), "{after}");
+    peer_https_stays_down(&wan_peer, "203.0.113.1");
+}
+
+#[test]
+fn published_vlan_on_one_nic_exposure_is_reachable_from_peer() {
+    let _guard = guest_lock();
+    let peer = NetworkPeer::new().expect("isolated one-NIC peer");
+    peer.add_address("10.70.0.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_peers(&[&peer])
+        .expect("published one-NIC Disk image");
+    let nics = wait_console_nics(&guest);
+    assert_eq!(nics.len(), 1, "VLAN-on-one-NIC guest has one Traffic NIC: {nics:?}");
+    let nic = nics[0].0.clone();
+    let before = guest.serial().len();
+    guest
+        .serial_write(&format!("static {nic} 10.70.0.1/24\n"))
+        .expect("opt the only Traffic NIC");
+    let opt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let tail = guest.serial().get(before..).unwrap_or("").to_string();
+        if tail.contains("Reach the UI:") && tail.contains("10.70.0.1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < opt_deadline,
+            "console static selection did not finish: {tail}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let https_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if peer.https_response("10.70.0.1").ok().flatten().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < https_deadline,
+            "peer cannot reach Bootstrap HTTPS at 10.70.0.1; serial:\n{}",
+            guest.serial()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let lan = format!("{nic}.20");
+    let payload = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": nic, "role": "wan", "addresses": ["192.0.2.1/24"]},
+            {"name": lan, "role": "lan", "parent": nic, "vlan": 20, "addresses": ["192.168.20.1/24"]}
+        ],
+        "ui_exposure": [lan],
+        "lan_prefix": "192.168.20.0/24",
+        "dhcp_pool": "192.168.20.100-192.168.20.200"
+    });
+    let _ = peer.https_exchange(
+        "POST",
+        "10.70.0.1",
+        "/api/bootstrap",
+        Some(&payload.to_string()),
+        None,
+        20,
+    );
+    let ready = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if guest.serial().contains("Bootstrap complete") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < ready,
+            "one-NIC Bootstrap did not finish; serial:\n{}",
+            guest.serial()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    peer.add_address("192.0.2.2/24").unwrap();
+    peer.add_vlan(20, "192.168.20.2/24").unwrap();
+    wait_peer_https(&peer, "192.168.20.1");
+    peer_https_stays_down(&peer, "192.0.2.1");
+
+    let extra = format!("{nic}.30");
+    peer.browser_configure_interfaces(
+        "https://192.168.20.1/",
+        "apply",
+        "alice",
+        "secret12",
+        &serde_json::json!([{
+            "op": "add-vlan", "name": extra, "parent": nic, "vlan": 30, "role": "lan",
+            "addresses": "192.168.30.1/24", "expose": true
+        }]),
+        "",
+    )
+    .expect("rendered editor adds a LAN VLAN and exposes it");
+    peer.add_vlan(30, "192.168.30.2/24").unwrap();
+    wait_peer_https(&peer, "192.168.30.1");
+    peer_https_stays_down(&peer, "192.0.2.1");
+
+    peer.browser_configure_interfaces(
+        "https://192.168.30.1/",
+        "reject",
+        "alice",
+        "secret12",
+        &serde_json::json!([{
+            "op": "set", "name": nic, "role": "wan", "parent": nic, "vlan": 20, "expose": false
+        }]),
+        "",
+    )
+    .expect("WAN and LAN cannot share one parent and tag");
+    wait_peer_https(&peer, "192.168.30.1");
+    peer_https_stays_down(&peer, "192.0.2.1");
+}
+
+#[test]
+fn published_management_nic_exposure_moves_with_peer_traffic() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.2/32", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Management NIC Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    assert_eq!(peers.len(), 2, "management topology needs LAN and WAN peers");
+    let (lan, wan) = (&peers[0], &peers[1]);
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [mgmt],
+        "lan_prefix": "10.56.0.0/24",
+        "dhcp_pool": "10.56.0.100-10.56.0.200"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    peer_https_stays_down(&lan_peer, "10.56.0.1");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+    assert!(
+        https_login_admin(&guest, "alice", "secret12")
+            .get("/api/status")
+            .unwrap()
+            .contains(&mgmt),
+        "Management NIC stays reachable"
+    );
+
+    guest
+        .browser_configure_interfaces(
+            "apply",
+            "alice",
+            "secret12",
+            &serde_json::json!([{"op": "set", "name": lan, "expose": true}]),
+            "",
+        )
+        .expect("administrator exposes the LAN");
+    wait_peer_https(&lan_peer, "10.56.0.1");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("LAN peer ICMP"),
+        "LAN traffic still forwards to WAN"
+    );
+    let offer = wait_dhcp_offer(&lan_peer);
+    assert!(
+        offer.starts_with("10.56.0."),
+        "LAN services stay on the LAN, not the Management NIC: {offer}"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let revision = serde_json::from_str::<serde_json::Value>(&alice.get("/api/routes").unwrap())
+        .unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+    let gateway = serde_json::json!({
+        "base_revision": revision,
+        "routes": [{"to": "198.51.100.0/24", "via": "10.0.2.2", "dev": mgmt}],
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/routes/apply", Some(&gateway.to_string()), 30)
+        .unwrap();
+    assert_eq!(code, 400, "Management NIC gateway must be rejected: {body}");
+    assert!(body.contains("no gateway"), "{body}");
+
+    guest
+        .browser_configure_interfaces(
+            "apply",
+            "alice",
+            "secret12",
+            &serde_json::json!([{"op": "set", "name": lan, "expose": false}]),
+            "",
+        )
+        .expect("administrator removes LAN UI exposure");
+    peer_https_stays_down(&lan_peer, "10.56.0.1");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+    assert!(
+        https_login_admin(&guest, "alice", "secret12")
+            .get("/api/interfaces")
+            .unwrap()
+            .contains(&format!("\"{mgmt}\"")),
+        "Management NIC remains in UI exposure"
+    );
+
+    let before = https_login_admin(&guest, "alice", "secret12")
+        .get("/api/interfaces")
+        .unwrap();
+    let revision = serde_json::from_str::<serde_json::Value>(&before).unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+    guest
+        .browser_configure_interfaces(
+            "reject",
+            "alice",
+            "secret12",
+            &serde_json::json!([{
+                "op": "add-vlan", "name": format!("{mgmt}.20"), "parent": mgmt, "vlan": 20,
+                "role": "lan", "addresses": "192.168.9.1/24", "expose": false
+            }]),
+            "",
+        )
+        .expect("a Management NIC owns its whole parent");
+    let after = https_login_admin(&guest, "alice", "secret12")
+        .get("/api/interfaces")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).unwrap()["revision"].as_u64(),
+        Some(revision),
+        "rejected Management NIC topology must not apply: {after}"
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("LAN peer ICMP after rejection"),
+        "rejected topology leaves LAN-to-WAN forwarding in place"
+    );
+}
+
 fn https_bootstrap(guest: &Guest, payload: &str) {
     opt_user_net(guest);
     let mut page = String::new();

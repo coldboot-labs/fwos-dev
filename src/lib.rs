@@ -155,6 +155,51 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+fn run_interface_browser(
+    namespace: Option<&str>,
+    url: &str,
+    action: &str,
+    username: &str,
+    password: &str,
+    edits: &serde_json::Value,
+    expect_in_review: &str,
+) -> Result<(), Error> {
+    let input = serde_json::to_vec(&serde_json::json!({
+        "url": url,
+        "action": action,
+        "username": username,
+        "password": password,
+        "edits": edits,
+        "expectInReview": expect_in_review,
+    }))
+    .map_err(|_| Error::from_message("encode interface browser input"))?;
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/interfaces.mjs");
+    let node = std::env::var("FWOS_NODE").unwrap_or_else(|_| "/usr/bin/node".into());
+    let mut command = if let Some(namespace) = namespace {
+        let mut command = Command::new("sudo");
+        command.args(["-n", "ip", "netns", "exec", namespace, "env", "HOME=/tmp"]);
+        command.arg(&node);
+        command.arg(script);
+        command
+    } else {
+        let mut command = Command::new("node");
+        command.arg(script);
+        command
+    };
+    let output = output_with_input(&mut command, &input)
+        .map_err(|error| Error::from_io("run interface browser driver", error))?;
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| Error::from_message("interface browser driver returned no valid result"))?;
+    if !output.status.success() || result["ok"] != true {
+        return Err(Error::from_message(format!(
+            "rendered interface edit failed at {}: {}",
+            result["stage"].as_str().unwrap_or("driver"),
+            result["error"].as_str().unwrap_or("no browser detail")
+        )));
+    }
+    Ok(())
+}
+
 fn output_with_input(command: &mut Command, input: &[u8]) -> io::Result<std::process::Output> {
     let mut child = command
         .stdin(Stdio::piped())
@@ -609,6 +654,26 @@ impl Guest {
             )));
         }
         Ok(())
+    }
+
+    /// Drive the published interface editor through rendered HTTPS controls.
+    pub fn browser_configure_interfaces(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        edits: &serde_json::Value,
+        expect_in_review: &str,
+    ) -> Result<(), Error> {
+        run_interface_browser(
+            None,
+            &format!("https://127.0.0.1:{}", self.https_port),
+            action,
+            username,
+            password,
+            edits,
+            expect_in_review,
+        )
     }
 
     /// Drive optional Apply confirmation through the rendered HTTPS UI.
