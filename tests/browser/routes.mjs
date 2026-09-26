@@ -52,14 +52,57 @@ try {
     await page.locator("#route-result").getByText("Reconciled draft saved", { exact: false }).waitFor({ timeout: 60_000 });
     result = { ok: true };
   } else {
-  if (action === "change" || action === "remove") {
+  if (action === "change" || action === "remove" || action === "quick-change" || action === "quick-change-stale" || action === "quick-remove" || action === "quick-remove-dirty") {
     const row = page.locator("#route-list li").filter({ hasText: existingDestination });
-    await row.getByRole("button", { name: action === "remove" ? "Remove" : "Edit", exact: true }).click();
+    if (action === "quick-remove-dirty") {
+      await page.getByLabel("Destination", { exact: true }).fill(destination);
+      await page.getByLabel("Next hop", { exact: true }).fill(gateway);
+    }
+    await row.getByRole("button", { name: action === "remove" || action === "quick-remove" || action === "quick-remove-dirty" ? "Remove" : "Edit", exact: true }).click();
   }
-  if (action !== "remove") {
+  if (action !== "remove" && action !== "quick-remove" && action !== "quick-remove-dirty") {
     await page.getByLabel("Destination", { exact: true }).fill(destination);
     await page.getByLabel("Next hop", { exact: true }).fill(gateway);
     await page.locator("#route-interface").selectOption(device);
+  }
+  if (action === "quick-add" || action === "quick-change" || action === "quick-unavailable" ||
+      action === "quick-failed" || action === "quick-add-pending") {
+    stage = "shortcut";
+    const shortcut = page.getByRole("button", { name: "Save and apply", exact: true });
+    if (action === "quick-unavailable") {
+      if (!(await shortcut.isDisabled())) throw new Error("shortcut available with a private pending draft");
+    } else {
+      await shortcut.click();
+      const outcome = action === "quick-failed" ? "Previous Accepted network restored"
+        : action === "quick-add-pending" ? "pending confirmation" : "Accepted revision";
+      await page.locator("#route-result").getByText(outcome, { exact: false }).waitFor({ timeout: 60_000 });
+    }
+    result = { ok: true };
+  } else if (action === "quick-change-stale") {
+    stage = "stale-selection";
+    const before = await page.locator("#accepted-route-status").textContent();
+    const revision = Number(before?.match(/Accepted revision (\d+)/)?.[1]);
+    if (!revision) throw new Error("Accepted revision unavailable before edit");
+    await page.getByLabel("Require confirmation after Apply").check();
+    await page.getByRole("button", { name: "Apply setting", exact: true }).click();
+    await page.locator("#apply-confirmation-result").getByText("Setting accepted", { exact: false }).waitFor({ timeout: 60_000 });
+    await page.locator("#accepted-route-status").getByText(`Accepted revision ${revision + 1}`, { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Save and apply", exact: true }).click();
+    await page.locator("#route-result").getByText("Rejected: Accepted Desired state changed", { exact: false }).waitFor({ timeout: 60_000 });
+    result = { ok: true };
+  } else if (action === "quick-remove") {
+    stage = "shortcut";
+    await page.locator("#route-remove-save-and-apply").click();
+    await page.locator("#route-result").getByText("Accepted revision", { exact: false }).waitFor({ timeout: 60_000 });
+    result = { ok: true };
+  } else if (action === "quick-remove-dirty") {
+    stage = "shortcut-availability";
+    if (!(await page.locator("#route-remove-save-and-apply").isDisabled())) {
+      throw new Error("removal shortcut available with another unfinished route edit");
+    }
+    result = { ok: true };
+  } else {
+  if (action !== "remove") {
     await page.getByRole("button", { name: "Review route", exact: true }).click();
   }
   stage = "review";
@@ -79,6 +122,7 @@ try {
     await page.locator("#route-result").getByText(outcome, { exact: false }).waitFor({ timeout: 60_000 });
   }
   result = { ok: true };
+  }
   }
 } catch (error) {
   result = {

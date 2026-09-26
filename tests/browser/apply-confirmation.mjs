@@ -35,7 +35,7 @@ try {
     await page.getByRole("button", { name: "Apply setting", exact: true }).click();
     await page.locator("#apply-confirmation-result").getByText("pending confirmation", { exact: false }).waitFor({ timeout: 60_000 });
     await page.locator("#pending-apply-status").getByText("Pending revision", { exact: false }).waitFor();
-  } else if (action === "confirm" || action === "confirm-setting") {
+  } else if (action === "confirm" || action === "confirm-setting" || action === "confirm-route-change") {
     await page.locator("#pending-apply-status").getByText("Pending revision", { exact: false }).waitFor();
     const pendingText = await page.locator("#pending-apply-status").textContent();
     const revision = pendingText?.match(/Pending revision (\d+)/)?.[1];
@@ -52,11 +52,20 @@ try {
     const expectedSetting = action === "confirm-setting"
       ? "Apply confirmation setting: enabled → disabled"
       : "Apply confirmation setting: enabled → enabled";
-    const expectedRoutes = action === "confirm-setting" ? "Routes: [{" : "Routes: [] →";
+    const routeLine = details?.split("\n").find((line) => line.startsWith("Routes: "));
+    const [acceptedRoutes, proposedRoutes] = routeLine?.slice("Routes: ".length).split(" → ") || [];
+    const routesMatch = action === "confirm"
+      ? acceptedRoutes === "[]" && proposedRoutes?.includes("198.51.100.0/24")
+      : action === "confirm-route-change"
+        ? acceptedRoutes?.includes("198.51.100.0/24") &&
+          !acceptedRoutes?.includes("203.0.113.0/24") &&
+          proposedRoutes?.includes("198.51.100.0/24") &&
+          proposedRoutes?.includes("203.0.113.0/24")
+        : acceptedRoutes?.includes("198.51.100.0/24");
     if (!details?.includes(`Confirmation ID: ${confirmationId}`) ||
+        !details?.includes(`Previous Accepted revision ${status.pending.base_revision}`) ||
         !details?.includes(expectedSetting) ||
-        !details?.includes(expectedRoutes) ||
-        !details?.includes("198.51.100.0/24") ||
+        !routesMatch ||
         !details?.includes("Applied by alice")) {
       throw new Error("pending review omitted revision changes or applying administrator");
     }

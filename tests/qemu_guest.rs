@@ -1239,6 +1239,263 @@ fn published_administrator_reviews_and_applies_static_route_in_rendered_ui() {
 }
 
 #[test]
+fn standalone_route_shortcut_uses_reviewed_apply_lifecycle_without_other_drafts() {
+    let _guard = guest_lock();
+    let guest = Guest::boot_published_host_image_two_nics()
+        .expect("published Disk image boots without injected credentials");
+    let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Alice creates Bob in rendered UI");
+    guest
+        .browser_add_static_route(
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("normal reviewed route Apply");
+    guest
+        .browser_static_route_action(
+            "quick-add",
+            "alice",
+            "secret12",
+            "",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("one-action route Apply");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 3);
+    assert_eq!(accepted["routes"].as_array().unwrap().len(), 2);
+    assert_eq!(accepted["routes"][0]["to"], "198.51.100.0/24");
+    assert_eq!(accepted["routes"][1]["to"], "203.0.113.0/24");
+    let apply: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(apply["accepted_revision"], 3);
+    assert!(apply["pending"].is_null());
+    guest
+        .browser_static_route_action(
+            "quick-remove-dirty",
+            "alice",
+            "secret12",
+            "203.0.113.0/24",
+            "192.0.2.128/25",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("removal shortcut is unavailable with another unfinished route edit");
+
+    guest
+        .browser_static_route_action(
+            "save",
+            "bob",
+            "bob-secret",
+            "",
+            "192.0.2.0/25",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Bob saves private draft");
+    guest
+        .browser_static_route_action(
+            "quick-unavailable",
+            "bob",
+            "bob-secret",
+            "",
+            "192.0.2.128/25",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("shortcut is unavailable to Bob while his draft is pending");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let shortcut = serde_json::json!({
+        "base_revision": 3, "action": "add",
+        "route": {"to": "192.0.2.128/25", "via": "192.0.2.2", "dev": wan_nic}
+    });
+    let (blocked, _) = bob
+        .exchange(
+            "POST",
+            "/api/routes/save-and-apply",
+            Some(&shortcut.to_string()),
+            15,
+        )
+        .unwrap();
+    assert_eq!(
+        blocked, 409,
+        "another client cannot bypass Bob's pending draft"
+    );
+    let (smuggled, _) = alice.exchange(
+        "POST", "/api/routes/save-and-apply",
+        Some(&serde_json::json!({"base_revision": 3, "action": "add", "route": shortcut["route"],
+            "routes": [{"to": "0.0.0.0/0", "via": "192.0.2.2", "dev": wan_nic}]}).to_string()), 15,
+    ).unwrap();
+    assert_eq!(smuggled, 400, "shortcut accepts only one route change");
+    let (stale, _) = alice.exchange(
+        "POST", "/api/routes/save-and-apply",
+        Some(&serde_json::json!({"base_revision": 1, "action": "add", "route": shortcut["route"]}).to_string()), 15,
+    ).unwrap();
+    assert_eq!(stale, 409);
+    let draft: serde_json::Value = serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(draft["status"], "pending");
+    assert_eq!(draft["routes"].as_array().unwrap().len(), 3);
+    guest
+        .browser_static_route_action(
+            "quick-change",
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "198.51.101.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice changes only her selected Accepted route while Bob has a private draft");
+    let changed: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(changed["revision"], 4);
+    assert_eq!(changed["routes"].as_array().unwrap().len(), 2);
+    assert_eq!(changed["routes"][0]["to"], "198.51.101.0/24");
+    assert_eq!(changed["routes"][1]["to"], "203.0.113.0/24");
+    let bob_after: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(bob_after["version"], draft["version"]);
+    assert_eq!(bob_after["routes"], draft["routes"]);
+    assert_eq!(bob_after["stale"], true);
+    guest
+        .browser_static_route_action(
+            "quick-remove",
+            "alice",
+            "secret12",
+            "203.0.113.0/24",
+            "",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice removes one Accepted route through the shortcut");
+    let after: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(after["revision"], 5);
+    assert_eq!(after["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(after["routes"][0]["to"], "198.51.101.0/24");
+    guest
+        .browser_static_route_action(
+            "quick-change-stale",
+            "alice",
+            "secret12",
+            "198.51.101.0/24",
+            "198.51.102.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("shortcut rejects a route edit prepared before a newer Accepted revision");
+    let after_stale: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(after_stale["revision"], 6);
+    assert_eq!(after_stale["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(after_stale["routes"][0]["to"], "198.51.101.0/24");
+}
+
+#[test]
+fn standalone_route_shortcut_recovers_failed_apply_and_uses_shared_confirmation() {
+    let _guard = guest_lock();
+    let (guest, lan_peer, wan_peer, wan_nic) = boot_apply_confirmation_route_guest();
+    lan_peer.add_route("203.0.113.0/24", "10.56.0.1").unwrap();
+    wan_peer.add_address("203.0.113.2/24").unwrap();
+    guest
+        .browser_add_static_route(
+            "alice",
+            "secret12",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("normal reviewed route Apply establishes Accepted forwarding");
+    assert!(lan_peer.ping("198.51.100.2").unwrap());
+    assert!(!lan_peer.ping("203.0.113.2").unwrap());
+    guest
+        .browser_static_route_action(
+            "quick-failed",
+            "alice",
+            "secret12",
+            "",
+            "203.0.113.0/24",
+            "192.0.2.255",
+            &wan_nic,
+        )
+        .expect("shortcut reports recovery after runtime route failure");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let restored: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(restored["revision"], 2);
+    assert_eq!(restored["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(restored["routes"][0]["to"], "198.51.100.0/24");
+    assert!(
+        lan_peer.ping("198.51.100.2").unwrap(),
+        "Accepted forwarding survived shortcut rollback"
+    );
+    assert!(
+        !lan_peer.ping("203.0.113.2").unwrap(),
+        "failed shortcut did not leave route live"
+    );
+
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("enable optional Apply confirmation");
+    guest
+        .browser_static_route_action(
+            "quick-add-pending",
+            "alice",
+            "secret12",
+            "",
+            "203.0.113.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("shortcut returns shared pending confirmation status");
+    assert!(
+        lan_peer.ping("203.0.113.2").unwrap(),
+        "pending shortcut route is live"
+    );
+    let before: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(before["revision"], 3);
+    assert_eq!(before["routes"].as_array().unwrap().len(), 1);
+    let status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(status["pending"]["revision"], 4);
+    assert_eq!(status["pending"]["applying"]["username"], "alice");
+    let overlap = serde_json::json!({
+        "base_revision": 3, "action": "add",
+        "route": {"to": "192.0.2.0/25", "via": "192.0.2.2", "dev": wan_nic}
+    });
+    let (busy, _) = alice
+        .exchange(
+            "POST",
+            "/api/routes/save-and-apply",
+            Some(&overlap.to_string()),
+            15,
+        )
+        .unwrap();
+    assert_eq!(busy, 409, "shortcut waits for the in-flight Apply");
+    guest
+        .browser_apply_confirmation_action("confirm-route-change", "alice", "secret12")
+        .expect("review and confirm shortcut revision in the common UI");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 4);
+    assert_eq!(accepted["routes"].as_array().unwrap().len(), 2);
+    let after: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(after["pending"].is_null());
+    assert_eq!(after["last_accepted"]["revision"], 4);
+}
+
+#[test]
 fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery() {
     let _guard = guest_lock();
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
