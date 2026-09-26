@@ -1670,6 +1670,161 @@ fn identical_network_change_by_another_administrator_does_not_accept_private_dra
 }
 
 #[test]
+fn confirmed_private_draft_cleans_up_after_another_unrelated_accepted_apply() {
+    let _guard = guest_lock();
+    let (guest, _lan_peer, _wan_peer, wan_nic) = boot_apply_confirmation_route_guest();
+    guest
+        .browser_create_administrator("alice", "secret12", "bob", "bob-secret")
+        .expect("Alice creates Bob through the rendered UI");
+    guest
+        .browser_apply_confirmation_action("enable", "alice", "secret12")
+        .expect("Apply confirmation is enabled in Accepted revision 2");
+    guest
+        .browser_static_route_action(
+            "save",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "192.0.2.2",
+            &wan_nic,
+        )
+        .expect("Alice saves a private route draft");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let saved: serde_json::Value = serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(saved["status"], "pending");
+    guest
+        .browser_static_route_action(
+            "apply-draft-pending",
+            "alice",
+            "secret12",
+            "",
+            "198.51.100.0/24",
+            "",
+            &wan_nic,
+        )
+        .expect("Alice reviews and applies the private draft");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let first_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(first_pending["pending"]["revision"], 3);
+    let first_confirmation = serde_json::json!({
+        "revision": 3,
+        "confirmation_id": first_pending["pending"]["confirmation_id"],
+    });
+    let (first_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(&first_confirmation.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(first_status, 200);
+    let later = serde_json::json!({
+        "base_revision": 3,
+        "routes": [
+            {"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            {"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic},
+        ],
+    });
+    let (later_status, later_body) = bob
+        .exchange("POST", "/api/routes/apply", Some(&later.to_string()), 120)
+        .unwrap();
+    assert_eq!(later_status, 200);
+    let later_reply: serde_json::Value = serde_json::from_str(&later_body).unwrap();
+    assert_eq!(later_reply["outcome"], "pending_confirmation");
+    assert_eq!(later_reply["revision"], 4);
+    let later_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    let later_confirmation = serde_json::json!({
+        "revision": 4,
+        "confirmation_id": later_pending["pending"]["confirmation_id"],
+    });
+    let (confirm_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(&later_confirmation.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(confirm_status, 200);
+    let accepted: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(accepted["revision"], 4);
+    assert_eq!(accepted["routes"][1]["to"], "203.0.113.0/24");
+    let (disable_status, disable_body) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/configure",
+            Some(r#"{"base_revision":4,"enabled":false}"#),
+            120,
+        )
+        .unwrap();
+    assert_eq!(disable_status, 200);
+    let disabling: serde_json::Value = serde_json::from_str(&disable_body).unwrap();
+    assert_eq!(disabling["outcome"], "pending_confirmation");
+    let setting_pending: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    let setting_confirmation = serde_json::json!({
+        "revision": 5,
+        "confirmation_id": setting_pending["pending"]["confirmation_id"],
+    });
+    let (setting_status, _) = bob
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/confirm",
+            Some(&setting_confirmation.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(setting_status, 200);
+    let immediate = serde_json::json!({
+        "base_revision": 5,
+        "routes": [
+            {"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            {"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic},
+            {"to": "203.0.114.0/24", "via": "192.0.2.2", "dev": wan_nic},
+        ],
+    });
+    let (immediate_status, immediate_body) = bob
+        .exchange(
+            "POST",
+            "/api/routes/apply",
+            Some(&immediate.to_string()),
+            120,
+        )
+        .unwrap();
+    assert_eq!(immediate_status, 200);
+    let immediate_reply: serde_json::Value = serde_json::from_str(&immediate_body).unwrap();
+    assert_eq!(immediate_reply["outcome"], "accepted");
+    assert_eq!(immediate_reply["revision"], 6);
+    let from = guest.serial().len();
+    guest
+        .qemu_system_reset()
+        .expect("external restart before the draft owner checks her accepted proposal");
+    let rebooted = serial_wait(&guest, from, 300, |text| {
+        text.lines().any(|line| line.trim() == "admin:")
+    });
+    assert!(
+        rebooted.lines().any(|line| line.trim() == "admin:"),
+        "owned appliance must return to the authenticated console: {rebooted}"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let after: serde_json::Value = serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(
+        after["status"], "none",
+        "Alice's accepted draft must not reappear after Bob's later Apply"
+    );
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let status: serde_json::Value =
+        serde_json::from_str(&bob.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert!(status["last_accepted"].get("draft_receipts").is_none());
+    assert!(status["last_accepted"].get("draft_version").is_none());
+}
+
+#[test]
 fn two_administrators_reconcile_private_drafts_after_accepted_revision_changes() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
