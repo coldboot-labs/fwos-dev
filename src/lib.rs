@@ -800,6 +800,41 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive the published traffic-shaping controls through rendered HTTPS.
+    pub fn browser_configure_qdisc(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        dev: &str,
+        kind: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "dev": dev,
+            "kind": kind,
+        }))
+        .map_err(|_| Error::from_message("encode qdisc browser input"))?;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/qdiscs.mjs");
+        let mut command = Command::new("node");
+        command.arg(script);
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run qdisc browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| Error::from_message("qdisc browser driver returned no valid result"))?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered qdisc edit failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(())
+    }
+
     /// Drive optional Apply confirmation through the rendered HTTPS UI.
     pub fn browser_apply_confirmation_action(
         &self,

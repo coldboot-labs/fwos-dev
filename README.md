@@ -46,6 +46,10 @@ rendered controls. The Rust guest test checks each account's HTTPS login and
 session behavior, then verifies removed and changed credentials on serial.
 The driver reports only a fixed stage name and browser version, never form values.
 
+`tests/browser/qdiscs.mjs` drives the existing qdisc controls. A peer still
+forwards through the shaped interface, and an unsupported kind is rejected
+before the live queue changes.
+
 `tests/browser/wireguard.mjs` drives the supported WireGuard settings and a
 route through that tunnel. Ordinary status and review text omit the private
 key, and a peer checks that the accepted listen port is bound.

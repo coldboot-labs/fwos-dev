@@ -4951,6 +4951,100 @@ fn published_wireguard_ui_listens_and_hides_the_private_key() {
     assert!(tunnels.contains("51821"), "{tunnels}");
 }
 
+#[test]
+fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.2/32", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    https_bootstrap(
+        &guest,
+        &serde_json::json!({
+            "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+            "interfaces": [
+                {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+                {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+                {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+            ],
+            "ui_exposure": [mgmt],
+            "lan_prefix": "10.56.0.0/24",
+            "dhcp_pool": "10.56.0.100-10.56.0.140"
+        })
+        .to_string(),
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("forwarded probe"),
+        "LAN-to-WAN forwarding starts permitted"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let routes: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    let draft = serde_json::json!({
+        "base_revision": routes["revision"].as_u64().unwrap(),
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan}],
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/draft/save", Some(&draft.to_string()), 20)
+        .unwrap();
+    assert_eq!(code, 200, "route draft failed: {body}");
+    guest
+        .browser_configure_qdisc("save-draft", "alice", "secret12", &wan, "fq_codel")
+        .expect("qdisc joins the private route draft");
+    guest
+        .browser_configure_qdisc("apply-draft", "alice", "secret12", &wan, "fq_codel")
+        .expect("reviewed draft applies the route and qdisc together");
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("forwarded probe after fq_codel"),
+        "traffic still forwards across the shaped WAN"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let applied = alice.get("/api/qdiscs").unwrap();
+    let routes = alice.get("/api/routes").unwrap();
+    assert!(applied.contains("fq_codel") && applied.contains(&wan), "{applied}");
+    assert!(
+        applied.contains(&format!("qdisc fq_codel")) && applied.contains(&wan),
+        "live qdisc show must report fq_codel on the WAN: {applied}"
+    );
+    assert!(routes.contains("198.51.100.0/24"), "{routes}");
+    let revision = serde_json::from_str::<serde_json::Value>(&applied).unwrap()["revision"]
+        .as_u64()
+        .unwrap();
+    let rejected = serde_json::json!({
+        "base_revision": revision,
+        "qdiscs": [{"dev": wan, "kind": "tbf"}],
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/qdiscs/apply", Some(&rejected.to_string()), 20)
+        .unwrap();
+    assert_eq!(code, 400, "unsupported qdisc must be rejected: {body}");
+    assert!(body.contains("unsupported qdisc"), "{body}");
+    let after = alice.get("/api/qdiscs").unwrap();
+    assert!(after.contains("fq_codel"), "{after}");
+    assert!(
+        after.contains("qdisc fq_codel") && !after.contains("qdisc tbf"),
+        "rejected kind must leave the live fq_codel queue: {after}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).unwrap()["revision"].as_u64(),
+        Some(revision)
+    );
+    assert!(
+        lan_peer.ping("192.0.2.2").expect("forwarded probe after rejection"),
+        "rejected qdisc must leave forwarding in place"
+    );
+}
+
 fn https_bootstrap(guest: &Guest, payload: &str) {
     opt_user_net(guest);
     let mut page = String::new();
