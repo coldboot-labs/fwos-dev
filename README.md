@@ -46,6 +46,10 @@ rendered controls. The Rust guest test checks each account's HTTPS login and
 session behavior, then verifies removed and changed credentials on serial.
 The driver reports only a fixed stage name and browser version, never form values.
 
+`tests/browser/wireguard.mjs` drives the supported WireGuard settings and a
+route through that tunnel. Ordinary status and review text omit the private
+key, and a peer checks that the accepted listen port is bound.
+
 `tests/browser/policy.mjs` drives firewall policy through the same private draft
 and apply controls. Peers prove which packets the appliance forwards and which
 it drops, while the UI stays off the WAN.

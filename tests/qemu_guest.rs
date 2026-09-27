@@ -4786,6 +4786,171 @@ fn published_firewall_policy_blocks_lan_input_and_keeps_forwarding() {
     peer_https_stays_down(&wan_peer, "192.0.2.1");
 }
 
+fn wait_udp(peer: &NetworkPeer, address: &str, port: u16) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if peer.udp_port_listening(address, port).unwrap_or(false) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    false
+}
+
+fn assert_wireguard_key_hidden(body: &str) {
+    assert!(
+        !body.contains(WG_PRIVATE),
+        "ordinary status must omit the WireGuard private key: {body}"
+    );
+}
+
+#[test]
+fn published_wireguard_ui_listens_and_hides_the_private_key() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    https_bootstrap(
+        &guest,
+        &serde_json::json!({
+            "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+            "interfaces": [
+                {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+                {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+                {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+            ],
+            "ui_exposure": [mgmt],
+            "lan_prefix": "10.56.0.0/24",
+            "dhcp_pool": "10.56.0.100-10.56.0.140"
+        })
+        .to_string(),
+    );
+    guest
+        .browser_configure_wireguard(
+            "save-draft",
+            "alice",
+            "secret12",
+            "wg0",
+            WG_PRIVATE,
+            "51820",
+            "10.13.13.1/24",
+            "198.51.100.0/24",
+            "10.13.13.2",
+        )
+        .expect("WireGuard draft is saved from the rendered editor");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let draft = alice.get("/api/draft").unwrap();
+    let status = alice.get("/api/status").unwrap();
+    let tunnels = alice.get("/api/wireguard").unwrap();
+    assert_wireguard_key_hidden(&draft);
+    assert_wireguard_key_hidden(&status);
+    assert_wireguard_key_hidden(&tunnels);
+    assert!(
+        draft.contains("\"private_key_set\":true") && draft.contains("wg0"),
+        "private draft keeps the key without revealing it: {draft}"
+    );
+    guest
+        .browser_configure_wireguard(
+            "apply-draft",
+            "alice",
+            "secret12",
+            "wg0",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+        .expect("reviewed WireGuard draft applies");
+    assert!(
+        wait_udp(&lan_peer, "10.56.0.1", 51820),
+        "accepted WireGuard listen port must take effect"
+    );
+    let routes = https_login_admin(&guest, "alice", "secret12")
+        .get("/api/routes")
+        .unwrap();
+    assert!(routes.contains("198.51.100.0/24"), "{routes}");
+    assert!(routes.contains("wg0"), "{routes}");
+    lan_peer
+        .add_route("10.13.13.1/32", "10.56.0.1")
+        .expect("route toward the tunnel address");
+    assert!(
+        lan_peer.ping("10.13.13.1").expect("tunnel address probe"),
+        "the accepted WireGuard address must answer"
+    );
+    guest
+        .browser_configure_wireguard(
+            "apply",
+            "alice",
+            "secret12",
+            "wg0",
+            "",
+            "51821",
+            "10.13.13.1/24",
+            "",
+            "",
+        )
+        .expect("listen port changes without retyping the private key");
+    assert!(
+        wait_udp(&lan_peer, "10.56.0.1", 51821),
+        "new listen port must take effect"
+    );
+    assert!(
+        !lan_peer.udp_port_listening("10.56.0.1", 51820).unwrap_or(true),
+        "old listen port must close"
+    );
+    let tunnels = https_login_admin(&guest, "alice", "secret12")
+        .get("/api/wireguard")
+        .unwrap();
+    assert_wireguard_key_hidden(&tunnels);
+    assert!(tunnels.contains("\"private_key_set\":true"), "{tunnels}");
+    guest
+        .browser_configure_wireguard(
+            "reject",
+            "alice",
+            "secret12",
+            "wg0",
+            "not-a-key",
+            "51821",
+            "10.13.13.1/24",
+            "",
+            "",
+        )
+        .expect("invalid private key is rejected");
+    guest
+        .browser_configure_wireguard(
+            "failed",
+            "alice",
+            "secret12",
+            &lan,
+            WG_PRIVATE,
+            "51822",
+            "10.13.14.1/24",
+            "",
+            "",
+        )
+        .expect("a tunnel that cannot be created restores the previous network");
+    assert!(
+        wait_udp(&lan_peer, "10.56.0.1", 51821),
+        "restoration must keep the accepted tunnel"
+    );
+    let tunnels = https_login_admin(&guest, "alice", "secret12")
+        .get("/api/wireguard")
+        .unwrap();
+    assert_wireguard_key_hidden(&tunnels);
+    assert!(tunnels.contains("51821"), "{tunnels}");
+}
+
 fn https_bootstrap(guest: &Guest, payload: &str) {
     opt_user_net(guest);
     let mut page = String::new();

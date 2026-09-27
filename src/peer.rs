@@ -219,6 +219,37 @@ impl NetworkPeer {
         }
     }
 
+    /// Report whether a UDP port is bound rather than refusing the packet.
+    pub fn udp_port_listening(&self, address: &str, port: u16) -> Result<bool, Error> {
+        let script = format!(
+            r#"import socket,sys
+server,port=sys.argv[1],int(sys.argv[2])
+udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+udp.sendto(b"fwos",(server,port))
+icmp=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_ICMP)
+icmp.settimeout(2)
+try:
+    while True:
+        packet,_=icmp.recvfrom(1500)
+        ihl=(packet[0]&0x0F)*4
+        if len(packet)>=ihl+2 and packet[ihl]==3 and packet[ihl+1]==3:
+            print("closed"); raise SystemExit(1)
+except socket.timeout:
+    print("listening"); raise SystemExit(0)
+"#
+        );
+        let output = self
+            .command("python3")
+            .arg("-c")
+            .arg(&script)
+            .arg(address)
+            .arg(port.to_string())
+            .output()
+            .map_err(|error| Error::from_io("external-peer UDP probe", error))?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("listening"))
+    }
+
     /// Ask the appliance DNS resolver and report whether it sends a DNS answer.
     pub fn dns_resolves(&self, server: &str, name: &str, source: &str) -> Result<bool, Error> {
         let script =

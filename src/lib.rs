@@ -756,6 +756,50 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive the published WireGuard editor through rendered HTTPS controls.
+    pub fn browser_configure_wireguard(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        name: &str,
+        private_key: &str,
+        listen_port: &str,
+        addresses: &str,
+        route_to: &str,
+        route_via: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "name": name,
+            "privateKey": private_key,
+            "listenPort": listen_port,
+            "addresses": addresses,
+            "routeTo": route_to,
+            "routeVia": route_via,
+        }))
+        .map_err(|_| Error::from_message("encode WireGuard browser input"))?;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/wireguard.mjs");
+        let mut command = Command::new("node");
+        command.arg(script);
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run WireGuard browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("WireGuard browser driver returned no valid result")
+        })?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered WireGuard edit failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(())
+    }
+
     /// Drive optional Apply confirmation through the rendered HTTPS UI.
     pub fn browser_apply_confirmation_action(
         &self,
