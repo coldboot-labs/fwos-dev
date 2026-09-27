@@ -38,14 +38,23 @@ try {
       throw new Error("export is available before the sensitive-file acknowledgement");
     }
     stage = "export";
+    if (input.passphrase) {
+      await transfer.getByLabel("Export passphrase (optional)", { exact: true }).fill(input.passphrase);
+      await transfer.getByLabel("Confirm export passphrase", { exact: true }).fill(input.passphrase);
+    }
     await transfer.getByLabel("I understand this file contains network secrets", { exact: true }).check();
     const download = page.waitForEvent("download");
     await exportButton.click();
     await (await download).saveAs(input.file);
-    await outcome.getByText("contains network secrets", { exact: false }).waitFor();
+    await outcome.getByText(input.passphrase ? "encrypted with your passphrase" : "plaintext file contains network secrets", {
+      exact: false,
+    }).waitFor({ timeout: 60_000 });
   } else if (action === "import" || action === "reject") {
     stage = "import";
     await transfer.getByLabel("Network export file", { exact: true }).setInputFiles(input.file);
+    if (input.passphrase) {
+      await transfer.getByLabel("Import passphrase (encrypted files only)", { exact: true }).fill(input.passphrase);
+    }
     await transfer.getByRole("button", { name: "Import into private draft", exact: true }).click();
     stage = "import-result";
     await outcome.getByText(action === "reject" ? "Import rejected:" : "networking unchanged", {
@@ -75,6 +84,12 @@ try {
   const body = await page.locator("body").innerText();
   if (input.secret && body.includes(input.secret)) {
     throw new Error("rendered page shows a network secret");
+  }
+  if (input.passphrase && body.includes(input.passphrase)) {
+    throw new Error("rendered page shows the export passphrase");
+  }
+  for (const id of ["#export-passphrase", "#export-passphrase-confirm", "#import-passphrase"]) {
+    if (await page.locator(id).inputValue()) throw new Error("page keeps an export passphrase");
   }
   result = { ok: true };
 } catch (error) {

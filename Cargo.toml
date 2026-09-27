@@ -16,3 +16,10 @@ path = "src/main.rs"
 [lib]
 name = "fwos_dev"
 path = "src/lib.rs"
+
+[dev-dependencies]
+age = { version = "0.12", features = ["armor"] }
+
+# The encrypted export test runs scrypt; unoptimized it takes minutes.
+[profile.dev.package."*"]
+opt-level = 3

@@ -5044,7 +5044,7 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
     let _cleanup = RemoveOnDrop(dir.clone());
     let exported_path = dir.join("exported.toml");
     guest
-        .browser_transfer_desired_state("export", "alice", "secret12", &exported_path, WG_PRIVATE)
+        .browser_transfer_desired_state("export", "alice", "secret12", &exported_path, WG_PRIVATE, "")
         .expect("rendered export downloads the network file");
     let exported = std::fs::read_to_string(&exported_path).unwrap();
     assert!(exported.starts_with("# SENSITIVE"), "{exported}");
@@ -5065,11 +5065,11 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
     };
     let malformed = write("malformed.toml", "this is not a network export [");
     guest
-        .browser_transfer_desired_state("reject", "alice", "secret12", &malformed, WG_PRIVATE)
+        .browser_transfer_desired_state("reject", "alice", "secret12", &malformed, WG_PRIVATE, "")
         .expect("malformed file is rejected in the page");
     let invalid = write("invalid.toml", &exported.replace(WG_PRIVATE, "not-a-key"));
     guest
-        .browser_transfer_desired_state("reject", "alice", "secret12", &invalid, WG_PRIVATE)
+        .browser_transfer_desired_state("reject", "alice", "secret12", &invalid, WG_PRIVATE, "")
         .expect("invalid network is rejected in the page");
     let identity = serde_json::json!({
         "base_revision": revision,
@@ -5092,7 +5092,7 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
         .replace("listen_port = 51820", "listen_port = 51821");
     let edited_path = write("edited.toml", &edited);
     guest
-        .browser_transfer_desired_state("import", "alice", "secret12", &edited_path, WG_PRIVATE)
+        .browser_transfer_desired_state("import", "alice", "secret12", &edited_path, WG_PRIVATE, "")
         .expect("valid file becomes the private draft");
     assert_eq!(accepted_revision(&alice), revision, "import does not apply");
     assert!(!lan_peer.ping("198.51.100.2").unwrap(), "import does not change forwarding");
@@ -5115,7 +5115,7 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
     assert_eq!(code, 409, "quick apply still refuses while the imported draft is pending");
 
     guest
-        .browser_transfer_desired_state("apply-draft", "alice", "secret12", &edited_path, WG_PRIVATE)
+        .browser_transfer_desired_state("apply-draft", "alice", "secret12", &edited_path, WG_PRIVATE, "")
         .expect("reviewed imported draft applies through the shared engine");
     let alice = https_login_admin(&guest, "alice", "secret12");
     assert_eq!(accepted_revision(&alice), revision + 1);
@@ -5132,6 +5132,193 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
         .unwrap();
     assert_eq!(code, 200);
     assert!(reexport.contains(WG_PRIVATE) && reexport.contains("listen_port = 51821"));
+}
+
+const EXPORT_PASSPHRASE: &str = "correct horse battery staple";
+
+fn age_decrypt(armored: &str, passphrase: &str) -> String {
+    let identity = age::scrypt::Identity::new(passphrase.to_owned().into());
+    String::from_utf8(age::decrypt(&identity, armored.as_bytes()).expect("decrypt export")).unwrap()
+}
+
+fn age_encrypt(plaintext: &str, passphrase: &str) -> String {
+    let mut recipient = age::scrypt::Recipient::new(passphrase.to_owned().into());
+    recipient.set_work_factor(18);
+    age::encrypt_and_armor(&recipient, plaintext.as_bytes()).expect("encrypt export")
+}
+
+#[test]
+fn published_encrypted_network_export_round_trips_and_rejects_bad_passphrases_through_the_ui() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.57.0.2/24").unwrap();
+    lan_peer.add_route("198.51.100.0/24", "10.57.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("198.51.100.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    https_bootstrap(
+        &guest,
+        &serde_json::json!({
+            "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+            "interfaces": [
+                {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+                {"name": lan, "role": "lan", "addresses": ["10.57.0.1/24"]},
+                {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+            ],
+            "ui_exposure": [mgmt],
+            "lan_prefix": "10.57.0.0/24",
+            "dhcp_pool": "10.57.0.100-10.57.0.140"
+        })
+        .to_string(),
+    );
+    guest
+        .browser_configure_wireguard(
+            "apply", "alice", "secret12", "wg0", WG_PRIVATE, "51820", "10.13.13.1/24", "", "",
+        )
+        .expect("secret-bearing WireGuard configuration is accepted");
+    assert!(wait_udp(&lan_peer, "10.57.0.1", 51820));
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let revision = accepted_revision(&alice);
+
+    // Exported files hold network secrets; remove them even if the test fails.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("fwos-encrypted-transfer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let transfer = |action: &str, file: &std::path::Path, passphrase: &str| {
+        guest.browser_transfer_desired_state(action, "alice", "secret12", file, WG_PRIVATE, passphrase)
+    };
+
+    // Encrypted export is an established age file that only the passphrase opens.
+    let encrypted_path = dir.join("exported.toml.age");
+    transfer("export", &encrypted_path, EXPORT_PASSPHRASE).expect("rendered encrypted export downloads");
+    let encrypted = std::fs::read_to_string(&encrypted_path).unwrap();
+    assert!(encrypted.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"), "{encrypted}");
+    assert!(!encrypted.contains(WG_PRIVATE) && !encrypted.contains("fwos-network-desired-state"));
+    let decrypted = age_decrypt(&encrypted, EXPORT_PASSPHRASE);
+    assert!(decrypted.starts_with("# SENSITIVE") && decrypted.contains(WG_PRIVATE));
+    assert!(!decrypted.contains("secret12") && !decrypted.contains("alice"), "no Identity configuration");
+
+    // The explicitly sensitive plaintext export stays available.
+    let plaintext_path = dir.join("exported.toml");
+    transfer("export", &plaintext_path, "").expect("rendered plaintext export downloads");
+    let plaintext = std::fs::read_to_string(&plaintext_path).unwrap();
+    assert!(plaintext.starts_with("# SENSITIVE") && plaintext.contains(WG_PRIVATE));
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/desired-state/export",
+            Some(r#"{"acknowledge_sensitive":true,"passphrase":""}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 400, "an empty passphrase is not encryption: {body}");
+    assert_wireguard_key_hidden(&body);
+
+    // FWOS keeps no passphrase: ordinary views never show it.
+    for path in ["/api/status", "/api/wireguard", "/api/draft", "/api/apply-confirmation", "/api/routes"] {
+        let body = alice.get(path).unwrap();
+        assert!(!body.contains(EXPORT_PASSPHRASE), "{path} exposes the passphrase");
+        assert_wireguard_key_hidden(&body);
+    }
+
+    // Identity configuration changed after the export must survive every import.
+    let (code, body) = alice
+        .exchange("POST", "/api/administrators", Some(r#"{"username":"bob","password":"secret34"}"#), 15)
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+
+    let write = |name: &str, content: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    assert!(decrypted.contains("routes = []") && decrypted.contains("listen_port = 51820"));
+    let edited = decrypted
+        .replace("routes = []", "routes = [{ to = \"198.51.100.0/24\", via = \"192.0.2.2\" }]")
+        .replace("listen_port = 51820", "listen_port = 51821");
+    let edited_path = write("edited.toml.age", &age_encrypt(&edited, EXPORT_PASSPHRASE));
+    let mut damaged = encrypted.lines().map(str::to_owned).collect::<Vec<_>>();
+    let middle = damaged.len() / 2;
+    let replacement = if damaged[middle].starts_with('A') { "B" } else { "A" };
+    damaged[middle].replace_range(..1, replacement);
+    let damaged_path = write("damaged.toml.age", &(damaged.join("\n") + "\n"));
+    let invalid_path = write(
+        "invalid.toml.age",
+        &age_encrypt(&decrypted.replace(WG_PRIVATE, "not-a-key"), EXPORT_PASSPHRASE),
+    );
+    let identity_path = write(
+        "identity.toml.age",
+        &age_encrypt(&format!("administrators = [\"mallory\"]\n{decrypted}"), EXPORT_PASSPHRASE),
+    );
+    for (file, passphrase, case) in [
+        (&edited_path, "wrong horse battery staple", "wrong passphrase"),
+        (&edited_path, "", "missing passphrase"),
+        (&damaged_path, EXPORT_PASSPHRASE, "damaged file"),
+        (&invalid_path, EXPORT_PASSPHRASE, "invalid decrypted network"),
+        (&identity_path, EXPORT_PASSPHRASE, "decrypted Identity configuration"),
+    ] {
+        transfer("reject", file, passphrase).unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(accepted_revision(&alice), revision, "{case} leaves Accepted state");
+        assert!(alice.get("/api/draft").unwrap().contains("\"status\":\"none\""), "{case} makes no draft");
+    }
+    assert!(!lan_peer.ping("198.51.100.2").unwrap(), "rejections do not change forwarding");
+    assert!(wait_udp(&lan_peer, "10.57.0.1", 51820), "rejections keep the live tunnel");
+    https_login_admin(&guest, "bob", "secret34");
+
+    // The UI's own encrypted file restores with its passphrase into the same
+    // reviewed private draft as the plaintext export of that revision.
+    let proposed = |alice: &fwos_dev::HttpsSession<'_>| {
+        let mut draft: serde_json::Value = serde_json::from_str(&alice.get("/api/draft").unwrap()).unwrap();
+        assert_eq!(draft["status"], "pending");
+        assert_eq!(draft["sections"], serde_json::json!(["import"]));
+        for revisioned in ["base_revision", "accepted_revision", "version", "stale"] {
+            draft.as_object_mut().unwrap().remove(revisioned);
+        }
+        draft
+    };
+    transfer("import", &encrypted_path, EXPORT_PASSPHRASE).expect("UI-encrypted export imports unchanged");
+    assert_eq!(accepted_revision(&alice), revision, "import does not apply");
+    let draft = alice.get("/api/draft").unwrap();
+    assert_wireguard_key_hidden(&draft);
+    assert!(!draft.contains(EXPORT_PASSPHRASE), "the draft exposes the passphrase");
+    let from_encrypted = proposed(&alice);
+    transfer("apply-draft", &encrypted_path, "").expect("reviewed encrypted import applies");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    transfer("import", &plaintext_path, "").expect("plaintext export imports unchanged");
+    assert_eq!(proposed(&alice), from_encrypted, "encrypted and plaintext imports propose the same draft");
+    transfer("apply-draft", &plaintext_path, "").expect("reviewed plaintext import applies");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision + 2);
+    assert!(wait_udp(&lan_peer, "10.57.0.1", 51820), "restoring the export keeps the tunnel");
+
+    // An operator-edited encrypted file imports and applies only on review.
+    transfer("import", &edited_path, EXPORT_PASSPHRASE).expect("encrypted file becomes the private draft");
+    assert_eq!(accepted_revision(&alice), revision + 2, "import does not apply");
+    assert!(!lan_peer.ping("198.51.100.2").unwrap(), "import does not change forwarding");
+    let draft = alice.get("/api/draft").unwrap();
+    assert!(draft.contains("198.51.100.0/24"), "the draft proposes the edited route");
+    transfer("apply-draft", &edited_path, "").expect("reviewed imported draft applies");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision + 3);
+    assert!(lan_peer.ping("198.51.100.2").unwrap(), "imported route forwards");
+    assert!(wait_udp(&lan_peer, "10.57.0.1", 51821), "imported listen port takes effect");
+    let bob = https_login_admin(&guest, "bob", "secret34");
+    assert!(bob.get("/api/administrators").unwrap().contains("bob"));
 }
 
 #[test]

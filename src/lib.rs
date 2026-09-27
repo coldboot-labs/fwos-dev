@@ -864,7 +864,9 @@ impl Guest {
 
     /// Export or import network Desired state through the rendered transfer
     /// controls. `file` is where an export is saved or the file to import;
-    /// `secret` must never appear on the rendered page.
+    /// `secret` must never appear on the rendered page. A non-empty
+    /// `passphrase` encrypts the export or decrypts the import.
+    #[allow(clippy::too_many_arguments)]
     pub fn browser_transfer_desired_state(
         &self,
         action: &str,
@@ -872,6 +874,7 @@ impl Guest {
         password: &str,
         file: &Path,
         secret: &str,
+        passphrase: &str,
     ) -> Result<(), Error> {
         let input = serde_json::to_vec(&serde_json::json!({
             "url": format!("https://127.0.0.1:{}", self.https_port),
@@ -880,6 +883,7 @@ impl Guest {
             "password": password,
             "file": file,
             "secret": secret,
+            "passphrase": passphrase,
         }))
         .map_err(|_| Error::from_message("encode transfer browser input"))?;
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/transfer.mjs");

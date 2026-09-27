@@ -62,7 +62,15 @@ listen port. It checks that anonymous export and import get 401 and that
 ordinary views omit the key. Malformed, invalid, and identity-bearing files are
 rejected with the Accepted network unchanged. An administrator created after
 the export survives the import. Peers see the imported route and port only
-after the explicit apply.
+after the explicit apply. With a passphrase the driver fills the rendered
+passphrase fields; it checks that the page does not keep or show them. A second
+guest exports an age-encrypted file and a plaintext file. The test decrypts,
+edits, and re-encrypts the export with the `age` crate, as an operator would with
+`age -p`. Wrong or missing passphrases, a damaged file, and invalid or
+identity-bearing decrypted content are rejected with Accepted Desired state,
+forwarding, and Identity configuration unchanged. The UI's encrypted file
+imports unchanged with its passphrase into the same reviewed private draft as
+the plaintext export, and nothing applies until review.
 
 `tests/browser/policy.mjs` drives firewall policy through the same private draft
 and apply controls. Peers prove which packets the appliance forwards and which
