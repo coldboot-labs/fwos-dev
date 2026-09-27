@@ -975,6 +975,44 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive the rendered Host update panel: `status`, `stage` (with `image`),
+    /// or `reboot`. Returns the driver's rendered status texts.
+    pub fn browser_host_update(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        image: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "image": image,
+        }))
+        .map_err(|_| Error::from_message("encode Host update browser input"))?;
+        let output = output_with_input(
+            Command::new("node").arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/browser/host-update.mjs"
+            )),
+            &input,
+        )
+        .map_err(|error| Error::from_io("run Host update browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("Host update browser driver returned no valid result")
+        })?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered Host update failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(result)
+    }
+
     /// Check the rendered one-NIC warning as the operator changes WAN tagging.
     pub fn browser_one_nic_bootstrap_warning(&self) -> Result<String, Error> {
         let input = serde_json::to_vec(&serde_json::json!({
@@ -2802,6 +2840,33 @@ impl LocalRegistry {
     /// Image ref the guest uses (QEMU user-net host is 10.0.2.2).
     pub fn guest_image(&self) -> String {
         format!("10.0.2.2:{}/fwos:next", self.port)
+    }
+
+    /// Stop serving without discarding the pushed Release, as in a registry outage.
+    pub fn pause(&self) -> Result<(), Error> {
+        self.podman("stop", "stopping Workstation-local registry")
+    }
+
+    /// Serve the same pushed Release again after `pause`.
+    pub fn resume(&self) -> Result<(), Error> {
+        self.podman("start", "starting Workstation-local registry")?;
+        wait_tcp("127.0.0.1", self.port, Duration::from_secs(30))
+    }
+
+    fn podman(&self, verb: &str, context: &str) -> Result<(), Error> {
+        let output = Command::new("sudo")
+            .args(["podman", verb, &self.container])
+            .output()
+            .map_err(|e| Error::from_io(context, e))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::from_message(format!(
+                "{context} failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
     }
 }
 

@@ -3783,36 +3783,9 @@ fn published_serial_stages_host_update_then_reboot_applies() {
     https_bootstrap(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
 
-    let mut ui_update = String::from("(no POST)");
-    let mut ui_code = 0u16;
-    let ui_session = https_login_admin(&guest, "alice", "secret12");
-    for _ in 0..30 {
-        match ui_session.exchange(
-            "POST",
-            "/api/update",
-            Some(&format!(r#"{{"image":"{image}"}}"#)),
-            15,
-        ) {
-            Ok((code, body)) => {
-                ui_code = code;
-                ui_update = body;
-                break;
-            }
-            Err(e) => ui_update = e.to_string(),
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    assert_eq!(
-        ui_code, 404,
-        "v1 UI must not be a client of the Host update socket, got http_code={ui_code} {ui_update}; serial:\n{}",
-        guest.serial()
-    );
-    let js = guest.https_get("/app.js").unwrap_or_default();
-    assert!(
-        !js.contains("update.sock") && !js.contains("/api/update"),
-        "UI JS must not call the Host update program, js:\n{js}"
-    );
-
+    // The UI Host update flow is covered by
+    // published_ui_stages_host_update_keeps_forwarding_and_reboots_offline;
+    // this legacy serial adapter stays callable until its retirement.
     let before_len = guest.serial().len();
     let staged = serial_cmd(&guest, &format!("update {image}\n"), 1200, |t| {
         (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
@@ -4058,6 +4031,274 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         "netd must be running after manual rollback, serial:\n{back}"
     );
     assert_no_ssh(&guest, "after Host update reboot");
+}
+
+fn host_update_status(guest: &Guest) -> serde_json::Value {
+    let session = https_login_admin(guest, "alice", "secret12");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (_, body) = session
+            .exchange("GET", "/api/host-update", None, 30)
+            .expect("authenticated Host update status");
+        let status: serde_json::Value = serde_json::from_str(&body).expect("Host update status JSON");
+        if status["ok"] == true || std::time::Instant::now() >= deadline {
+            assert_eq!(status["ok"], true, "Host update status: {status}");
+            return status;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Forwarded probes sent while a Host update stage ran.
+struct StagingProbes {
+    sent: u32,
+    lost: u32,
+    longest_gap: u32,
+}
+
+impl StagingProbes {
+    /// Staging must not stop forwarding. A single lost 2s probe while the
+    /// guest decompresses layers is load, not an outage; a run of them is not.
+    fn assert_forwarding_continued(&self, when: &str) {
+        eprintln!(
+            "{when}: {} of {} forwarded probes lost, longest gap {}",
+            self.lost, self.sent, self.longest_gap
+        );
+        assert!(
+            self.sent > 0 && self.longest_gap <= 1 && self.lost * 20 <= self.sent,
+            "{when}: forwarding stopped ({} of {} probes lost, longest gap {})",
+            self.lost,
+            self.sent,
+            self.longest_gap
+        );
+    }
+}
+
+/// Poll Host update status until staging ends, pinging through the appliance
+/// about once a second.
+fn wait_staging_done(
+    guest: &Guest,
+    peer: &NetworkPeer,
+    target: &str,
+) -> (serde_json::Value, StagingProbes) {
+    let session = https_login_admin(guest, "alice", "secret12");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
+    let mut probes = StagingProbes {
+        sent: 0,
+        lost: 0,
+        longest_gap: 0,
+    };
+    let mut gap = 0;
+    loop {
+        probes.sent += 1;
+        if peer.ping(target).expect("forwarded peer probe during staging") {
+            gap = 0;
+        } else {
+            probes.lost += 1;
+            gap += 1;
+            probes.longest_gap = probes.longest_gap.max(gap);
+        }
+        let (_, body) = session
+            .exchange("GET", "/api/host-update", None, 30)
+            .expect("Host update status during staging");
+        let status: serde_json::Value = serde_json::from_str(&body).expect("Host update status JSON");
+        if status["ok"] == true && status["operation"]["state"] != "staging" {
+            return (status, probes);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Host update staging did not finish: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+fn wait_ui_reboot(guest: &Guest, from: usize) {
+    let rebooted = serial_wait(guest, from, 600, |text| text.contains("FWOS Appliance CLI"));
+    assert!(
+        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        "UI reboot must restart the owned appliance: {rebooted}"
+    );
+}
+
+#[test]
+fn published_ui_stages_host_update_keeps_forwarding_and_reboots_offline() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_next_release()
+        .expect("Workstation-local registry must serve a newer Release");
+    let image = registry.guest_image();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    lan_peer
+        .add_route("192.0.2.0/24", "10.56.0.1")
+        .expect("LAN peer route to the WAN");
+    wan_peer.add_address("192.0.2.2/24").expect("WAN peer address");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+
+    // No administrator exists yet: the UI offers no Host update to anyone.
+    for (method, path) in [
+        ("GET", "/api/host-update"),
+        ("POST", "/api/host-update/stage"),
+        ("POST", "/api/host-update/reboot"),
+    ] {
+        let body = (method == "POST").then(|| format!(r#"{{"image":"{image}"}}"#));
+        let (code, reply) = guest
+            .https_exchange(method, path, body.as_deref(), 15)
+            .expect("pre-Bootstrap Host update request");
+        assert_eq!(code, 401, "{method} {path} before Bootstrap: {reply}");
+    }
+
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peers.len(), 2);
+    let (lan_nic, wan_nic) = (&peers[0], &peers[1]);
+    let payload = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.0.2.0/24", "dhcp_pool": "10.0.2.100-10.0.2.200"
+    });
+    https_bootstrap(&guest, &payload.to_string());
+    assert!(lan_peer
+        .ping("192.0.2.2")
+        .expect("forwarded probe after Bootstrap"));
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let revision = accepted_revision(&session);
+    let initial = host_update_status(&guest);
+    let previous = initial["booted"].as_str().unwrap_or_default().to_string();
+    assert!(!previous.is_empty(), "active Release is reported: {initial}");
+    assert!(!previous.contains("fwos:next"), "{initial}");
+    assert_eq!(initial["staged"], "", "{initial}");
+    assert_eq!(initial["reboot_required"], false, "{initial}");
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret12", "")
+        .expect("rendered Host update status");
+    assert!(
+        rendered["status"].as_str().unwrap().contains(&previous)
+            && rendered["status"].as_str().unwrap().contains("No Release is staged"),
+        "{rendered}"
+    );
+
+    // Stage the Release while peers keep forwarding through the appliance.
+    let from = guest.serial().len();
+    let started = guest
+        .browser_host_update("stage", "alice", "secret12", &image)
+        .expect("rendered stage request");
+    assert!(
+        started["result"].as_str().unwrap().contains("started"),
+        "{started}"
+    );
+    let (staged, probes) = wait_staging_done(&guest, &lan_peer, "192.0.2.2");
+    probes.assert_forwarding_continued("staging");
+    assert_eq!(staged["operation"]["state"], "idle", "{staged}");
+    assert!(
+        staged["staged"].as_str().unwrap().contains("fwos:next"),
+        "{staged}"
+    );
+    assert_eq!(staged["booted"], previous.as_str(), "{staged}");
+    assert_eq!(staged["reboot_required"], true, "{staged}");
+    let new = &guest.serial()[from..];
+    assert!(
+        !new.contains("FWOS Appliance CLI"),
+        "staging must not reboot: {new}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret12", "")
+        .expect("rendered staged Release");
+    assert!(
+        rendered["status"].as_str().unwrap().contains("fwos:next")
+            && rendered["status"].as_str().unwrap().contains("Reboot required"),
+        "{rendered}"
+    );
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&session), revision);
+
+    // Offline activation: the staged deployment boots without the registry.
+    registry.pause().expect("registry outage before reboot");
+    let from = guest.serial().len();
+    let rendered = guest
+        .browser_host_update("reboot", "alice", "secret12", "")
+        .expect("rendered reboot onto the staged Release");
+    assert!(
+        rendered["result"].as_str().unwrap().starts_with("Rebooting"),
+        "{rendered}"
+    );
+    assert!(
+        rendered["confirmation"].as_str().unwrap().contains("fwos:next"),
+        "reboot confirmation names the staged Release: {rendered}"
+    );
+    wait_ui_reboot(&guest, from);
+    let activated = host_update_status(&guest);
+    let next = activated["booted"].as_str().unwrap_or_default().to_string();
+    assert!(next.contains("fwos:next"), "{activated}");
+    assert_eq!(activated["rollback"], previous.as_str(), "{activated}");
+    assert_eq!(activated["staged"], "", "{activated}");
+    assert_eq!(activated["reboot_required"], false, "{activated}");
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&session), revision);
+    assert!(lan_peer
+        .ping("192.0.2.2")
+        .expect("forwarded probe on the new Release"));
+
+    // Registry still down: a later update fails without touching the running
+    // Release, the Accepted network, or forwarding.
+    let later = image.replace("fwos:next", "fwos:later");
+    let requested = guest
+        .browser_host_update("stage", "alice", "secret12", &later)
+        .expect("rendered stage request during registry outage");
+    assert!(
+        requested["result"].as_str().unwrap().contains("started"),
+        "{requested}"
+    );
+    let (failed, probes) = wait_staging_done(&guest, &lan_peer, "192.0.2.2");
+    probes.assert_forwarding_continued("failed staging");
+    assert_eq!(failed["operation"]["state"], "failed", "{failed}");
+    assert_eq!(failed["booted"], next.as_str(), "{failed}");
+    assert_eq!(failed["staged"], "", "{failed}");
+    assert_eq!(failed["reboot_required"], false, "{failed}");
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret12", "")
+        .expect("rendered failed staging");
+    assert!(
+        rendered["operation"].as_str().unwrap().contains("failed")
+            && rendered["operation"].as_str().unwrap().contains("unchanged"),
+        "{rendered}"
+    );
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&session), revision, "Accepted network unchanged");
+
+    // A failed download is not a Host update boot: the running Release stays
+    // booted and keeps its rollback target.
+    let from = guest.serial().len();
+    let rendered = guest
+        .browser_host_update("reboot", "alice", "secret12", "")
+        .expect("rendered reboot with nothing staged");
+    assert!(
+        rendered["result"].as_str().unwrap().starts_with("Rebooting"),
+        "{rendered}"
+    );
+    wait_ui_reboot(&guest, from);
+    let after_failure = host_update_status(&guest);
+    assert_eq!(after_failure["booted"], next.as_str(), "{after_failure}");
+    assert_eq!(after_failure["rollback"], previous.as_str(), "{after_failure}");
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&session), revision);
+    assert!(lan_peer
+        .ping("192.0.2.2")
+        .expect("forwarded probe after reboot with nothing staged"));
+    assert_no_ssh(&guest, "after UI Host update");
 }
 
 #[test]
