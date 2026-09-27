@@ -488,6 +488,47 @@ impl Guest {
         Ok(())
     }
 
+    /// Pull or restore the cable of the external peer NIC at `index` (the
+    /// order peers were passed at boot), as the guest sees link state.
+    pub fn qemu_set_peer_link(&self, index: usize, up: bool) -> Result<(), Error> {
+        let state = if up { "on" } else { "off" };
+        let response = self.monitor_command(&format!("set_link peer{index} {state}"))?;
+        match response.split("Error:").nth(1) {
+            Some(error) => Err(Error::from_message(format!(
+                "QEMU set_link peer{index} {state} failed: {}",
+                error.split("\r\n").next().unwrap_or(error).trim()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn monitor_command(&self, command: &str) -> Result<String, Error> {
+        let mut stream = UnixStream::connect(&self.monitor)
+            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let read_prompt = |stream: &mut UnixStream| -> Result<String, Error> {
+            let mut reply = [0u8; 4096];
+            let mut text = String::new();
+            while !text.ends_with("(qemu) ") {
+                let n = stream
+                    .read(&mut reply)
+                    .map_err(|e| Error::from_io("reading QEMU monitor", e))?;
+                if n == 0 {
+                    return Err(Error::from_message("QEMU monitor closed"));
+                }
+                text.push_str(&String::from_utf8_lossy(&reply[..n]));
+            }
+            Ok(text)
+        };
+        read_prompt(&mut stream)?;
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .and_then(|_| stream.flush())
+            .map_err(|e| Error::from_io("writing QEMU monitor command", e))?;
+        read_prompt(&mut stream)
+    }
+
     /// Write bytes to the guest serial console.
     pub fn serial_write(&self, data: &str) -> Result<(), Error> {
         let mut serial = self
@@ -2813,20 +2854,27 @@ pub struct LocalRegistry {
 impl LocalRegistry {
     /// Build a newer Host image (one tag: Host image plus Built-in addons) and serve it over HTTP.
     pub fn publish_next_release() -> Result<Self, Error> {
-        Self::publish(false)
+        Self::publish(NextRelease::Working)
     }
 
     /// Same, but the newer Release has no netd — appliance health must roll it back.
     pub fn publish_dead_netd_release() -> Result<Self, Error> {
-        Self::publish(true)
+        Self::publish(NextRelease::DeadNetd)
     }
 
-    fn publish(dead_netd: bool) -> Result<Self, Error> {
+    /// Same, but the newer Release's Kea DHCPv4 cannot start. netd runs and
+    /// applies the network, yet the LAN services of the Accepted Desired state
+    /// are not restored, so appliance health must roll it back.
+    pub fn publish_broken_lan_services_release() -> Result<Self, Error> {
+        Self::publish(NextRelease::BrokenLanServices)
+    }
+
+    fn publish(release: NextRelease) -> Result<Self, Error> {
         let image_dir = host_image_dir()?;
         let parts = host_image_parts(&image_dir)?;
         parts.build_images()?;
         build_host_container(&image_dir)?;
-        build_next_release(dead_netd)?;
+        build_next_release(release)?;
         let port = free_localhost_port()?;
         let container = format!("fwos-registry-{port}");
         start_registry(&container, port)?;
@@ -2882,16 +2930,31 @@ fn stop_registry(name: &str) {
         .status();
 }
 
-fn build_next_release(dead_netd: bool) -> Result<(), Error> {
+enum NextRelease {
+    Working,
+    DeadNetd,
+    BrokenLanServices,
+}
+
+fn build_next_release(release: NextRelease) -> Result<(), Error> {
     let ctx = temp_work_dir("fwos-dev-next", "creating next Release context")?;
-    let body = if dead_netd {
-        "FROM localhost/fwos:dev\n\
-         RUN rm -f /usr/share/containers/systemd/fwos-netd.container \\\n\
-         && ln -sfn /dev/null /etc/systemd/system/fwos-netd.service \\\n\
-         && printf 'next\\n' > /usr/lib/fwos/release \\\n\
-         && ostree container commit\n"
-    } else {
-        "FROM localhost/fwos:dev\nRUN printf 'next\\n' > /usr/lib/fwos/release && ostree container commit\n"
+    let body = match release {
+        NextRelease::DeadNetd => {
+            "FROM localhost/fwos:dev\n\
+             RUN rm -f /usr/share/containers/systemd/fwos-netd.container \\\n\
+             && ln -sfn /dev/null /etc/systemd/system/fwos-netd.service \\\n\
+             && printf 'next\\n' > /usr/lib/fwos/release \\\n\
+             && ostree container commit\n"
+        }
+        NextRelease::BrokenLanServices => {
+            "FROM localhost/fwos:dev\n\
+             RUN rm -f /usr/lib/fwos/addons/kea/usr/bin/kea-dhcp4 \\\n\
+             && printf 'next\\n' > /usr/lib/fwos/release \\\n\
+             && ostree container commit\n"
+        }
+        NextRelease::Working => {
+            "FROM localhost/fwos:dev\nRUN printf 'next\\n' > /usr/lib/fwos/release && ostree container commit\n"
+        }
     };
     fs::write(ctx.join("Containerfile"), body)
         .map_err(|e| Error::from_io("writing next Release Containerfile", e))?;

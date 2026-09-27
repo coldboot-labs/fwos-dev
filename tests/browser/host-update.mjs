@@ -43,6 +43,7 @@ try {
   result = {
     ok: true,
     status: await status.textContent(),
+    health: await page.locator("#host-update-health").textContent(),
     operation: await page.locator("#host-update-operation").textContent(),
     result: await outcome.textContent(),
     confirmation,

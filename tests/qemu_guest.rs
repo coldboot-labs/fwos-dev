@@ -4034,7 +4034,11 @@ fn published_serial_stages_host_update_then_reboot_applies() {
 }
 
 fn host_update_status(guest: &Guest) -> serde_json::Value {
-    let session = https_login_admin(guest, "alice", "secret12");
+    host_update_status_as(guest, "secret12")
+}
+
+fn host_update_status_as(guest: &Guest, password: &str) -> serde_json::Value {
+    let session = https_login_admin(guest, "alice", password);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let (_, body) = session
@@ -4396,7 +4400,304 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
         "after automatic rollback, HTTPS UI must still serve status; got:\n{ui_after}; serial:\n{}",
         guest.serial()
     );
+    let status = host_update_status(&guest);
+    assert_eq!(status["last_update"]["outcome"], "rolled_back", "{status}");
+    assert_eq!(status["last_update"]["reason"], "netd not running", "{status}");
     assert_no_ssh(&guest, "after automatic rollback");
+}
+
+/// UI on the user-net NIC, and a LAN peer that the Accepted Desired state
+/// serves with Kea DHCPv4 and routes to a WAN peer.
+fn boot_host_update_guest(lan_peer: &NetworkPeer, wan_peer: &NetworkPeer) -> Guest {
+    lan_peer
+        .add_address("10.56.0.2/24")
+        .expect("LAN peer address");
+    lan_peer
+        .add_route("192.0.2.0/24", "10.56.0.1")
+        .expect("LAN peer route to the WAN");
+    wan_peer.add_address("192.0.2.2/24").expect("WAN peer address");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[lan_peer, wan_peer])
+        .expect("published Disk image with external peers");
+    let ui_nic = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &ui_nic)
+        .collect();
+    assert_eq!(peers.len(), 2);
+    let (lan_nic, wan_nic) = (&peers[0], &peers[1]);
+    let payload = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": ui_nic, "role": "lan", "addresses": ["10.0.2.15/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.100-10.56.0.140"
+    });
+    https_bootstrap(&guest, &payload.to_string());
+    guest
+}
+
+/// Accepted interface Desired state, without live NIC observations.
+fn accepted_interfaces(session: &fwos_dev::HttpsSession<'_>) -> serde_json::Value {
+    let body: serde_json::Value =
+        serde_json::from_str(&session.get("/api/interfaces").expect("Accepted interfaces"))
+            .expect("interfaces JSON");
+    serde_json::json!([body["interfaces"], body["ui_exposure"], body["lan_prefix"]])
+}
+
+/// The LAN peer gets a lease from the appliance and reaches the WAN peer.
+fn assert_lan_services_and_forwarding(lan_peer: &NetworkPeer, when: &str) {
+    let offered = wait_dhcp_offer(lan_peer);
+    assert!(
+        (100..=140).contains(&offer_octet(&offered)),
+        "{when}: Accepted DHCP pool lease: {offered}"
+    );
+    assert!(
+        wait_ping(lan_peer, "192.0.2.2"),
+        "{when}: LAN peer must forward to the WAN"
+    );
+}
+
+/// Stage `image` from the rendered UI, run `before_reboot`, and reboot onto
+/// it; returns the previously active Release and the serial offset of the reboot.
+fn stage_and_reboot_from_ui(
+    guest: &Guest,
+    lan_peer: &NetworkPeer,
+    image: &str,
+    before_reboot: impl FnOnce(),
+) -> (String, usize) {
+    let previous = host_update_status(guest)["booted"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!previous.is_empty() && !previous.contains("fwos:next"));
+    let started = guest
+        .browser_host_update("stage", "alice", "secret12", image)
+        .expect("rendered stage request");
+    assert!(
+        started["result"].as_str().unwrap().contains("started"),
+        "{started}"
+    );
+    let (staged, _) = wait_staging_done(guest, lan_peer, "192.0.2.2");
+    assert_eq!(staged["operation"]["state"], "idle", "{staged}");
+    assert!(
+        staged["staged"].as_str().unwrap().contains("fwos:next"),
+        "{staged}"
+    );
+    before_reboot();
+    let from = guest.serial().len();
+    let rendered = guest
+        .browser_host_update("reboot", "alice", "secret12", "")
+        .expect("rendered reboot onto the staged Release");
+    assert!(
+        rendered["result"].as_str().unwrap().starts_with("Rebooting"),
+        "{rendered}"
+    );
+    (previous, from)
+}
+
+#[test]
+fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps_current_identity(
+) {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_broken_lan_services_release()
+        .expect("Workstation-local registry must serve a Release whose Kea cannot start");
+    let image = registry.guest_image();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    let guest = boot_host_update_guest(&lan_peer, &wan_peer);
+    assert_lan_services_and_forwarding(&lan_peer, "before the update");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/administrators",
+            Some(r#"{"username":"bob","password":"secret34"}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let revision = accepted_revision(&alice);
+    let accepted_network = accepted_interfaces(&alice);
+
+    let (previous, from) = stage_and_reboot_from_ui(&guest, &lan_peer, &image, || ());
+    wait_ui_reboot(&guest, from);
+
+    // The broken Release is live: netd runs and serves the UI, but the
+    // Accepted LAN services are not restored.
+    let failed = host_update_status(&guest);
+    assert!(
+        failed["booted"].as_str().unwrap().contains("fwos:next"),
+        "{failed}"
+    );
+    assert_eq!(failed["rollback"], previous.as_str(), "{failed}");
+    // Identity changes made on the failed Release are current and must
+    // survive the rollback: bob is removed and alice changes her password.
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/administrators/remove",
+            Some(r#"{"username":"bob"}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/administrators/password",
+            Some(r#"{"username":"alice","password":"secret56"}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        lan_peer.dhcp_offer().expect("LAN DHCP probe on the failed Release"),
+        None,
+        "the fixture Release must not serve DHCP"
+    );
+    let still_failed = host_update_status_as(&guest, "secret56");
+    assert!(
+        still_failed["booted"].as_str().unwrap().contains("fwos:next"),
+        "identity changes must be made on the failed Release: {still_failed}"
+    );
+
+    // No operator action: appliance health reboots into the previous Release.
+    let rolled = serial_wait(&guest, from, 600, |text| {
+        text.matches("FWOS Appliance CLI").count() >= 2
+    });
+    assert!(
+        rolled.matches("FWOS Appliance CLI").count() >= 2,
+        "failed appliance health must reboot into the previous bootc deployment: {rolled}"
+    );
+    let status = host_update_status_as(&guest, "secret56");
+    assert_eq!(status["booted"], previous.as_str(), "{status}");
+    assert!(
+        status["rollback"].as_str().unwrap().contains("fwos:next"),
+        "{status}"
+    );
+    assert_eq!(status["reboot_required"], false, "{status}");
+    assert_eq!(status["last_update"]["outcome"], "rolled_back", "{status}");
+    let reason = status["last_update"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("Desired state not restored") && reason.contains("fwos-kea-dhcp4"),
+        "a running netd is not a restored network: {status}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret56", "")
+        .expect("rendered automatic rollback");
+    assert!(
+        rendered["health"]
+            .as_str()
+            .unwrap()
+            .contains("automatically returned to the previous Release"),
+        "{rendered}"
+    );
+
+    // The previous Release restores the pre-update network and its services.
+    let alice = https_login_admin(&guest, "alice", "secret56");
+    assert_eq!(accepted_revision(&alice), revision, "pre-update revision");
+    assert_eq!(accepted_interfaces(&alice), accepted_network);
+    assert_lan_services_and_forwarding(&lan_peer, "after automatic rollback");
+
+    // Current Identity configuration, not an older snapshot, stays in effect.
+    for (username, password) in [("alice", "secret12"), ("bob", "secret34")] {
+        let credentials = serde_json::json!({"source": "local", "username": username, "password": password})
+            .to_string();
+        match guest.https_login(&credentials) {
+            Ok(_) => panic!("{username}'s obsolete credential must not return after rollback"),
+            Err(error) => assert!(error.to_string().contains("401"), "{error}"),
+        }
+    }
+    let login_from = guest.serial().rfind("FWOS Appliance CLI").unwrap_or(from);
+    serial_login_admin_from(&guest, "alice", "secret56", login_from);
+    assert_no_ssh(&guest, "after automatic rollback of broken LAN services");
+}
+
+#[test]
+fn published_host_update_is_accepted_with_the_wan_unplugged_and_no_acknowledgement() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_next_release()
+        .expect("Workstation-local registry must serve a newer Release");
+    let image = registry.guest_image();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    let guest = boot_host_update_guest(&lan_peer, &wan_peer);
+    assert_lan_services_and_forwarding(&lan_peer, "before the update");
+    // Apply confirmation is a network safeguard, not Host update health.
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let base = accepted_revision(&alice);
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/apply-confirmation/configure",
+            Some(&format!(r#"{{"base_revision":{base},"enabled":true}}"#)),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let revision = accepted_revision(&alice);
+
+    let (previous, from) = stage_and_reboot_from_ui(&guest, &lan_peer, &image, || {
+        // Unplug the WAN and lose every upstream, including the registry,
+        // before the update boot and through its health check.
+        guest
+            .qemu_set_peer_link(1, false)
+            .expect("pull the WAN cable");
+        registry.pause().expect("upstream registry outage");
+        assert!(!lan_peer.ping("192.0.2.2").unwrap(), "WAN is unplugged");
+    });
+    wait_ui_reboot(&guest, from);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let status = loop {
+        let status = host_update_status(&guest);
+        if !status["last_update"].is_null() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "appliance health must decide the update boot: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    };
+    assert_eq!(status["last_update"]["outcome"], "accepted", "{status}");
+    assert!(
+        status["booted"].as_str().unwrap().contains("fwos:next"),
+        "an unplugged WAN is not a failed Release: {status}"
+    );
+    assert_eq!(status["rollback"], previous.as_str(), "{status}");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision, "Accepted network unchanged");
+    let confirmation: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
+    assert_eq!(confirmation["enabled"], true, "{confirmation}");
+    assert!(
+        confirmation["pending"].is_null(),
+        "Host update health asks for no Apply confirmation: {confirmation}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret12", "")
+        .expect("rendered accepted update");
+    assert!(
+        rendered["health"].as_str().unwrap().contains("passed appliance health"),
+        "{rendered}"
+    );
+
+    let offered = wait_dhcp_offer(&lan_peer);
+    assert!((100..=140).contains(&offer_octet(&offered)), "{offered}");
+    guest
+        .qemu_set_peer_link(1, true)
+        .expect("plug the WAN cable back in");
+    assert!(
+        wait_ping(&lan_peer, "192.0.2.2"),
+        "forwarding resumes when the WAN returns"
+    );
+    assert_no_ssh(&guest, "after an update boot with the WAN unplugged");
 }
 
 fn peer_https_stays_down(peer: &NetworkPeer, address: &str) {
