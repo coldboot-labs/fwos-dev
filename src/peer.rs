@@ -22,6 +22,7 @@ pub struct NetworkPeer {
     owned_tap: bool,
     owned_uplink: bool,
     discovery: Option<Discovery>,
+    upstream: Option<(Child, std::path::PathBuf)>,
 }
 
 impl NetworkPeer {
@@ -38,6 +39,7 @@ impl NetworkPeer {
             owned_tap: false,
             owned_uplink: false,
             discovery: None,
+            upstream: None,
         };
         let (uid, _) = current_uid_gid()?;
         ip(&["netns", "add", &peer.namespace])?;
@@ -546,6 +548,129 @@ except socket.timeout:
         self.neighbor_resolved(address)
     }
 
+    /// Act as the IPv6 upstream on this segment: RA for `ra_prefix`/64 and
+    /// DHCPv6 with an address and, when given, a delegated prefix routed to
+    /// the client like an ISP would. `None` answers NoPrefixAvail.
+    pub fn start_ipv6_upstream(&mut self, ra_prefix: &str, delegate: Option<&str>) -> Result<(), Error> {
+        if self.upstream.is_some() {
+            return Err(Error::from_message("IPv6 upstream already started"));
+        }
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/ipv6-upstream.py");
+        let log = std::env::temp_dir().join(format!("fwos-ipv6-upstream-{}.log", self.namespace));
+        let file = std::fs::File::create(&log)
+            .map_err(|error| Error::from_io("IPv6 upstream log", error))?;
+        let child = self
+            .command("python3")
+            .arg(script)
+            .args(["eth0", ra_prefix, delegate.unwrap_or("none")])
+            .stdout(file)
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| Error::from_io("start IPv6 upstream", error))?;
+        self.upstream = Some((child, log));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.ipv6_upstream_events()?.iter().any(|event| event["event"] == "ready") {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err(Error::from_message("IPv6 upstream did not start"))
+    }
+
+    /// Bindings the IPv6 upstream handed out, as reported by the upstream itself.
+    pub fn ipv6_upstream_events(&self) -> Result<Vec<serde_json::Value>, Error> {
+        let (_, log) = self
+            .upstream
+            .as_ref()
+            .ok_or_else(|| Error::from_message("IPv6 upstream not started"))?;
+        let text = std::fs::read_to_string(log)
+            .map_err(|error| Error::from_io("read IPv6 upstream log", error))?;
+        Ok(text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    }
+
+    /// Let this peer autoconfigure from Router Advertisements, like a LAN host.
+    pub fn enable_slaac(&self) -> Result<(), Error> {
+        let output = self
+            .command("sysctl")
+            .args([
+                "-w",
+                "net.ipv6.conf.eth0.accept_ra=1",
+                "net.ipv6.conf.eth0.autoconf=1",
+            ])
+            .output()
+            .map_err(|e| Error::from_io("enable peer SLAAC", e))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(Error::from_message("could not enable peer SLAAC"))
+        }
+    }
+
+    /// Global IPv6 addresses on this peer's segment interface.
+    pub fn global_ipv6(&self) -> Result<Vec<String>, Error> {
+        let output = self
+            .command("ip")
+            .args(["-j", "-6", "address", "show", "dev", "eth0", "scope", "global"])
+            .output()
+            .map_err(|e| Error::from_io("read peer IPv6 addresses", e))?;
+        let links: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| Error::from_message(format!("peer IPv6 address JSON: {e}")))?;
+        Ok(links
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|link| link["addr_info"].as_array().cloned().unwrap_or_default())
+            .filter_map(|address| address["local"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    /// The IPv6 default router this peer learned from Router Advertisements.
+    pub fn ipv6_default_router(&self) -> Result<Option<String>, Error> {
+        let output = self
+            .command("ip")
+            .args(["-j", "-6", "route", "show", "default", "dev", "eth0"])
+            .output()
+            .map_err(|e| Error::from_io("read peer IPv6 default route", e))?;
+        let routes: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| Error::from_message(format!("peer IPv6 route JSON: {e}")))?;
+        Ok(routes
+            .get(0)
+            .and_then(|route| route["gateway"].as_str())
+            .map(str::to_owned))
+    }
+
+    /// Record source addresses of ICMPv6 echo requests that reach this peer
+    /// while `traffic` runs elsewhere.
+    pub fn echo_request_sources(&self, traffic: impl FnOnce()) -> Result<Vec<String>, Error> {
+        let capture = self
+            .command("timeout")
+            .args([
+                "8", "tcpdump", "-n", "-l", "-i", "eth0", "icmp6", "and", "ip6[40]", "==", "128",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| Error::from_io("external ICMPv6 capture", error))?;
+        std::thread::sleep(Duration::from_millis(500));
+        traffic();
+        let output = capture
+            .wait_with_output()
+            .map_err(|error| Error::from_io("external ICMPv6 capture", error))?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                words.find(|word| *word == "IP6")?;
+                words.next().map(str::to_owned)
+            })
+            .collect())
+    }
+
     fn command(&self, executable: &str) -> Command {
         let mut command = Command::new("sudo");
         command.args(["-n", "ip", "netns", "exec", &self.namespace, executable]);
@@ -632,6 +757,11 @@ impl Drop for NetworkPeer {
             }
         }
         self.discovery.take();
+        if let Some((mut child, log)) = self.upstream.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(log);
+        }
         // These names are generated exclusively for this peer. Removing the
         // namespace also removes its veth; no broad network cleanup is used.
         for (owned, args) in [

@@ -714,6 +714,48 @@ impl Guest {
         Ok(())
     }
 
+    /// Drive the published IPv6 page through rendered HTTPS controls and return
+    /// its live IPv6 text once it contains `expect_live` (when not empty).
+    #[allow(clippy::too_many_arguments)]
+    pub fn browser_configure_ipv6(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        wan: &str,
+        mode: &str,
+        request_pd: bool,
+        expect_live: &str,
+    ) -> Result<String, Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "wan": wan,
+            "mode": mode,
+            "requestPd": request_pd,
+            "expectLive": expect_live,
+            "liveTimeoutMs": 60_000,
+        }))
+        .map_err(|_| Error::from_message("encode IPv6 browser input"))?;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/ipv6.mjs");
+        let mut command = Command::new("node");
+        command.arg(script);
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run IPv6 browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| Error::from_message("IPv6 browser driver returned no valid result"))?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered IPv6 edit failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(result["live"].as_str().unwrap_or_default().to_owned())
+    }
+
     /// Drive the published firewall policy editor through rendered HTTPS controls.
     pub fn browser_configure_policy(
         &self,

@@ -6428,3 +6428,215 @@ fn installer_serial_cmd(
         .unwrap_or_else(|e| panic!("Installer serial {data:?}: {e}"));
     serial_wait(guest, from, secs, pred)
 }
+
+fn wait_global_ipv6(peer: &NetworkPeer, prefix: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    while std::time::Instant::now() < deadline {
+        if let Some(address) = peer
+            .global_ipv6()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|address| address.starts_with(prefix))
+        {
+            return Some(address);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    None
+}
+
+fn wait_ping(peer: &NetworkPeer, address: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if peer.ping(address).unwrap_or(false) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    false
+}
+
+/// The routed LAN source reaches the WAN peer; the appliance's own WAN
+/// address never stands in for it (no NAT66/NPTv6).
+fn assert_routed_ipv6(lan_peer: &NetworkPeer, wan_peer: &NetworkPeer, lan_source: &str, target: &str) {
+    assert!(wait_ping(lan_peer, target), "LAN-to-WAN IPv6 must forward to {target}");
+    let sources = wan_peer
+        .echo_request_sources(|| {
+            let _ = lan_peer.ping(target);
+        })
+        .expect("WAN-side ICMPv6 capture");
+    assert!(
+        sources.iter().any(|source| source == lan_source),
+        "WAN peer must see the LAN host's own address {lan_source}: {sources:?}"
+    );
+    assert!(
+        sources.iter().all(|source| source == lan_source),
+        "no translated IPv6 source may reach the WAN: {sources:?}"
+    );
+}
+
+#[test]
+fn published_ipv6_dual_stack_delegates_a_routed_lan_prefix() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let mut wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.2/32", "10.56.0.1").unwrap();
+    lan_peer.enable_slaac().unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("2001:db8:ff::1/64").unwrap();
+    wan_peer
+        .start_ipv6_upstream("2001:db8:ff::", Some("2001:db8:ff00:100::/56"))
+        .expect("external IPv6 upstream with prefix delegation");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [mgmt],
+        "lan_prefix": "10.56.0.0/24",
+        "dhcp_pool": "10.56.0.100-10.56.0.140"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+
+    // IPv4-only: NAT44 forwards (the WAN peer has no route to 10.56.0.0/24),
+    // and a LAN without a routed IPv6 prefix is not advertised.
+    assert!(wait_ping(&lan_peer, "192.0.2.2"), "IPv4-only LAN-to-WAN uses NAT44");
+    let live = guest
+        .browser_configure_ipv6("observe", "alice", "secret12", &wan, "static", false, "no NAT66")
+        .expect("IPv6 page reports the IPv4-only appliance");
+    assert!(live.contains("LAN prefix (none): none"), "{live}");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        lan_peer.global_ipv6().unwrap().is_empty() && lan_peer.ipv6_default_router().unwrap().is_none(),
+        "no RA without a delegated or routed prefix"
+    );
+
+    let live = guest
+        .browser_configure_ipv6(
+            "apply",
+            "alice",
+            "secret12",
+            &wan,
+            "dhcpv6",
+            true,
+            "delegated prefix 2001:db8:ff00:100::/56",
+        )
+        .expect("reviewed IPv6 change acquires an address and a delegated prefix");
+    assert!(live.contains("2001:db8:ff::1000/128"), "DHCPv6 WAN address: {live}");
+    assert!(live.contains("; IPv6 default route"), "RA default route: {live}");
+    assert!(
+        live.contains("LAN prefix (delegated): 2001:db8:ff00:100::/64 on"),
+        "{live}"
+    );
+    let events = wan_peer.ipv6_upstream_events().unwrap();
+    assert!(
+        events.iter().any(|event| event["event"] == "delegated"),
+        "upstream delegated the prefix: {events:?}"
+    );
+
+    let lan_address = wait_global_ipv6(&lan_peer, "2001:db8:ff00:100:")
+        .expect("LAN host autoconfigures from the delegated prefix");
+    let router = lan_peer
+        .ipv6_default_router()
+        .unwrap()
+        .expect("LAN host learns FWOS as its IPv6 router");
+    assert!(router.starts_with("fe80:"), "RA comes from the LAN link-local address: {router}");
+    assert_routed_ipv6(&lan_peer, &wan_peer, &lan_address, "2001:db8:ff::1");
+    assert!(wait_ping(&lan_peer, "192.0.2.2"), "dual-stack keeps NAT44 for IPv4");
+    assert_eq!(
+        lan_peer
+            .https_response(&format!("{router}%eth0"))
+            .expect("link-local HTTPS probe"),
+        None,
+        "neighbor discovery and RA work without link-local UI access"
+    );
+}
+
+#[test]
+fn published_ipv6_only_wan_reports_missing_delegation_and_routes_a_static_prefix() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let mut wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.enable_slaac().unwrap();
+    wan_peer.add_address("2001:db8:ff::1/64").unwrap();
+    wan_peer
+        .start_ipv6_upstream("2001:db8:ff::", None)
+        .expect("external IPv6 upstream without prefix delegation");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": []},
+            {"name": wan, "role": "wan", "addresses": []}
+        ],
+        "ui_exposure": [mgmt]
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+
+    let live = guest
+        .browser_configure_ipv6(
+            "save-and-apply",
+            "alice",
+            "secret12",
+            &wan,
+            "slaac",
+            true,
+            &format!("{wan}: 2001:db8:ff:"),
+        )
+        .expect("IPv6-only WAN autoconfigures with a prefix request");
+    assert!(live.contains("delegated prefix none received"), "{live}");
+    assert!(live.contains("LAN prefix (none): none"), "{live}");
+    assert!(live.contains("There is no NAT66, NPTv6, or NAT64"), "{live}");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        lan_peer.global_ipv6().unwrap().is_empty() && lan_peer.ipv6_default_router().unwrap().is_none(),
+        "without a delegated prefix the LAN gets no IPv6 rather than translation"
+    );
+    let wan_address = live
+        .split_whitespace()
+        .find(|word| word.starts_with("2001:db8:ff:"))
+        .and_then(|cidr| cidr.split('/').next())
+        .expect("WAN SLAAC address in live IPv6")
+        .to_owned();
+
+    guest
+        .browser_configure_lan_services("reject", "alice", "secret12", "", "", "2001:db8:56::/48")
+        .expect("a static prefix and prefix delegation together are rejected");
+    guest
+        .browser_configure_ipv6("apply", "alice", "secret12", &wan, "slaac", false, "")
+        .expect("stop requesting prefix delegation");
+    guest
+        .browser_configure_lan_services("apply", "alice", "secret12", "", "", "2001:db8:56::/48")
+        .expect("statically routed LAN prefix applies on an IPv6-only LAN");
+    // The ISP routes the static prefix to the appliance's WAN address.
+    wan_peer.add_route("2001:db8:56::/48", &wan_address).unwrap();
+
+    let lan_address = wait_global_ipv6(&lan_peer, "2001:db8:56:")
+        .expect("IPv6-only LAN host autoconfigures from the routed prefix");
+    assert_routed_ipv6(&lan_peer, &wan_peer, &lan_address, "2001:db8:ff::1");
+    let live = guest
+        .browser_configure_ipv6("observe", "alice", "secret12", &wan, "slaac", false, "LAN prefix (static)")
+        .expect("IPv6 page reports the static routed prefix");
+    assert!(live.contains("2001:db8:56::/64"), "{live}");
+}

@@ -62,6 +62,16 @@ it drops, while the UI stays off the WAN.
 through the same draft and apply controls, including a VLAN and its services
 in one revision. Peers check address leases and DNS answers before and after.
 
+`tests/browser/ipv6.mjs` drives the WAN IPv6 mode (static, SLAAC, or DHCPv6)
+and the prefix-delegation request through the same draft and apply controls,
+and reads the page's live IPv6 state. `tests/peer/ipv6-upstream.py` is the
+external IPv6 upstream on a WAN peer: it sends Router Advertisements, answers
+DHCPv6 with an address and optionally a delegated prefix, and routes that
+prefix to the appliance like an ISP. QEMU guests check IPv4-only NAT44,
+dual-stack prefix delegation, and an IPv6-only WAN without delegation, with a
+LAN peer autoconfiguring from the appliance's RA and its own address seen on
+the WAN (no NAT66).
+
 `tests/browser/interfaces.mjs` drives post-bootstrap interface, VLAN, role, and UI
 exposure edits through the same private draft, review, and apply controls.
 QEMU guests check two-NIC, VLAN-on-one-NIC, and Management NIC topologies with
