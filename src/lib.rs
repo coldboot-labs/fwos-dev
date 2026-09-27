@@ -726,7 +726,7 @@ impl Guest {
         verdict: &str,
         expect_in_review: &str,
     ) -> Result<(), Error> {
-        let input = serde_json::to_vec(&serde_json::json!({
+        self.run_policy_driver(serde_json::json!({
             "url": format!("https://127.0.0.1:{}", self.https_port),
             "actionName": action,
             "username": username,
@@ -737,7 +737,27 @@ impl Guest {
             "action": verdict,
             "expectInReview": expect_in_review,
         }))
-        .map_err(|_| Error::from_message("encode firewall browser input"))?;
+    }
+
+    /// Remove one listed firewall rule through the rendered page and apply it.
+    pub fn browser_remove_policy_rule(
+        &self,
+        username: &str,
+        password: &str,
+        rule: &str,
+    ) -> Result<(), Error> {
+        self.run_policy_driver(serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "actionName": "apply",
+            "username": username,
+            "password": password,
+            "removeRule": rule,
+        }))
+    }
+
+    fn run_policy_driver(&self, input: serde_json::Value) -> Result<(), Error> {
+        let input = serde_json::to_vec(&input)
+            .map_err(|_| Error::from_message("encode firewall browser input"))?;
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/policy.mjs");
         let mut command = Command::new("node");
         command.arg(script);
@@ -800,7 +820,8 @@ impl Guest {
         Ok(())
     }
 
-    /// Drive the published traffic-shaping controls through rendered HTTPS.
+    /// Drive the published traffic-shaping controls through rendered HTTPS and
+    /// return the live qdisc show the page reports afterwards.
     pub fn browser_configure_qdisc(
         &self,
         action: &str,
@@ -808,7 +829,7 @@ impl Guest {
         password: &str,
         dev: &str,
         kind: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let input = serde_json::to_vec(&serde_json::json!({
             "url": format!("https://127.0.0.1:{}", self.https_port),
             "action": action,
@@ -832,7 +853,7 @@ impl Guest {
                 result["error"].as_str().unwrap_or("no browser detail")
             )));
         }
-        Ok(())
+        Ok(result["live"].as_str().unwrap_or_default().to_string())
     }
 
     /// Drive optional Apply confirmation through the rendered HTTPS UI.

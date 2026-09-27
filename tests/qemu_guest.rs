@@ -4784,6 +4784,23 @@ fn published_firewall_policy_blocks_lan_input_and_keeps_forwarding() {
     );
     assert!(lan_peer.ping("192.0.2.2").unwrap(), "forwarding stays in place");
     peer_https_stays_down(&wan_peer, "192.0.2.1");
+
+    guest
+        .browser_remove_policy_rule(
+            "alice",
+            "secret12",
+            &format!("iifname \"{lan}\" ip saddr 10.56.0.2 icmp type echo-request drop"),
+        )
+        .expect("the rendered page removes the drop rule");
+    assert!(
+        lan_peer.ping("10.56.0.1").expect("permitted LAN input"),
+        "removing the rule must permit the LAN peer echo again"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let policy = alice.get("/api/firewall").unwrap();
+    assert!(!policy.contains("echo-request"), "{policy}");
+    assert!(lan_peer.ping("192.0.2.2").unwrap(), "forwarding stays in place");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
 }
 
 fn wait_udp(peer: &NetworkPeer, address: &str, port: u16) -> bool {
@@ -4987,6 +5004,16 @@ fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
         lan_peer.ping("192.0.2.2").expect("forwarded probe"),
         "LAN-to-WAN forwarding starts permitted"
     );
+    // fq_codel is commonly the kernel default, so first move the WAN root to
+    // pfifo; the later fq_codel line then proves the reviewed draft changed it.
+    let live = guest
+        .browser_configure_qdisc("save-and-apply", "alice", "secret12", &wan, "pfifo")
+        .expect("rendered shortcut installs pfifo");
+    assert_eq!(
+        root_qdisc_kind(&live, &wan).as_deref(),
+        Some("pfifo"),
+        "rendered live qdisc show must report pfifo at the WAN root: {live}"
+    );
     let alice = https_login_admin(&guest, "alice", "secret12");
     let routes: serde_json::Value =
         serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
@@ -5001,9 +5028,14 @@ fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
     guest
         .browser_configure_qdisc("save-draft", "alice", "secret12", &wan, "fq_codel")
         .expect("qdisc joins the private route draft");
-    guest
+    let live = guest
         .browser_configure_qdisc("apply-draft", "alice", "secret12", &wan, "fq_codel")
         .expect("reviewed draft applies the route and qdisc together");
+    assert_eq!(
+        root_qdisc_kind(&live, &wan).as_deref(),
+        Some("fq_codel"),
+        "rendered live qdisc show must report fq_codel at the WAN root: {live}"
+    );
     assert!(
         lan_peer.ping("192.0.2.2").expect("forwarded probe after fq_codel"),
         "traffic still forwards across the shaped WAN"
@@ -5012,10 +5044,6 @@ fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
     let applied = alice.get("/api/qdiscs").unwrap();
     let routes = alice.get("/api/routes").unwrap();
     assert!(applied.contains("fq_codel") && applied.contains(&wan), "{applied}");
-    assert!(
-        applied.contains(&format!("qdisc fq_codel")) && applied.contains(&wan),
-        "live qdisc show must report fq_codel on the WAN: {applied}"
-    );
     assert!(routes.contains("198.51.100.0/24"), "{routes}");
     let revision = serde_json::from_str::<serde_json::Value>(&applied).unwrap()["revision"]
         .as_u64()
@@ -5031,9 +5059,14 @@ fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
     assert!(body.contains("unsupported qdisc"), "{body}");
     let after = alice.get("/api/qdiscs").unwrap();
     assert!(after.contains("fq_codel"), "{after}");
-    assert!(
-        after.contains("qdisc fq_codel") && !after.contains("qdisc tbf"),
-        "rejected kind must leave the live fq_codel queue: {after}"
+    let effective = serde_json::from_str::<serde_json::Value>(&after).unwrap()["effective"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        root_qdisc_kind(&effective, &wan).as_deref(),
+        Some("fq_codel"),
+        "rejected kind must leave the live fq_codel queue: {effective}"
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&after).unwrap()["revision"].as_u64(),
@@ -5043,6 +5076,17 @@ fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
         lan_peer.ping("192.0.2.2").expect("forwarded probe after rejection"),
         "rejected qdisc must leave forwarding in place"
     );
+}
+
+/// The root qdisc kind `tc qdisc show` reports for one device.
+fn root_qdisc_kind(show: &str, dev: &str) -> Option<String> {
+    show.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let on_dev = words.windows(2).any(|pair| pair == ["dev", dev]);
+        (words.first() == Some(&"qdisc") && on_dev && words.contains(&"root"))
+            .then(|| words.get(1).map(|kind| kind.to_string()))
+            .flatten()
+    })
 }
 
 fn https_bootstrap(guest: &Guest, payload: &str) {

@@ -26,6 +26,9 @@ try {
   });
   await page.locator("#accepted-policy-status").getByText("Accepted revision", { exact: false }).waitFor();
   stage = "edit";
+  if (input.removeRule) {
+    await policy.getByRole("button", { name: "Remove rule " + input.removeRule, exact: true }).click();
+  }
   if (input.interface) await policy.locator("#policy-interface").selectOption(input.interface);
   if (input.source != null) await policy.locator("#policy-source").fill(input.source);
   if (input.protocol) await policy.locator("#policy-protocol").selectOption(input.protocol);

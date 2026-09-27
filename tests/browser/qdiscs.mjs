@@ -62,7 +62,11 @@ try {
       : "Accepted revision";
   stage = "result";
   await page.locator("#qdisc-result, #route-result").getByText(expected, { exact: false }).waitFor({ timeout: 90_000 });
-  result = { ok: true };
+  stage = "live";
+  await page.reload();
+  await page.locator("#accepted-qdisc-status").getByText("Accepted revision", { exact: false }).waitFor();
+  const live = await page.locator("#qdisc-live").textContent();
+  result = { ok: true, live: live || "" };
 } catch (error) {
   const message = error instanceof Error ? error.message : "traffic shaping editor failed";
   result = { ok: false, stage, error: message.slice(0, 180) };
