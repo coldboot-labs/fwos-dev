@@ -54,6 +54,16 @@ before the live queue changes.
 route through that tunnel. Ordinary status and review text omit the private
 key, and a peer checks that the accepted listen port is bound.
 
+`tests/browser/transfer.mjs` drives network Desired state export and import.
+Export needs the sensitive-file acknowledgement and saves the downloaded file.
+Import sends a file into the private draft, and the driver then reviews and
+applies it. The QEMU guest round-trips a WireGuard key and an edited route and
+listen port. It checks that anonymous export and import get 401 and that
+ordinary views omit the key. Malformed, invalid, and identity-bearing files are
+rejected with the Accepted network unchanged. An administrator created after
+the export survives the import. Peers see the imported route and port only
+after the explicit apply.
+
 `tests/browser/policy.mjs` drives firewall policy through the same private draft
 and apply controls. Peers prove which packets the appliance forwards and which
 it drops, while the UI stays off the WAN.

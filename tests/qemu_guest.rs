@@ -4968,6 +4968,172 @@ fn published_wireguard_ui_listens_and_hides_the_private_key() {
     assert!(tunnels.contains("51821"), "{tunnels}");
 }
 
+fn accepted_revision(session: &fwos_dev::HttpsSession<'_>) -> u64 {
+    let routes: serde_json::Value = serde_json::from_str(&session.get("/api/routes").unwrap()).unwrap();
+    routes["revision"].as_u64().expect("Accepted revision")
+}
+
+#[test]
+fn published_network_export_and_import_round_trip_through_the_ui() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("198.51.100.0/24", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    wan_peer.add_address("198.51.100.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    https_bootstrap(
+        &guest,
+        &serde_json::json!({
+            "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+            "interfaces": [
+                {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+                {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+                {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+            ],
+            "ui_exposure": [mgmt],
+            "lan_prefix": "10.56.0.0/24",
+            "dhcp_pool": "10.56.0.100-10.56.0.140"
+        })
+        .to_string(),
+    );
+    guest
+        .browser_configure_wireguard(
+            "apply", "alice", "secret12", "wg0", WG_PRIVATE, "51820", "10.13.13.1/24", "", "",
+        )
+        .expect("secret-bearing WireGuard configuration is accepted");
+    assert!(wait_udp(&lan_peer, "10.56.0.1", 51820));
+
+    // Export is never an unauthenticated download path.
+    for path in ["/api/desired-state/export", "/api/desired-state/import"] {
+        let (code, body) = guest
+            .https_exchange("POST", path, Some(r#"{"acknowledge_sensitive":true}"#), 15)
+            .expect("anonymous transfer response");
+        assert_eq!(code, 401, "{path} must require sign-in: {body}");
+        assert_wireguard_key_hidden(&body);
+    }
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let (code, body) = alice
+        .exchange("POST", "/api/desired-state/export", Some(r#"{"acknowledge_sensitive":false}"#), 15)
+        .unwrap();
+    assert_eq!(code, 400, "export needs the sensitive-file acknowledgement: {body}");
+    assert_wireguard_key_hidden(&body);
+    for path in ["/api/status", "/api/wireguard", "/api/draft", "/api/apply-confirmation", "/api/routes"] {
+        assert_wireguard_key_hidden(&alice.get(path).unwrap());
+    }
+    let revision = accepted_revision(&alice);
+
+    // The exported file holds a network secret; remove it even if the test fails.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("fwos-transfer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveOnDrop(dir.clone());
+    let exported_path = dir.join("exported.toml");
+    guest
+        .browser_transfer_desired_state("export", "alice", "secret12", &exported_path, WG_PRIVATE)
+        .expect("rendered export downloads the network file");
+    let exported = std::fs::read_to_string(&exported_path).unwrap();
+    assert!(exported.starts_with("# SENSITIVE"), "{exported}");
+    assert!(exported.contains(WG_PRIVATE), "export must restore the WireGuard key");
+    assert!(exported.contains("fwos-network-desired-state"));
+    assert!(!exported.contains("secret12") && !exported.contains("alice"), "no Identity configuration");
+
+    // Identity configuration changed after the export must survive the import.
+    let (code, body) = alice
+        .exchange("POST", "/api/administrators", Some(r#"{"username":"bob","password":"secret34"}"#), 15)
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+
+    let write = |name: &str, content: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let malformed = write("malformed.toml", "this is not a network export [");
+    guest
+        .browser_transfer_desired_state("reject", "alice", "secret12", &malformed, WG_PRIVATE)
+        .expect("malformed file is rejected in the page");
+    let invalid = write("invalid.toml", &exported.replace(WG_PRIVATE, "not-a-key"));
+    guest
+        .browser_transfer_desired_state("reject", "alice", "secret12", &invalid, WG_PRIVATE)
+        .expect("invalid network is rejected in the page");
+    let identity = serde_json::json!({
+        "base_revision": revision,
+        "content": format!("administrators = [\"mallory\"]\n{exported}"),
+    });
+    let (code, body) = alice
+        .exchange("POST", "/api/desired-state/import", Some(&identity.to_string()), 30)
+        .unwrap();
+    assert_eq!(code, 400, "a network import cannot carry Identity configuration: {body}");
+    assert_eq!(accepted_revision(&alice), revision, "rejected imports leave Accepted state");
+    assert!(alice.get("/api/draft").unwrap().contains("\"status\":\"none\""));
+    assert!(!lan_peer.ping("198.51.100.2").unwrap());
+
+    assert!(exported.contains("routes = []") && exported.contains("listen_port = 51820"), "{exported}");
+    let edited = exported
+        .replace(
+            "routes = []",
+            "routes = [{ to = \"198.51.100.0/24\", via = \"192.0.2.2\" }]",
+        )
+        .replace("listen_port = 51820", "listen_port = 51821");
+    let edited_path = write("edited.toml", &edited);
+    guest
+        .browser_transfer_desired_state("import", "alice", "secret12", &edited_path, WG_PRIVATE)
+        .expect("valid file becomes the private draft");
+    assert_eq!(accepted_revision(&alice), revision, "import does not apply");
+    assert!(!lan_peer.ping("198.51.100.2").unwrap(), "import does not change forwarding");
+    assert!(wait_udp(&lan_peer, "10.56.0.1", 51820), "import keeps the live tunnel");
+    let draft = alice.get("/api/draft").unwrap();
+    assert_wireguard_key_hidden(&draft);
+    assert!(draft.contains("\"sections\":[\"import\"]"), "{draft}");
+    assert!(draft.contains("198.51.100.0/24") && draft.contains("\"private_key_set\":true"), "{draft}");
+    let again = serde_json::json!({"base_revision": revision, "content": edited});
+    let (code, body) = alice
+        .exchange("POST", "/api/desired-state/import", Some(&again.to_string()), 30)
+        .unwrap();
+    assert_eq!(code, 409, "an import cannot replace a pending draft: {body}");
+    let (code, _) = alice
+        .exchange("POST", "/api/routes/save-and-apply", Some(&serde_json::json!({
+            "base_revision": revision, "action": "add",
+            "route": {"to": "203.0.113.0/24", "via": "192.0.2.2"},
+        }).to_string()), 30)
+        .unwrap();
+    assert_eq!(code, 409, "quick apply still refuses while the imported draft is pending");
+
+    guest
+        .browser_transfer_desired_state("apply-draft", "alice", "secret12", &edited_path, WG_PRIVATE)
+        .expect("reviewed imported draft applies through the shared engine");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision + 1);
+    assert!(lan_peer.ping("198.51.100.2").unwrap(), "imported route forwards");
+    assert!(wait_udp(&lan_peer, "10.56.0.1", 51821), "imported listen port takes effect");
+    assert!(!lan_peer.udp_port_listening("10.56.0.1", 51820).unwrap_or(true));
+    let bob = https_login_admin(&guest, "bob", "secret34");
+    assert!(bob.get("/api/administrators").unwrap().contains("bob"));
+    for path in ["/api/status", "/api/wireguard", "/api/draft", "/api/apply-confirmation"] {
+        assert_wireguard_key_hidden(&alice.get(path).unwrap());
+    }
+    let (code, reexport) = alice
+        .exchange("POST", "/api/desired-state/export", Some(r#"{"acknowledge_sensitive":true}"#), 15)
+        .unwrap();
+    assert_eq!(code, 200);
+    assert!(reexport.contains(WG_PRIVATE) && reexport.contains("listen_port = 51821"));
+}
+
 #[test]
 fn published_qdisc_ui_keeps_forwarding_and_rejects_unknown_kinds() {
     let _guard = guest_lock();

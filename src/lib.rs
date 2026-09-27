@@ -862,6 +862,44 @@ impl Guest {
         Ok(())
     }
 
+    /// Export or import network Desired state through the rendered transfer
+    /// controls. `file` is where an export is saved or the file to import;
+    /// `secret` must never appear on the rendered page.
+    pub fn browser_transfer_desired_state(
+        &self,
+        action: &str,
+        username: &str,
+        password: &str,
+        file: &Path,
+        secret: &str,
+    ) -> Result<(), Error> {
+        let input = serde_json::to_vec(&serde_json::json!({
+            "url": format!("https://127.0.0.1:{}", self.https_port),
+            "action": action,
+            "username": username,
+            "password": password,
+            "file": file,
+            "secret": secret,
+        }))
+        .map_err(|_| Error::from_message("encode transfer browser input"))?;
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/browser/transfer.mjs");
+        let mut command = Command::new("node");
+        command.arg(script);
+        let output = output_with_input(&mut command, &input)
+            .map_err(|error| Error::from_io("run transfer browser driver", error))?;
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Error::from_message("transfer browser driver returned no valid result")
+        })?;
+        if !output.status.success() || result["ok"] != true {
+            return Err(Error::from_message(format!(
+                "rendered network transfer failed at {}: {}",
+                result["stage"].as_str().unwrap_or("driver"),
+                result["error"].as_str().unwrap_or("no browser detail")
+            )));
+        }
+        Ok(())
+    }
+
     /// Drive the published traffic-shaping controls through rendered HTTPS and
     /// return the live qdisc show the page reports afterwards.
     pub fn browser_configure_qdisc(
