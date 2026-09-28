@@ -3977,7 +3977,8 @@ fn published_serial_stages_host_update_then_reboot_applies() {
         help.contains("status")
             && help.contains("restore-previous")
             && help.contains("reboot")
-            && !help.contains("rollback")
+            && help.contains("rollback-image")
+            && !help.lines().any(|l| l.trim() == "rollback")
             && !help.contains("apply <"),
         "v1 recovery help must stay limited while legacy commands remain callable, serial:\n{help}"
     );
@@ -4829,6 +4830,284 @@ fn published_host_update_is_accepted_with_the_wan_unplugged_and_no_acknowledgeme
         "forwarding resumes when the WAN returns"
     );
     assert_no_ssh(&guest, "after an update boot with the WAN unplugged");
+}
+
+/// Wait until appliance health has accepted the update boot.
+fn wait_update_accepted(guest: &Guest) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let status = host_update_status(guest);
+        if status["last_update"]["outcome"] == "accepted" {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "appliance health must accept the working Release: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+/// At the console's `admin:` prompt, obsolete identities are refused.
+fn assert_serial_logins_refused(guest: &Guest, from: usize, obsolete: &[(&str, &str)]) {
+    let prompt = serial_wait(guest, from, 600, |text| text.contains("admin:"));
+    assert!(
+        prompt.contains("admin:") && !prompt.contains("FWOS Bootstrap console"),
+        "authenticated console, not Bootstrap: {prompt}"
+    );
+    for (user, password) in obsolete {
+        let asked = serial_cmd(guest, &format!("{user}\n"), 15, |text| {
+            text.contains("password:")
+        });
+        assert!(asked.contains("password:"), "console login prompt: {asked}");
+        let sent = guest.serial().len();
+        guest
+            .serial_write(&format!("{password}\n"))
+            .expect("submit obsolete console password");
+        let denied = serial_wait(guest, sent, 15, |text| text.contains("login failed"));
+        assert!(
+            denied.contains("login failed"),
+            "{user}'s obsolete credential must be refused: {denied}"
+        );
+    }
+}
+
+/// The LAN peer leases from `pool` (last octets) and forwards to the WAN.
+fn assert_lease_in_pool_and_forwarding(
+    lan_peer: &NetworkPeer,
+    pool: std::ops::RangeInclusive<u8>,
+    when: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let offered = wait_dhcp_offer(lan_peer);
+        if pool.contains(&offer_octet(&offered)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{when}: lease {offered} must come from {pool:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    assert!(
+        wait_ping(lan_peer, "192.0.2.2"),
+        "{when}: LAN peer must forward to the WAN"
+    );
+}
+
+#[test]
+fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and_current_identity(
+) {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_next_release()
+        .expect("Workstation-local registry must serve a newer Release");
+    let image = registry.guest_image();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    let guest = boot_host_update_guest(&lan_peer, &wan_peer);
+    assert_lan_services_and_forwarding(&lan_peer, "before the update");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/administrators",
+            Some(r#"{"username":"bob","password":"secret34"}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let revision = accepted_revision(&alice);
+    let accepted_network = accepted_interfaces(&alice);
+
+    let (previous, from) = stage_and_reboot_from_ui(&guest, &lan_peer, &image, || ());
+    wait_ui_reboot(&guest, from);
+    let accepted = wait_update_accepted(&guest);
+    assert!(
+        accepted["booted"].as_str().unwrap().contains("fwos:next"),
+        "{accepted}"
+    );
+    assert_eq!(accepted["rollback"], previous.as_str(), "{accepted}");
+
+    // On the accepted newer Release: a network change, and Identity changes
+    // that the image rollback must not revert.
+    guest
+        .browser_configure_lan_services(
+            "apply",
+            "alice",
+            "secret12",
+            "10.56.0.0/24",
+            "10.56.0.150-10.56.0.160",
+            "",
+        )
+        .expect("the newer Release applies a DHCP pool change");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision + 1);
+    for (path, body) in [
+        ("/api/administrators/remove", r#"{"username":"bob"}"#),
+        (
+            "/api/administrators/password",
+            r#"{"username":"alice","password":"secret56"}"#,
+        ),
+    ] {
+        let (code, reply) = alice.exchange("POST", path, Some(body), 15).unwrap();
+        assert_eq!(code, 200, "{path}: {reply}");
+    }
+    assert_lease_in_pool_and_forwarding(&lan_peer, 150..=160, "on the newer Release");
+
+    // The UI path is lost: its NIC's cable is pulled.
+    guest
+        .qemu_set_user_net_link(false)
+        .expect("pull the UI NIC cable");
+    https_must_not_answer(&guest, 5, "with the UI NIC unplugged");
+
+    let console_from = guest.serial().rfind("FWOS Appliance CLI").unwrap_or(from);
+    assert_serial_logins_refused(
+        &guest,
+        console_from,
+        &[("alice", "secret12"), ("bob", "secret34")],
+    );
+    serial_login_admin_from(&guest, "alice", "secret56", guest.serial().len());
+    let help = serial_cmd(&guest, "help\n", 15, |text| text.contains("logout"));
+    assert!(
+        help.contains("rollback-image")
+            && help.contains("the network is unchanged")
+            && help.contains("restore-previous")
+            && help.contains("the Host image is unchanged")
+            && !help.contains("apply <"),
+        "the recovery menu distinguishes image rollback from network restoration: {help}"
+    );
+    let status = serial_cmd(&guest, "status\n", 30, |text| {
+        text.contains("Previous Host image") && text.contains("fwos>")
+    });
+    assert!(
+        status.contains(&format!(
+            "Previous Host image available for rollback-image: {previous}"
+        )) && json_status_image(&status, "booted")
+            .unwrap_or_default()
+            .contains("fwos:next"),
+        "console status names the rollback target: {status}"
+    );
+    assert!(
+        status.contains("fwos:next accepted"),
+        "console status reports the accepted update: {status}"
+    );
+
+    let queued = serial_cmd(&guest, "rollback-image\n", 60, |text| {
+        text.contains("Host image rollback") && text.contains("fwos>")
+    });
+    assert!(
+        queued.contains(&format!(
+            "Host image rollback queued: the next boot runs the previous Host image {previous}"
+        )),
+        "manual image rollback outcome: {queued}"
+    );
+    assert!(
+        queued.contains("Reboot required: enter reboot")
+            && queued.contains("Accepted network revision is unchanged")
+            && !queued.contains("unknown command"),
+        "the outcome names the explicit reboot and keeps the network: {queued}"
+    );
+    // Queued, not activated: the newer Release keeps running until reboot.
+    let still = serial_cmd(&guest, "status\n", 30, |text| {
+        text.contains("Host image rollback queued") && text.contains("fwos>")
+    });
+    assert!(
+        still.contains(&format!(
+            "Host image rollback queued: the next boot runs {previous}"
+        )) && still.contains("Reboot required")
+            && json_status_image(&still, "booted")
+                .unwrap_or_default()
+                .contains("fwos:next"),
+        "rollback waits for the explicit reboot: {still}"
+    );
+    assert!(wait_ping(&lan_peer, "192.0.2.2"), "forwarding continues");
+
+    let from_rb = guest.serial().len();
+    guest
+        .serial_write("reboot\n")
+        .expect("explicit console reboot into the previous Host image");
+    assert_serial_logins_refused(
+        &guest,
+        from_rb,
+        &[("alice", "secret12"), ("bob", "secret34")],
+    );
+    let serial = guest.serial();
+    let rebooted = &serial[from_rb..];
+    assert!(
+        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        "the image rollback reboot must not reopen Bootstrap: {rebooted}"
+    );
+    serial_login_admin_from(&guest, "alice", "secret56", guest.serial().len());
+    let back = serial_cmd(&guest, "status\n", 60, |text| {
+        text.contains("netd: running") && text.contains("Previous Host image")
+    });
+    assert_eq!(
+        json_status_image(&back, "booted").unwrap_or_default(),
+        previous,
+        "the previous Host image is booted: {back}"
+    );
+    assert!(
+        json_status_image(&back, "rollback")
+            .unwrap_or_default()
+            .contains("fwos:next")
+            && !back.contains("rollback queued")
+            && !back.contains("Reboot required")
+            && back.contains(&format!("Accepted network revision: {}", revision + 1))
+            && back.contains("bootstrapped"),
+        "image rollback keeps the Accepted network revision: {back}"
+    );
+    // Prior Release, current network, with the UI still unreachable.
+    assert_lease_in_pool_and_forwarding(&lan_peer, 150..=160, "after the image rollback");
+
+    guest
+        .qemu_set_user_net_link(true)
+        .expect("restore the UI NIC cable");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !https_up(&guest) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the UI must answer again on the previous Release; serial:\n{}",
+            guest.serial()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    let status = host_update_status_as(&guest, "secret56");
+    assert_eq!(status["booted"], previous.as_str(), "{status}");
+    assert_eq!(status["reboot_required"], false, "{status}");
+    assert_eq!(status["rollback_queued"], false, "{status}");
+    for (username, password) in [("alice", "secret12"), ("bob", "secret34")] {
+        let credentials =
+            serde_json::json!({"source": "local", "username": username, "password": password});
+        let (code, _) = guest
+            .https_exchange("POST", "/api/login", Some(&credentials.to_string()), 15)
+            .expect("obsolete identity response after image rollback");
+        assert_eq!(code, 401, "{username}'s obsolete credential must stay refused");
+    }
+    let alice = https_login_admin(&guest, "alice", "secret56");
+    let ui_status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/status").unwrap()).unwrap();
+    assert_eq!(ui_status["bootstrapped"], true, "rollback cannot reopen Bootstrap");
+    assert_eq!(accepted_revision(&alice), revision + 1);
+
+    // Restoring the previous network revision is the separate operation, and
+    // leaves the Host image alone.
+    let restored = serial_cmd(&guest, "restore-previous\n", 120, |text| {
+        text.contains("\"outcome\"")
+    });
+    assert!(
+        restored.contains("\"outcome\":\"accepted\"")
+            || restored.contains("\"outcome\": \"accepted\""),
+        "console network restoration outcome: {restored}"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret56");
+    assert_eq!(accepted_revision(&alice), revision + 2);
+    assert_eq!(accepted_interfaces(&alice), accepted_network);
+    assert_lease_in_pool_and_forwarding(&lan_peer, 100..=140, "after network restoration");
+    let status = host_update_status_as(&guest, "secret56");
+    assert_eq!(status["booted"], previous.as_str(), "{status}");
+    assert_eq!(status["reboot_required"], false, "{status}");
+    assert_no_ssh(&guest, "after manual Host image rollback");
 }
 
 fn peer_https_stays_down(peer: &NetworkPeer, address: &str) {

@@ -428,6 +428,14 @@ impl Guest {
         monitor_error(&response, &format!("QEMU set_link peer{index} {state}"))
     }
 
+    /// Pull or restore the cable of the QEMU user-net NIC, the Workstation's
+    /// HTTPS path to the UI when a guest boots with user net and peers.
+    pub fn qemu_set_user_net_link(&self, up: bool) -> Result<(), Error> {
+        let state = if up { "on" } else { "off" };
+        let response = self.monitor_command(&format!("set_link net0 {state}"))?;
+        monitor_error(&response, &format!("QEMU set_link net0 {state}"))
+    }
+
     fn monitor_command(&self, command: &str) -> Result<String, Error> {
         let mut stream = UnixStream::connect(&self.monitor)
             .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
