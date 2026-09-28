@@ -423,17 +423,19 @@ impl Guest {
     /// Pull or restore the cable of the external peer NIC at `index` (the
     /// order peers were passed at boot), as the guest sees link state.
     pub fn qemu_set_peer_link(&self, index: usize, up: bool) -> Result<(), Error> {
-        let state = if up { "on" } else { "off" };
-        let response = self.monitor_command(&format!("set_link peer{index} {state}"))?;
-        monitor_error(&response, &format!("QEMU set_link peer{index} {state}"))
+        self.qemu_set_link(&format!("peer{index}"), up)
     }
 
     /// Pull or restore the cable of the QEMU user-net NIC, the Workstation's
     /// HTTPS path to the UI when a guest boots with user net and peers.
     pub fn qemu_set_user_net_link(&self, up: bool) -> Result<(), Error> {
+        self.qemu_set_link("net0", up)
+    }
+
+    fn qemu_set_link(&self, netdev: &str, up: bool) -> Result<(), Error> {
         let state = if up { "on" } else { "off" };
-        let response = self.monitor_command(&format!("set_link net0 {state}"))?;
-        monitor_error(&response, &format!("QEMU set_link net0 {state}"))
+        let response = self.monitor_command(&format!("set_link {netdev} {state}"))?;
+        monitor_error(&response, &format!("QEMU set_link {netdev} {state}"))
     }
 
     fn monitor_command(&self, command: &str) -> Result<String, Error> {

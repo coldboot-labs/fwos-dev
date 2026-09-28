@@ -4832,20 +4832,42 @@ fn published_host_update_is_accepted_with_the_wan_unplugged_and_no_acknowledgeme
     assert_no_ssh(&guest, "after an update boot with the WAN unplugged");
 }
 
+/// Poll `probe` every `every` until it yields a value; after `secs`, fail
+/// with `what` and the probe's last observation.
+fn wait_until<T>(
+    secs: u64,
+    every: std::time::Duration,
+    what: &str,
+    mut probe: impl FnMut() -> Result<T, String>,
+) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match probe() {
+            Ok(value) => return value,
+            Err(last) => assert!(
+                std::time::Instant::now() < deadline,
+                "{what}; last observed: {last}"
+            ),
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// Wait until appliance health has accepted the update boot.
 fn wait_update_accepted(guest: &Guest) -> serde_json::Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    loop {
-        let status = host_update_status(guest);
-        if status["last_update"]["outcome"] == "accepted" {
-            return status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "appliance health must accept the working Release: {status}"
-        );
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
+    wait_until(
+        300,
+        std::time::Duration::from_secs(5),
+        "appliance health must accept the working Release",
+        || {
+            let status = host_update_status(guest);
+            if status["last_update"]["outcome"] == "accepted" {
+                Ok(status)
+            } else {
+                Err(status.to_string())
+            }
+        },
+    )
 }
 
 /// At the console's `admin:` prompt, obsolete identities are refused.
@@ -4878,18 +4900,19 @@ fn assert_lease_in_pool_and_forwarding(
     pool: std::ops::RangeInclusive<u8>,
     when: &str,
 ) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        let offered = wait_dhcp_offer(lan_peer);
-        if pool.contains(&offer_octet(&offered)) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{when}: lease {offered} must come from {pool:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    wait_until(
+        120,
+        std::time::Duration::from_secs(2),
+        &format!("{when}: the lease must come from {pool:?}"),
+        || {
+            let offered = wait_dhcp_offer(lan_peer);
+            if pool.contains(&offer_octet(&offered)) {
+                Ok(())
+            } else {
+                Err(offered)
+            }
+        },
+    );
     assert!(
         wait_ping(lan_peer, "192.0.2.2"),
         "{when}: LAN peer must forward to the WAN"
@@ -4928,6 +4951,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
         "{accepted}"
     );
     assert_eq!(accepted["rollback"], previous.as_str(), "{accepted}");
+    let next = accepted["booted"].as_str().unwrap().to_string();
 
     // On the accepted newer Release: a network change, and Identity changes
     // that the image rollback must not revert.
@@ -4971,7 +4995,8 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     let help = serial_cmd(&guest, "help\n", 15, |text| text.contains("logout"));
     assert!(
         help.contains("rollback-image")
-            && help.contains("the network is unchanged")
+            && help.contains("the Accepted Desired state is unchanged")
+            && help.contains("cancels the queued rollback")
             && help.contains("restore-previous")
             && help.contains("the Host image is unchanged")
             && !help.contains("apply <"),
@@ -5004,7 +5029,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     );
     assert!(
         queued.contains("Reboot required: enter reboot")
-            && queued.contains("Accepted network revision is unchanged")
+            && queued.contains("The Accepted Desired state is unchanged")
             && !queued.contains("unknown command"),
         "the outcome names the explicit reboot and keeps the network: {queued}"
     );
@@ -5057,25 +5082,50 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
             && back.contains("bootstrapped"),
         "image rollback keeps the Accepted network revision: {back}"
     );
+    assert!(
+        back.contains(&format!(
+            "Last Host image change: manually rolled back from {next} to {previous}"
+        )),
+        "the booted previous Release reports the manual rollback: {back}"
+    );
     // Prior Release, current network, with the UI still unreachable.
     assert_lease_in_pool_and_forwarding(&lan_peer, 150..=160, "after the image rollback");
 
     guest
         .qemu_set_user_net_link(true)
         .expect("restore the UI NIC cable");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while !https_up(&guest) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the UI must answer again on the previous Release; serial:\n{}",
-            guest.serial()
-        );
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
+    wait_until(
+        120,
+        std::time::Duration::from_secs(2),
+        "the UI must answer again on the previous Release",
+        || {
+            https_up(&guest)
+                .then_some(())
+                .ok_or_else(|| serial_tail(&guest.serial(), 4000).to_string())
+        },
+    );
     let status = host_update_status_as(&guest, "secret56");
     assert_eq!(status["booted"], previous.as_str(), "{status}");
     assert_eq!(status["reboot_required"], false, "{status}");
     assert_eq!(status["rollback_queued"], false, "{status}");
+    assert_eq!(
+        status["last_update"],
+        serde_json::json!({"release": next, "outcome": "rolled_back",
+            "reason": "manual rollback",
+            "manual": {"to": previous, "pre_update_network": false},
+            "network": null}),
+        "{status}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret56", "")
+        .expect("rendered manual rollback outcome");
+    assert_eq!(
+        rendered["health"].as_str().unwrap(),
+        format!(
+            "The Host image was manually rolled back from {next} to {previous}. The Accepted network was kept."
+        ),
+        "{rendered}"
+    );
     for (username, password) in [("alice", "secret12"), ("bob", "secret34")] {
         let credentials =
             serde_json::json!({"source": "local", "username": username, "password": password});
