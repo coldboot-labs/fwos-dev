@@ -91,14 +91,20 @@ LAN peer autoconfiguring from the appliance's RA and its own address seen on
 the WAN (no NAT66).
 
 `tests/browser/host-update.mjs` drives the rendered Host update panel. The
-`LocalRegistry` fixture serves a newer Release from the Workstation; with
-`serve_on_peer` the same Release is also served from inside an external peer's
+`LocalRegistry` fixture serves a newer Release from the Workstation. With
+`serve_on_peer`, the same Release is also served from inside an external peer's
 namespace. The IPv6-only update test puts that registry, an ISP-like resolver
-(`serve_dns`, dnsmasq with a `registry.fwos.test` AAAA record), and a DHCPv6
-upstream that names the resolver on the WAN peer. Nothing is delegated or
-routed to the appliance. The guest stages from the UI by registry name. The
-resolver's query log and the registry's request log show that the lookup and
-every download came from the appliance's WAN address.
+(`serve_dns`, dnsmasq with a `registry.fwos.test` AAAA record), and an upstream
+whose SLAAC Router Advertisements name the resolver (RDNSS) on the WAN peer.
+Nothing is delegated or routed to the appliance. The appliance uses plain HTTP
+only for IP-literal registries, and an image reference cannot hold an IPv6
+literal. So the guest stages a Workstation IPv4-literal reference through
+`redirect_blobs_to` (`tests/peer/redirect-registry.py`). That front serves the
+manifests and redirects every blob to the WAN registry by name, as public
+registries redirect blobs to storage hosts. The resolver's query log and the
+registry's request log show that the lookup and every blob download came from
+the appliance's WAN address. The update status shows that the controller ran
+in the Host netns and the download worker in `fwd`.
 
 `tests/browser/interfaces.mjs` drives post-bootstrap interface, VLAN, role, and UI
 exposure edits through the same private draft, review, and apply controls.

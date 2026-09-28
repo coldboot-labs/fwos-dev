@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod peer;
-pub use peer::{DiscoveryPackets, NetworkPeer, PendingHttps};
+pub use peer::{DiscoveryPackets, Ipv6Upstream, NetworkPeer, PendingHttps};
+use peer::LoggedChild;
 
 static PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -2889,6 +2890,33 @@ impl LocalRegistry {
         Ok(registry)
     }
 
+    /// Serve this Release's manifests to the guest at a Workstation IP
+    /// literal, but answer every blob download with a redirect to
+    /// `blob_base_url` (for example a registry name only a WAN resolver
+    /// knows), as public registries redirect blobs to storage hosts.
+    pub fn redirect_blobs_to(&self, blob_base_url: &str) -> Result<BlobRedirect, Error> {
+        let port = free_localhost_port()?;
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/peer/redirect-registry.py");
+        let mut command = Command::new("python3");
+        command
+            .arg(script)
+            .arg(port.to_string())
+            .arg(format!("127.0.0.1:{}", self.port))
+            .arg(blob_base_url);
+        let mut front = LoggedChild::spawn(
+            command,
+            &format!("fwos-blob-redirect-{port}.log"),
+            true,
+            "start blob-redirecting registry front",
+        )?;
+        if let Err(error) = wait_tcp("127.0.0.1", port, Duration::from_secs(10)) {
+            front.ensure_running("blob-redirecting registry front")?;
+            return Err(error);
+        }
+        Ok(BlobRedirect { _front: front, port })
+    }
+
     fn podman(&self, verb: &str, context: &str) -> Result<(), Error> {
         let output = Command::new("sudo")
             .args(["podman", verb, &self.container])
@@ -2906,7 +2934,51 @@ impl LocalRegistry {
     }
 }
 
+/// A registry front from [`LocalRegistry::redirect_blobs_to`].
+pub struct BlobRedirect {
+    _front: LoggedChild,
+    port: u16,
+}
+
+impl BlobRedirect {
+    /// Image ref the guest uses (QEMU user-net host is 10.0.2.2).
+    pub fn guest_image(&self) -> String {
+        format!("10.0.2.2:{}/fwos:next", self.port)
+    }
+}
+
 const PEER_REGISTRY_PORT: u16 = 5000;
+
+/// One request in a registry's log.
+#[derive(Debug, Clone)]
+pub struct RegistryRequest {
+    /// The client address the registry saw.
+    pub client: std::net::IpAddr,
+    /// The Host header, i.e. the name the client used.
+    pub host: String,
+    pub uri: String,
+    pub user_agent: String,
+}
+
+impl RegistryRequest {
+    fn parse(line: &str) -> Option<Self> {
+        let field = |key: &str| {
+            let at = line.find(&format!("{key}=\""))? + key.len() + 2;
+            let end = line[at..].find('"')?;
+            Some(line[at..at + end].to_owned())
+        };
+        Some(Self {
+            client: field("http.request.remoteaddr")?.parse::<SocketAddr>().ok()?.ip(),
+            host: field("http.request.host")?,
+            uri: field("http.request.uri")?,
+            user_agent: field("http.request.useragent").unwrap_or_default(),
+        })
+    }
+
+    pub fn is_blob(&self) -> bool {
+        self.uri.contains("/blobs/")
+    }
+}
 
 /// A copy of a [`LocalRegistry`] served from inside an external peer.
 pub struct PeerRegistry {
@@ -2914,25 +2986,20 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
-    /// Image ref the guest uses, reaching the registry as `host`.
-    pub fn guest_image(&self, host: &str) -> String {
-        format!("{host}:{PEER_REGISTRY_PORT}/fwos:next")
+    /// The registry's base URL when clients reach it as `host`.
+    pub fn url(&self, host: &str) -> String {
+        format!("http://{host}:{PEER_REGISTRY_PORT}")
     }
 
-    /// The registry's own request log: one line per HTTP request, with the
-    /// client address and user agent the registry saw.
-    pub fn requests(&self) -> Result<Vec<String>, Error> {
+    /// The requests this registry served, from its own log.
+    pub fn requests(&self) -> Result<Vec<RegistryRequest>, Error> {
         let output = Command::new("sudo")
             .args(["podman", "logs", &self.container])
             .output()
             .map_err(|e| Error::from_io("reading peer registry log", e))?;
         let text = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
-        Ok(text
-            .lines()
-            .filter(|line| line.contains("http.request.remoteaddr"))
-            .map(str::to_owned)
-            .collect())
+        Ok(text.lines().filter_map(RegistryRequest::parse).collect())
     }
 
     /// Stop serving, as in a registry outage.

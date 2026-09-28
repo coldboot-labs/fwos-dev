@@ -2,8 +2,9 @@
 """External IPv6 upstream for one isolated peer segment.
 
 Sends Router Advertisements for one on-link /64 and answers DHCPv6 for one
-address (IA_NA) and, when configured, one delegated prefix (IA_PD) and one
-DNS recursive name server (option 23). Like an ISP router, it routes a
+address (IA_NA) and, when configured, one delegated prefix (IA_PD). A
+configured DNS recursive name server is named both in DHCPv6 (option 23) and
+in the Router Advertisements (RDNSS). Like an ISP router, it routes a
 delegated prefix to the client's link-local address. Each binding is reported
 as one JSON line on stdout.
 
@@ -47,7 +48,10 @@ def router_advertisement():
     packet = struct.pack("!BBHBBHII", 134, 0, 0, 64, 0, 1800, 0, 0)
     packet += struct.pack("!BB", 1, 1) + mac
     packet += struct.pack("!BBBBIII", 3, 4, 64, 0xC0, 3600, 1800, 0)
-    return packet + ra_network.network_address.packed
+    packet += ra_network.network_address.packed
+    if dns_server is not None:
+        packet += struct.pack("!BBHI", 25, 3, 0, 600) + dns_server.packed
+    return packet
 
 
 def bindings(client, message, source, commit):
