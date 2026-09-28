@@ -2,11 +2,12 @@
 """External IPv6 upstream for one isolated peer segment.
 
 Sends Router Advertisements for one on-link /64 and answers DHCPv6 for one
-address (IA_NA) and, when configured, one delegated prefix (IA_PD). Like an
-ISP router, it routes a delegated prefix to the client's link-local address.
-Each binding is reported as one JSON line on stdout.
+address (IA_NA) and, when configured, one delegated prefix (IA_PD) and one
+DNS recursive name server (option 23). Like an ISP router, it routes a
+delegated prefix to the client's link-local address. Each binding is reported
+as one JSON line on stdout.
 
-usage: ipv6-upstream.py <device> <ra-prefix> <delegated-prefix|none>
+usage: ipv6-upstream.py <device> <ra-prefix> <delegated-prefix|none> [dns-server]
 """
 import ipaddress
 import json
@@ -21,6 +22,7 @@ DEVICE, RA_PREFIX, DELEGATE = sys.argv[1], sys.argv[2], sys.argv[3]
 ifindex = socket.if_nametoindex(DEVICE)
 ra_network = ipaddress.IPv6Network(RA_PREFIX + "/64")
 delegated = None if DELEGATE == "none" else ipaddress.IPv6Network(DELEGATE)
+dns_server = ipaddress.IPv6Address(sys.argv[4]) if len(sys.argv) > 4 else None
 mac = bytes.fromhex(open(f"/sys/class/net/{DEVICE}/address").read().strip().replace(":", ""))
 server_duid = struct.pack("!HH", 3, 1) + mac
 addresses = {}
@@ -112,4 +114,6 @@ while True:
         body += option(13, struct.pack("!H", 0) + b"released")
     else:
         body += bindings(client, message[4:], source.split("%")[0], kind != 1)
+        if dns_server is not None:
+            body += option(23, dns_server.packed)
     dhcp.sendto(bytes([answer]) + transaction + body, (source, port, 0, scope or ifindex))

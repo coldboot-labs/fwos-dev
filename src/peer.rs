@@ -23,6 +23,7 @@ pub struct NetworkPeer {
     owned_uplink: bool,
     discovery: Option<Discovery>,
     upstream: Option<(Child, std::path::PathBuf)>,
+    dns: Option<(Child, std::path::PathBuf)>,
 }
 
 impl NetworkPeer {
@@ -40,6 +41,7 @@ impl NetworkPeer {
             owned_uplink: false,
             discovery: None,
             upstream: None,
+            dns: None,
         };
         let (uid, _) = current_uid_gid()?;
         ip(&["netns", "add", &peer.namespace])?;
@@ -250,6 +252,20 @@ except socket.timeout:
             .map_err(|error| Error::from_io("external-peer UDP probe", error))?;
         Ok(output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains("listening"))
+    }
+
+    /// Report whether a TCP connection to `address` and `port` succeeds from this peer.
+    pub fn tcp_port_open(&self, address: &str, port: u16) -> Result<bool, Error> {
+        let output = self
+            .command("python3")
+            .arg("-c")
+            .arg("import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()")
+            .arg(address)
+            .arg(port.to_string())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| Error::from_io("external-peer TCP probe", error))?;
+        Ok(output.status.success())
     }
 
     /// Ask the appliance DNS resolver and report whether it sends a DNS answer.
@@ -552,6 +568,16 @@ except socket.timeout:
     /// DHCPv6 with an address and, when given, a delegated prefix routed to
     /// the client like an ISP would. `None` answers NoPrefixAvail.
     pub fn start_ipv6_upstream(&mut self, ra_prefix: &str, delegate: Option<&str>) -> Result<(), Error> {
+        self.start_ipv6_upstream_with_dns(ra_prefix, delegate, None)
+    }
+
+    /// Same, and DHCPv6 also names `dns_server` as the recursive resolver.
+    pub fn start_ipv6_upstream_with_dns(
+        &mut self,
+        ra_prefix: &str,
+        delegate: Option<&str>,
+        dns_server: Option<&str>,
+    ) -> Result<(), Error> {
         if self.upstream.is_some() {
             return Err(Error::from_message("IPv6 upstream already started"));
         }
@@ -564,6 +590,7 @@ except socket.timeout:
             .command("python3")
             .arg(script)
             .args(["eth0", ra_prefix, delegate.unwrap_or("none")])
+            .args(dns_server)
             .stdout(file)
             .stderr(Stdio::null())
             .spawn()
@@ -591,6 +618,64 @@ except socket.timeout:
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect())
+    }
+
+    /// Serve DNS on this segment, like an ISP resolver: `name` has the one
+    /// AAAA record `address`, and every query is logged for `dns_queries`.
+    pub fn serve_dns(&mut self, name: &str, address: &str) -> Result<(), Error> {
+        if self.dns.is_some() {
+            return Err(Error::from_message("peer DNS already started"));
+        }
+        let log = std::env::temp_dir().join(format!("fwos-dns-{}.log", self.namespace));
+        let file = std::fs::File::create(&log)
+            .map_err(|error| Error::from_io("peer DNS log", error))?;
+        let mut child = self
+            .command("dnsmasq")
+            .args([
+                "--conf-file=/dev/null",
+                "--no-resolv",
+                "--no-hosts",
+                "--port=53",
+                "--interface=eth0",
+                "--bind-dynamic",
+                "--keep-in-foreground",
+                "--user=root",
+                "--log-queries",
+                "--log-facility=-",
+            ])
+            .arg(format!("--host-record={name},{address}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(file)
+            .spawn()
+            .map_err(|error| Error::from_io("start peer DNS", error))?;
+        std::thread::sleep(Duration::from_millis(300));
+        if let Ok(Some(status)) = child.try_wait() {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            return Err(Error::from_message(format!("peer DNS exited {status}: {text}")));
+        }
+        self.dns = Some((child, log));
+        Ok(())
+    }
+
+    /// Queries the peer DNS answered, as `query[TYPE] name from source` lines.
+    pub fn dns_queries(&self) -> Result<Vec<String>, Error> {
+        let (_, log) = self
+            .dns
+            .as_ref()
+            .ok_or_else(|| Error::from_message("peer DNS not started"))?;
+        let text = std::fs::read_to_string(log)
+            .map_err(|error| Error::from_io("read peer DNS log", error))?;
+        Ok(text
+            .lines()
+            .filter_map(|line| line.find("query[").map(|at| line[at..].to_owned()))
+            .collect())
+    }
+
+    /// The Workstation path of this peer's network namespace.
+    pub(crate) fn namespace_path(&self) -> String {
+        format!("/run/netns/{}", self.namespace)
     }
 
     /// Let this peer autoconfigure from Router Advertisements, like a LAN host.
@@ -757,7 +842,7 @@ impl Drop for NetworkPeer {
             }
         }
         self.discovery.take();
-        if let Some((mut child, log)) = self.upstream.take() {
+        for (mut child, log) in [self.upstream.take(), self.dns.take()].into_iter().flatten() {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(log);

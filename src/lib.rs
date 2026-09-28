@@ -2856,6 +2856,39 @@ impl LocalRegistry {
         wait_tcp("127.0.0.1", self.port, Duration::from_secs(30))
     }
 
+    /// Serve the same pushed Release from inside an external peer's segment,
+    /// on port 5000 of `address`, so the guest reaches it only through that
+    /// peer (for example over an IPv6-only WAN). Dropping the returned
+    /// registry stops only that copy.
+    pub fn serve_on_peer(&self, peer: &NetworkPeer, address: &str) -> Result<PeerRegistry, Error> {
+        let container = format!("{}-peer", self.container);
+        stop_registry(&container);
+        let output = Command::new("sudo")
+            .args(["podman", "run", "-d", "--name", &container, "--network"])
+            .arg(format!("ns:{}", peer.namespace_path()))
+            .args(["--volumes-from", &self.container, REGISTRY_IMAGE])
+            .output()
+            .map_err(|e| Error::from_io("starting peer registry", e))?;
+        if !output.status.success() {
+            return Err(Error::from_message(format!(
+                "podman run peer registry failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let registry = PeerRegistry { container };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !peer.tcp_port_open(address, PEER_REGISTRY_PORT)? {
+            if Instant::now() >= deadline {
+                return Err(Error::from_message(format!(
+                    "peer registry did not listen on [{address}]:{PEER_REGISTRY_PORT}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        Ok(registry)
+    }
+
     fn podman(&self, verb: &str, context: &str) -> Result<(), Error> {
         let output = Command::new("sudo")
             .args(["podman", verb, &self.container])
@@ -2870,6 +2903,47 @@ impl LocalRegistry {
                 String::from_utf8_lossy(&output.stderr).trim()
             )))
         }
+    }
+}
+
+const PEER_REGISTRY_PORT: u16 = 5000;
+
+/// A copy of a [`LocalRegistry`] served from inside an external peer.
+pub struct PeerRegistry {
+    container: String,
+}
+
+impl PeerRegistry {
+    /// Image ref the guest uses, reaching the registry as `host`.
+    pub fn guest_image(&self, host: &str) -> String {
+        format!("{host}:{PEER_REGISTRY_PORT}/fwos:next")
+    }
+
+    /// The registry's own request log: one line per HTTP request, with the
+    /// client address and user agent the registry saw.
+    pub fn requests(&self) -> Result<Vec<String>, Error> {
+        let output = Command::new("sudo")
+            .args(["podman", "logs", &self.container])
+            .output()
+            .map_err(|e| Error::from_io("reading peer registry log", e))?;
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        Ok(text
+            .lines()
+            .filter(|line| line.contains("http.request.remoteaddr"))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Stop serving, as in a registry outage.
+    pub fn stop(&self) {
+        stop_registry(&self.container);
+    }
+}
+
+impl Drop for PeerRegistry {
+    fn drop(&mut self) {
+        stop_registry(&self.container);
     }
 }
 

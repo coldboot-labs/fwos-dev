@@ -4306,6 +4306,167 @@ fn published_ui_stages_host_update_keeps_forwarding_and_reboots_offline() {
     assert_no_ssh(&guest, "after UI Host update");
 }
 
+/// Registry requests the peer registry logged, with the client address each came from.
+fn registry_clients(requests: &[String]) -> Vec<String> {
+    requests
+        .iter()
+        .filter_map(|line| {
+            let at = line.find("http.request.remoteaddr=")? + "http.request.remoteaddr=".len();
+            let value = line[at..].trim_start_matches('"');
+            let end = value.find(['"', ' ']).unwrap_or(value.len());
+            let address = &value[..end];
+            let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+            Some(host.trim_start_matches('[').trim_end_matches(']').to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn published_ui_stages_host_update_over_ipv6_only_wan_without_delegation() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_next_release()
+        .expect("Workstation-local registry must serve a newer Release");
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let mut wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.enable_slaac().unwrap();
+    // The IPv6-only upstream: RA and DHCPv6 (address and resolver, no delegated
+    // prefix), an ISP resolver, and the registry, all reachable only over IPv6.
+    wan_peer.add_address("2001:db8:ff::1/64").unwrap();
+    wan_peer
+        .serve_dns("registry.fwos.test", "2001:db8:ff::1")
+        .expect("WAN resolver");
+    wan_peer
+        .start_ipv6_upstream_with_dns("2001:db8:ff::", None, Some("2001:db8:ff::1"))
+        .expect("external IPv6 upstream without prefix delegation");
+    let peer_registry = registry
+        .serve_on_peer(&wan_peer, "2001:db8:ff::1")
+        .expect("registry on the IPv6-only WAN");
+    let image = peer_registry.guest_image("registry.fwos.test");
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": []}
+        ],
+        "ui_exposure": [mgmt]
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+
+    // The WAN is IPv6-only: DHCPv6 gives it one address and a resolver, and
+    // no prefix is delegated or routed to anything behind it.
+    let live = guest
+        .browser_configure_ipv6("apply", "alice", "secret12", &wan, "dhcpv6", false, "; IPv6 default route")
+        .expect("IPv6-only WAN takes a DHCPv6 address and an RA default route");
+    assert!(live.contains("2001:db8:ff::1000/128"), "DHCPv6 WAN address: {live}");
+    assert!(live.contains("LAN prefix (none): none"), "{live}");
+    assert!(live.contains("There is no NAT66, NPTv6, or NAT64"), "{live}");
+    let wan_address = "2001:db8:ff::1000";
+    let session = https_login_admin(&guest, "alice", "secret12");
+    let revision = accepted_revision(&session);
+    let initial = host_update_status(&guest);
+    let previous = initial["booted"].as_str().unwrap_or_default().to_string();
+    assert!(!previous.is_empty() && !previous.contains("fwos:next"), "{initial}");
+
+    // Stage from the UI. The controller stays in the Host netns, which has no
+    // route to this registry; only its fwd worker can resolve and reach it.
+    let started = guest
+        .browser_host_update("stage", "alice", "secret12", &image)
+        .expect("rendered stage request over the IPv6-only WAN");
+    assert!(started["result"].as_str().unwrap().contains("started"), "{started}");
+    let (staged, probes) = wait_staging_done(&guest, &lan_peer, "10.56.0.1");
+    probes.assert_forwarding_continued("IPv6-only staging");
+    let queries = wan_peer.dns_queries().expect("WAN resolver log");
+    eprintln!("WAN resolver queries: {queries:#?}");
+    eprintln!("DHCPv6 upstream: {:?}", wan_peer.ipv6_upstream_events().unwrap_or_default());
+    assert_eq!(staged["operation"]["state"], "idle", "{staged}");
+    assert_eq!(staged["staged"], image.as_str(), "{staged}");
+    assert_eq!(staged["booted"], previous.as_str(), "{staged}");
+    assert_eq!(staged["reboot_required"], true, "{staged}");
+    assert_eq!(accepted_revision(&https_login_admin(&guest, "alice", "secret12")), revision);
+
+    // Evidence from outside the appliance: the worker resolved the registry
+    // through the WAN resolver, and the download children fetched the Release
+    // from the appliance's own WAN address (no delegated prefix, no NAT66).
+    assert!(
+        queries
+            .iter()
+            .any(|q| q.contains("registry.fwos.test") && q.ends_with(&format!("from {wan_address}"))),
+        "the worker resolves the registry name through the fwd resolver: {queries:?}"
+    );
+    let requests = peer_registry.requests().expect("registry request log");
+    let clients = registry_clients(&requests);
+    let blobs = requests.iter().filter(|r| r.contains("/blobs/")).count();
+    eprintln!(
+        "registry: {} requests ({blobs} blob fetches) from {:?}; first: {}",
+        requests.len(),
+        clients.iter().collect::<std::collections::BTreeSet<_>>(),
+        requests.first().map(String::as_str).unwrap_or("")
+    );
+    assert!(blobs > 0, "the Release layers were downloaded: {requests:?}");
+    assert!(
+        !clients.is_empty() && clients.iter().all(|client| client == wan_address),
+        "every registry request comes from the WAN address: {clients:?}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret12", "")
+        .expect("rendered staged Release");
+    assert!(
+        rendered["status"].as_str().unwrap().contains("fwos:next")
+            && rendered["status"].as_str().unwrap().contains("Reboot required"),
+        "{rendered}"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        lan_peer.global_ipv6().unwrap().is_empty() && lan_peer.ipv6_default_router().unwrap().is_none(),
+        "the LAN still gets no IPv6 rather than translation"
+    );
+
+    // The staged deployment activates on the explicit reboot.
+    let from = guest.serial().len();
+    let rendered = guest
+        .browser_host_update("reboot", "alice", "secret12", "")
+        .expect("rendered reboot onto the staged Release");
+    assert!(rendered["result"].as_str().unwrap().starts_with("Rebooting"), "{rendered}");
+    wait_ui_reboot(&guest, from);
+    let activated = host_update_status(&guest);
+    assert_eq!(activated["booted"], image.as_str(), "{activated}");
+    assert_eq!(activated["rollback"], previous.as_str(), "{activated}");
+    assert_eq!(activated["reboot_required"], false, "{activated}");
+
+    // Registry outage: the worker's download fails, and that is neither a
+    // staged Release nor a network change.
+    peer_registry.stop();
+    let later = image.replace("fwos:next", "fwos:later");
+    let requested = guest
+        .browser_host_update("stage", "alice", "secret12", &later)
+        .expect("rendered stage request during the registry outage");
+    assert!(requested["result"].as_str().unwrap().contains("started"), "{requested}");
+    let (failed, probes) = wait_staging_done(&guest, &lan_peer, "10.56.0.1");
+    probes.assert_forwarding_continued("failed IPv6-only staging");
+    assert_eq!(failed["operation"]["state"], "failed", "{failed}");
+    assert_eq!(failed["booted"], image.as_str(), "{failed}");
+    assert_eq!(failed["staged"], "", "{failed}");
+    assert_eq!(failed["reboot_required"], false, "{failed}");
+    let session = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&session), revision, "Accepted network unchanged");
+    let live = guest
+        .browser_configure_ipv6("observe", "alice", "secret12", &wan, "dhcpv6", false, wan_address)
+        .expect("WAN IPv6 unchanged after the failed download");
+    assert!(live.contains("2001:db8:ff::1000/128"), "{live}");
+    assert_no_ssh(&guest, "after IPv6-only Host update");
+}
+
 #[test]
 fn published_serial_rolls_back_host_update_when_netd_is_dead() {
     let _guard = guest_lock();

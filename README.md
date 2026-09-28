@@ -90,6 +90,16 @@ dual-stack prefix delegation, and an IPv6-only WAN without delegation, with a
 LAN peer autoconfiguring from the appliance's RA and its own address seen on
 the WAN (no NAT66).
 
+`tests/browser/host-update.mjs` drives the rendered Host update panel. The
+`LocalRegistry` fixture serves a newer Release from the Workstation; with
+`serve_on_peer` the same Release is also served from inside an external peer's
+namespace. The IPv6-only update test puts that registry, an ISP-like resolver
+(`serve_dns`, dnsmasq with a `registry.fwos.test` AAAA record), and a DHCPv6
+upstream that names the resolver on the WAN peer. Nothing is delegated or
+routed to the appliance. The guest stages from the UI by registry name. The
+resolver's query log and the registry's request log show that the lookup and
+every download came from the appliance's WAN address.
+
 `tests/browser/interfaces.mjs` drives post-bootstrap interface, VLAN, role, and UI
 exposure edits through the same private draft, review, and apply controls.
 QEMU guests check two-NIC, VLAN-on-one-NIC, and Management NIC topologies with
