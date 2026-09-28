@@ -408,84 +408,16 @@ impl Guest {
 
     /// Remove QEMU's second physical NIC while the appliance is running.
     pub fn qemu_unplug_extra_nic(&self) -> Result<(), Error> {
-        let mut stream = UnixStream::connect(&self.monitor)
-            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut reply = [0u8; 4096];
-        let mut welcome = String::new();
-        while !welcome.ends_with("(qemu) ") {
-            let n = stream
-                .read(&mut reply)
-                .map_err(|e| Error::from_io("reading QEMU monitor prompt", e))?;
-            if n == 0 {
-                return Err(Error::from_message("QEMU monitor closed before prompt"));
-            }
-            welcome.push_str(&String::from_utf8_lossy(&reply[..n]));
-        }
-        stream
-            .write_all(b"device_del fwos-extra0\n")
-            .and_then(|_| stream.flush())
-            .map_err(|e| Error::from_io("QEMU extra NIC hot-unplug", e))?;
-        let mut response = String::new();
-        while !response.ends_with("(qemu) ") {
-            let n = stream
-                .read(&mut reply)
-                .map_err(|e| Error::from_io("reading QEMU hot-unplug reply", e))?;
-            if n == 0 {
-                return Err(Error::from_message("QEMU monitor closed during hot-unplug"));
-            }
-            response.push_str(&String::from_utf8_lossy(&reply[..n]));
-        }
-        if let Some(error) = response.split("Error:").nth(1) {
-            let message = error.split("\r\n").next().unwrap_or(error).trim();
-            return Err(Error::from_message(format!(
-                "QEMU extra NIC hot-unplug failed: {message}"
-            )));
-        }
-        Ok(())
+        let response = self.monitor_command("device_del fwos-extra0")?;
+        monitor_error(&response, "QEMU extra NIC hot-unplug")
     }
 
     /// Restore the task-owned QEMU extra NIC; network startup sees it on the next reset.
     pub fn qemu_replug_extra_nic(&self) -> Result<(), Error> {
-        let mut stream = UnixStream::connect(&self.monitor)
-            .map_err(|e| Error::from_io("connecting QEMU monitor", e))?;
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let mut reply = [0u8; 4096];
-        let mut response = String::new();
-        while !response.ends_with("(qemu) ") {
-            let n = stream
-                .read(&mut reply)
-                .map_err(|e| Error::from_io("reading QEMU monitor prompt", e))?;
-            if n == 0 {
-                return Err(Error::from_message("QEMU monitor closed before prompt"));
-            }
-            response.push_str(&String::from_utf8_lossy(&reply[..n]));
-        }
-        stream
-            .write_all(
-                b"device_add virtio-net-pci,netdev=net1,id=fwos-extra0,bus=fwos-hotplug-port0\n",
-            )
-            .and_then(|_| stream.flush())
-            .map_err(|e| Error::from_io("QEMU extra NIC hot-plug", e))?;
-        response.clear();
-        while !response.ends_with("(qemu) ") {
-            let n = stream
-                .read(&mut reply)
-                .map_err(|e| Error::from_io("reading QEMU hot-plug reply", e))?;
-            if n == 0 {
-                return Err(Error::from_message("QEMU monitor closed during hot-plug"));
-            }
-            response.push_str(&String::from_utf8_lossy(&reply[..n]));
-        }
-        if let Some(error) = response.split("Error:").nth(1) {
-            return Err(Error::from_message(format!(
-                "QEMU extra NIC hot-plug failed: {}",
-                error.split("\r\n").next().unwrap_or(error).trim()
-            )));
-        }
-        Ok(())
+        let response = self.monitor_command(
+            "device_add virtio-net-pci,netdev=net1,id=fwos-extra0,bus=fwos-hotplug-port0",
+        )?;
+        monitor_error(&response, "QEMU extra NIC hot-plug")
     }
 
     /// Pull or restore the cable of the external peer NIC at `index` (the
@@ -493,13 +425,7 @@ impl Guest {
     pub fn qemu_set_peer_link(&self, index: usize, up: bool) -> Result<(), Error> {
         let state = if up { "on" } else { "off" };
         let response = self.monitor_command(&format!("set_link peer{index} {state}"))?;
-        match response.split("Error:").nth(1) {
-            Some(error) => Err(Error::from_message(format!(
-                "QEMU set_link peer{index} {state} failed: {}",
-                error.split("\r\n").next().unwrap_or(error).trim()
-            ))),
-            None => Ok(()),
-        }
+        monitor_error(&response, &format!("QEMU set_link peer{index} {state}"))
     }
 
     fn monitor_command(&self, command: &str) -> Result<String, Error> {
@@ -2845,6 +2771,17 @@ fn iso_extract(iso: &Path, src: &str, dest: &Path) -> Result<(), Error> {
     }
 }
 
+/// A QEMU monitor reply reports failure as an `Error:` line.
+fn monitor_error(response: &str, context: &str) -> Result<(), Error> {
+    match response.split("Error:").nth(1) {
+        Some(error) => Err(Error::from_message(format!(
+            "{context} failed: {}",
+            error.split("\r\n").next().unwrap_or(error).trim()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Workstation-local registry serving a newer Release for Host update tests.
 pub struct LocalRegistry {
     container: String,
@@ -2867,6 +2804,14 @@ impl LocalRegistry {
     /// are not restored, so appliance health must roll it back.
     pub fn publish_broken_lan_services_release() -> Result<Self, Error> {
         Self::publish(NextRelease::BrokenLanServices)
+    }
+
+    /// Same, but the newer Release never reaches its default target (a unit
+    /// in it never finishes starting). netd, the UI, and LAN services run, so
+    /// an administrator can change the network on it before appliance health
+    /// rolls it back.
+    pub fn publish_stalled_boot_release() -> Result<Self, Error> {
+        Self::publish(NextRelease::StalledBoot)
     }
 
     fn publish(release: NextRelease) -> Result<Self, Error> {
@@ -2934,6 +2879,7 @@ enum NextRelease {
     Working,
     DeadNetd,
     BrokenLanServices,
+    StalledBoot,
 }
 
 fn build_next_release(release: NextRelease) -> Result<(), Error> {
@@ -2949,6 +2895,16 @@ fn build_next_release(release: NextRelease) -> Result<(), Error> {
         NextRelease::BrokenLanServices => {
             "FROM localhost/fwos:dev\n\
              RUN rm -f /usr/lib/fwos/addons/kea/usr/bin/kea-dhcp4 \\\n\
+             && printf 'next\\n' > /usr/lib/fwos/release \\\n\
+             && ostree container commit\n"
+        }
+        NextRelease::StalledBoot => {
+            "FROM localhost/fwos:dev\n\
+             RUN printf '[Unit]\\nDescription=Test fixture: a start that never finishes\\n\\n\
+[Service]\\nType=oneshot\\nExecStart=/usr/bin/sleep infinity\\nTimeoutStartSec=infinity\\n' \\\n\
+             > /usr/lib/systemd/system/fwos-fixture-stall.service \\\n\
+             && ln -s ../fwos-fixture-stall.service \\\n\
+             /usr/lib/systemd/system/multi-user.target.wants/fwos-fixture-stall.service \\\n\
              && printf 'next\\n' > /usr/lib/fwos/release \\\n\
              && ostree container commit\n"
         }

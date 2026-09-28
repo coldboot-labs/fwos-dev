@@ -4587,6 +4587,11 @@ fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps
         reason.contains("Desired state not restored") && reason.contains("fwos-kea-dhcp4"),
         "a running netd is not a restored network: {status}"
     );
+    assert_eq!(
+        status["last_update"]["network"],
+        serde_json::json!({"outcome": "unchanged", "revision": revision}),
+        "the failed Release did not change the network: {status}"
+    );
     let rendered = guest
         .browser_host_update("status", "alice", "secret56", "")
         .expect("rendered automatic rollback");
@@ -4616,6 +4621,132 @@ fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps
     let login_from = guest.serial().rfind("FWOS Appliance CLI").unwrap_or(from);
     serial_login_admin_from(&guest, "alice", "secret56", login_from);
     assert_no_ssh(&guest, "after automatic rollback of broken LAN services");
+}
+
+/// Wait until the previous Release's netd reports the pre-update network.
+fn wait_network_restoration(guest: &Guest, password: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        let status = host_update_status_as(guest, password);
+        if !status["last_update"]["network"].is_null() {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "netd must report the pre-update network after the rollback: {status}"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+#[test]
+fn published_host_update_rollback_restores_the_pre_update_network_as_a_new_revision() {
+    let _guard = guest_lock();
+    let registry = LocalRegistry::publish_stalled_boot_release()
+        .expect("Workstation-local registry must serve a Release that never finishes booting");
+    let image = registry.guest_image();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    let guest = boot_host_update_guest(&lan_peer, &wan_peer);
+    assert_lan_services_and_forwarding(&lan_peer, "before the update");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let revision = accepted_revision(&alice);
+    let accepted_network = accepted_interfaces(&alice);
+    let accepted_services = alice.get("/api/lan-services").expect("Accepted LAN services");
+
+    let (previous, from) = stage_and_reboot_from_ui(&guest, &lan_peer, &image, || ());
+    wait_ui_reboot(&guest, from);
+
+    // The failed Release serves the UI and applies network changes, but never
+    // reaches its default target. An administrator changes the DHCP pool and
+    // her password on it before appliance health decides.
+    let failed = host_update_status(&guest);
+    assert!(
+        failed["booted"].as_str().unwrap().contains("fwos:next"),
+        "{failed}"
+    );
+    guest
+        .browser_configure_lan_services(
+            "apply",
+            "alice",
+            "secret12",
+            "10.56.0.0/24",
+            "10.56.0.150-10.56.0.160",
+            "",
+        )
+        .expect("the failed Release applies a DHCP pool change");
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    assert_eq!(accepted_revision(&alice), revision + 1, "change Accepted on the failed Release");
+    let leased = wait_dhcp_offer(&lan_peer);
+    assert!(
+        (150..=160).contains(&offer_octet(&leased)),
+        "the failed Release serves its own pool: {leased}"
+    );
+    let (code, body) = alice
+        .exchange(
+            "POST",
+            "/api/administrators/password",
+            Some(r#"{"username":"alice","password":"secret56"}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200, "{body}");
+    let still_failed = host_update_status_as(&guest, "secret56");
+    assert!(
+        still_failed["booted"].as_str().unwrap().contains("fwos:next"),
+        "changes must be made on the failed Release: {still_failed}"
+    );
+
+    // No operator action: appliance health reboots into the previous Release,
+    // which restores the pre-update network as a new Accepted revision.
+    let rolled = serial_wait(&guest, from, 600, |text| {
+        text.matches("FWOS Appliance CLI").count() >= 2
+    });
+    assert!(
+        rolled.matches("FWOS Appliance CLI").count() >= 2,
+        "failed appliance health must reboot into the previous bootc deployment: {rolled}"
+    );
+    let status = wait_network_restoration(&guest, "secret56");
+    assert_eq!(status["booted"], previous.as_str(), "{status}");
+    assert_eq!(status["last_update"]["outcome"], "rolled_back", "{status}");
+    assert_eq!(
+        status["last_update"]["reason"], "default target not reached",
+        "{status}"
+    );
+    assert_eq!(
+        status["last_update"]["network"],
+        serde_json::json!({"outcome": "restored", "revision": revision + 2}),
+        "{status}"
+    );
+    let rendered = guest
+        .browser_host_update("status", "alice", "secret56", "")
+        .expect("rendered automatic rollback");
+    assert!(
+        rendered["health"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("restored as Accepted revision {}", revision + 2)),
+        "{rendered}"
+    );
+    let alice = https_login_admin(&guest, "alice", "secret56");
+    assert_eq!(accepted_revision(&alice), revision + 2);
+    assert_eq!(accepted_interfaces(&alice), accepted_network);
+    let services = alice.get("/api/lan-services").expect("Accepted LAN services");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&services).unwrap()["dhcp_pool"],
+        serde_json::from_str::<serde_json::Value>(&accepted_services).unwrap()["dhcp_pool"],
+        "pre-update pool is Accepted again: {services}"
+    );
+    // Effective prior networking: leases from the pre-update pool, forwarding.
+    assert_lan_services_and_forwarding(&lan_peer, "after the network restoration");
+
+    // Identity configuration is current, not reverted with the network.
+    let old = serde_json::json!({"source": "local", "username": "alice", "password": "secret12"});
+    match guest.https_login(&old.to_string()) {
+        Ok(_) => panic!("the obsolete password must not return with the network"),
+        Err(error) => assert!(error.to_string().contains("401"), "{error}"),
+    }
+    assert_no_ssh(&guest, "after restoring the pre-update network");
 }
 
 #[test]
