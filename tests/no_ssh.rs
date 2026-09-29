@@ -54,6 +54,16 @@ fn rust_under(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The source without its `#[cfg(test)] mod tests`, whose fixtures may
+/// legitimately name port 22 (e.g. an operator firewall rule).
+fn product_code(source: &str) -> String {
+    let marker = format!("#[cfg({})]\nmod tests", "test");
+    match source.find(&marker) {
+        Some(index) => source[..index].to_string(),
+        None => source.to_string(),
+    }
+}
+
 fn hits(haystack: &str, needle: &str) -> bool {
     haystack.contains(needle)
 }
@@ -174,7 +184,7 @@ fn sshd_is_not_a_v1_product() {
     );
 
     let src = src_dir();
-    let netd = read(&src.join("src/netd.rs"));
+    let netd = product_code(&read(&src.join("src/netd.rs")));
     assert!(
         !hits(&netd, &sshd_stamp()),
         "netd still writes an sshd-mgmt stamp"

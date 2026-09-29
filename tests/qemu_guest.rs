@@ -706,14 +706,7 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
     let reference = ui_import_draft(&alice, &replacement);
     let from = guest.serial().len();
     let interrupted = std::thread::scope(|scope| {
-        let apply = scope.spawn(|| {
-            alice.exchange(
-                "POST",
-                "/api/draft/apply",
-                Some(&reference.to_string()),
-                60,
-            )
-        });
+        let apply = scope.spawn(|| send_draft_apply(&alice, &reference, 60));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !lan_peer
             .ping("203.0.113.2")
@@ -835,14 +828,7 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
     let reference = ui_import_draft(&bob, &replacement);
     let from = guest.serial().len();
     let interrupted = std::thread::scope(|scope| {
-        let apply = scope.spawn(|| {
-            bob.exchange(
-                "POST",
-                "/api/draft/apply",
-                Some(&reference.to_string()),
-                60,
-            )
-        });
+        let apply = scope.spawn(|| send_draft_apply(&bob, &reference, 60));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !lan_peer
             .ping("203.0.113.2")
@@ -911,8 +897,14 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
         status.contains("Recovery required"),
         "console must name in-flight recovery: {status}"
     );
-    // No other apply can run around recovery: the UI is reached through the
-    // blocked forwarding path, and the recovery menu has no apply.
+    // No other apply can reach netd during failed restoration, by design:
+    // the UI (in `mgmt`) is reached only through `fwd`'s forwarding path,
+    // which the recovery guard blocks; the recovery menu has no apply; and
+    // v1 has no SSH, Host shell, or other client of netd's socket. netd's
+    // own refusal of every apply path while recovery is pending is the
+    // unit test `every_apply_path_is_refused_while_recovery_is_pending` in
+    // fwos-src. The one netd request still reachable here, restore-previous,
+    // is refused below while restoration cannot succeed.
     https_must_not_answer(&guest, 10, "UI while restoration has failed");
     let excluded = serial_cmd(&guest, "apply {}\n", 15, |text| {
         text.contains("unknown command")
@@ -1723,9 +1715,8 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
     // A complete-state import can change more than routes. Add a WAN alias,
     // then induce a later WireGuard runtime failure by targeting the real WAN
     // NIC as though it were a WireGuard link. Recovery must remove the alias.
-    // A failed draft stays private to its administrator, so each failing
-    // import below is by a separate administrator, and carol, without a
-    // draft, uses the LAN services page.
+    // A failed draft stays private and pending for its administrator (see
+    // dave below), so each failing import is by a separate administrator.
     for (name, password) in [("bob", "bob-secret"), ("carol", "carol-secret"), ("dave", "dave-secret")] {
         ui_create_administrator(&session, name, password);
     }
@@ -1838,10 +1829,30 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "pool B offer after rejected Kea config: {offer_after_host_failure}"
     );
 
-    // Dave revises his retained failed draft to pool C with the invalid
-    // tunnel, and applies it again.
+    // Dave's failed draft stays pending on the unchanged Accepted revision.
+    // Reconciliation only rebases a stale draft, so it cannot clear it, and
+    // a new import is refused while it is pending: his way forward is to
+    // revise that draft (here to pool C with the invalid tunnel) and apply
+    // it again. The other failing import is therefore bob's, and carol,
+    // without a draft, uses the LAN services page.
     let draft: serde_json::Value = serde_json::from_str(&dave.get("/api/draft").unwrap()).unwrap();
     assert_eq!(draft["status"], "pending", "failed draft stays private: {draft}");
+    let reconcile = serde_json::json!({
+        "base_revision": draft["base_revision"], "version": draft["version"],
+        "accepted_revision": draft["base_revision"],
+    });
+    let (code, body) = dave
+        .exchange("POST", "/api/draft/reconcile", Some(&reconcile.to_string()), 30)
+        .expect("reconcile reply");
+    assert_eq!(code, 409, "a failed draft on the current revision is not stale: {body}");
+    let request = serde_json::json!({
+        "base_revision": draft["base_revision"],
+        "content": network_export_file(&accepted_b),
+    });
+    let (code, body) = dave
+        .exchange("POST", "/api/desired-state/import", Some(&request.to_string()), 30)
+        .expect("import reply");
+    assert_eq!(code, 409, "an import cannot replace the pending failed draft: {body}");
     let revised = serde_json::json!({
         "base_revision": draft["base_revision"], "version": draft["version"],
         "services": {"lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.130-10.56.0.159"},
@@ -1902,6 +1913,10 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         )
         .expect("LAN services apply reply");
     assert_eq!(code, 200, "accepted DHCP disablement: {disabled}");
+    assert!(
+        disabled.contains("\"outcome\":\"accepted\""),
+        "accepted DHCP disablement: {disabled}"
+    );
     assert!(
         lan_peer
             .dhcp_offer()
@@ -3111,17 +3126,24 @@ fn ui_apply_draft(
     session: &fwos_dev::HttpsSession<'_>,
     reference: &serde_json::Value,
 ) -> (u16, serde_json::Value) {
-    let (code, body) = session
-        .exchange(
-            "POST",
-            "/api/draft/apply",
-            Some(&reference.to_string()),
-            150,
-        )
-        .expect("draft apply reply");
+    let (code, body) = send_draft_apply(session, reference, 150).expect("draft apply reply");
     let outcome = serde_json::from_str(&body)
         .unwrap_or_else(|_| panic!("draft apply outcome is not JSON ({code}): {body}"));
     (code, outcome)
+}
+
+/// Send the draft apply; an interrupted appliance may never answer it.
+fn send_draft_apply(
+    session: &fwos_dev::HttpsSession<'_>,
+    reference: &serde_json::Value,
+    max_time_secs: u64,
+) -> Result<(u16, String), fwos_dev::Error> {
+    session.exchange(
+        "POST",
+        "/api/draft/apply",
+        Some(&reference.to_string()),
+        max_time_secs,
+    )
 }
 
 /// Complete Desired state, imported and applied through the UI: the v1
@@ -3132,6 +3154,21 @@ fn ui_import_and_apply(
 ) -> (u16, serde_json::Value) {
     let reference = ui_import_draft(session, desired);
     ui_apply_draft(session, &reference)
+}
+
+/// The plaintext network export file from the UI (sensitive: it includes keys).
+fn ui_export_file(session: &fwos_dev::HttpsSession<'_>) -> String {
+    let (code, body) = session
+        .exchange(
+            "POST",
+            "/api/desired-state/export",
+            Some(r#"{"acknowledge_sensitive":true}"#),
+            15,
+        )
+        .expect("export reply");
+    assert_eq!(code, 200, "network export");
+    let reply: serde_json::Value = serde_json::from_str(&body).expect("export JSON");
+    reply["content"].as_str().expect("export file content").to_string()
 }
 
 /// Create a local administrator through the UI's authenticated API.
@@ -3838,6 +3875,16 @@ fn published_three_nic_mgmt_https_after_bootstrap() {
             .any(|l| l.trim().starts_with("UI exposure:") && l.split_whitespace().any(|w| w == mgmt_nic)),
         "UI exposure after apply includes the Management NIC, serial:\n{shown}"
     );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let exported = ui_export_file(&alice);
+    assert!(
+        exported.contains(&format!("name = \"{mgmt_nic}\"")) && exported.contains("role = \"mgmt\""),
+        "Accepted Desired state keeps the Management NIC:\n{exported}"
+    );
+    assert!(
+        !exported.contains("placement"),
+        "Desired state must not move the Management NIC into the Management netns:\n{exported}"
+    );
 }
 
 /// The shipped v1 operator console is the Appliance console: Bootstrap, then
@@ -3875,7 +3922,7 @@ fn published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli() {
         "Bootstrap console help, serial:\n{help}"
     );
     assert!(!help.contains("update"), "Bootstrap console help: {help}");
-    for retired in ["update 10.0.2.2:5000/fwos:next", "apply {}", "show"] {
+    for retired in ["update 10.0.2.2:5000/fwos:next", "apply {}", "show", "rollback"] {
         let out = serial_cmd(&guest, &format!("{retired}\n"), 15, |t| {
             t.contains("unknown command")
         });
@@ -3936,9 +3983,7 @@ fn published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli() {
         "stage 10.0.2.2:5000/fwos:next".to_string(),
     ];
     for retired in &retired_commands {
-        let out = serial_cmd(&guest, &format!("{retired}\n"), 15, |t| {
-            t.contains("unknown command") && t.contains("recovery>")
-        });
+        let out = recovery_cmd(&guest, &format!("{retired}\n"), 15, "unknown command");
         assert!(
             out.contains("unknown command"),
             "recovery must not offer {retired:?}, serial:\n{out}"
@@ -3974,17 +4019,7 @@ fn published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli() {
     let (code, applied) = ui_import_and_apply(&alice, &full);
     assert_eq!(code, 200, "{applied}");
     assert_eq!(applied["outcome"], "accepted", "{applied}");
-    let (code, exported) = alice
-        .exchange(
-            "POST",
-            "/api/desired-state/export",
-            Some(r#"{"acknowledge_sensitive":true}"#),
-            15,
-        )
-        .unwrap();
-    assert_eq!(code, 200);
-    let exported: serde_json::Value = serde_json::from_str(&exported).expect("export JSON");
-    let exported = exported["content"].as_str().expect("export file content");
+    let exported = ui_export_file(&alice);
     for expected in ["name = \"wg0\"", "198.51.100.0/24", "203.0.113.50", "fq_codel", WG_PRIVATE] {
         assert!(
             exported.contains(expected),
@@ -4013,8 +4048,8 @@ fn published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli() {
     assert_no_ssh(&guest, "after the v1 console scope checks");
 }
 
-/// Stage `image` from the rendered UI and wait until staging ends.
-fn stage_from_ui(guest: &Guest, image: &str) -> serde_json::Value {
+/// Start staging `image` from the rendered UI.
+fn start_stage_from_ui(guest: &Guest, image: &str) {
     let started = guest
         .browser_host_update("stage", "alice", "secret12", image)
         .expect("rendered stage request");
@@ -4022,19 +4057,12 @@ fn stage_from_ui(guest: &Guest, image: &str) -> serde_json::Value {
         started["result"].as_str().unwrap_or_default().contains("started"),
         "{started}"
     );
-    wait_until(
-        1200,
-        std::time::Duration::from_secs(5),
-        "Host update staging must finish",
-        || {
-            let status = host_update_status(guest);
-            if status["operation"]["state"] == "staging" {
-                Err(status.to_string())
-            } else {
-                Ok(status)
-            }
-        },
-    )
+}
+
+/// Stage `image` from the rendered UI and wait until staging ends.
+fn stage_from_ui(guest: &Guest, image: &str) -> serde_json::Value {
+    start_stage_from_ui(guest, image);
+    wait_staging_done_probing(guest, None).0
 }
 
 #[test]
@@ -4076,9 +4104,7 @@ fn published_ui_staged_host_update_activates_on_console_reboot_and_rolls_back_fr
 
     // The recovery menu reports the staged Host update, and its reboot
     // activates it.
-    let still = serial_cmd(&guest, "status\n", 20, |t| {
-        t.contains("fwos-box") && t.contains("recovery>") && t.contains("Host update staged")
-    });
+    let still = recovery_cmd(&guest, "status\n", 20, "Host update staged");
     assert!(
         still.contains("Host update staged: the next boot runs")
             && still.contains("Reboot required"),
@@ -4147,9 +4173,7 @@ fn published_ui_staged_host_update_activates_on_console_reboot_and_rolls_back_fr
     assert_eq!(host_update_status(&guest)["booted"], accepted["booted"]);
 
     // Manual rollback is the recovery menu's rollback-image.
-    let rolled = serial_cmd(&guest, "rollback-image\n", 60, |t| {
-        t.contains("Host image rollback") && t.contains("recovery>")
-    });
+    let rolled = recovery_cmd(&guest, "rollback-image\n", 60, "Host image rollback");
     assert!(
         rolled.contains("Host image rollback queued") && rolled.contains(&previous),
         "rollback-image must queue the previous bootc deployment, serial:\n{rolled}"
@@ -4231,6 +4255,15 @@ fn wait_staging_done(
     peer: &NetworkPeer,
     target: &str,
 ) -> (serde_json::Value, StagingProbes) {
+    wait_staging_done_probing(guest, Some((peer, target)))
+}
+
+/// Poll Host update status until staging ends, pinging `probe`'s target
+/// through the appliance about once a second when there is a peer.
+fn wait_staging_done_probing(
+    guest: &Guest,
+    probe: Option<(&NetworkPeer, &str)>,
+) -> (serde_json::Value, StagingProbes) {
     let session = https_login_admin(guest, "alice", "secret12");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1200);
     let mut probes = StagingProbes {
@@ -4240,13 +4273,15 @@ fn wait_staging_done(
     };
     let mut gap = 0;
     loop {
-        probes.sent += 1;
-        if peer.ping(target).expect("forwarded peer probe during staging") {
-            gap = 0;
-        } else {
-            probes.lost += 1;
-            gap += 1;
-            probes.longest_gap = probes.longest_gap.max(gap);
+        if let Some((peer, target)) = probe {
+            probes.sent += 1;
+            if peer.ping(target).expect("forwarded peer probe during staging") {
+                gap = 0;
+            } else {
+                probes.lost += 1;
+                gap += 1;
+                probes.longest_gap = probes.longest_gap.max(gap);
+            }
         }
         let (_, body) = session
             .exchange("GET", "/api/host-update", None, 30)
@@ -4800,13 +4835,7 @@ fn stage_and_reboot_from_ui(
         .unwrap_or_default()
         .to_string();
     assert!(!previous.is_empty() && !previous.contains("fwos:next"));
-    let started = guest
-        .browser_host_update("stage", "alice", "secret12", image)
-        .expect("rendered stage request");
-    assert!(
-        started["result"].as_str().unwrap().contains("started"),
-        "{started}"
-    );
+    start_stage_from_ui(guest, image);
     let (staged, _) = wait_staging_done(guest, lan_peer, "192.0.2.2");
     assert_eq!(staged["operation"]["state"], "idle", "{staged}");
     assert!(
@@ -4837,15 +4866,7 @@ fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps
     let guest = boot_host_update_guest(&lan_peer, &wan_peer);
     assert_lan_services_and_forwarding(&lan_peer, "before the update");
     let alice = https_login_admin(&guest, "alice", "secret12");
-    let (code, body) = alice
-        .exchange(
-            "POST",
-            "/api/administrators",
-            Some(r#"{"username":"bob","password":"secret34"}"#),
-            15,
-        )
-        .unwrap();
-    assert_eq!(code, 200, "{body}");
+    ui_create_administrator(&alice, "bob", "secret34");
     let revision = accepted_revision(&alice);
     let accepted_network = accepted_interfaces(&alice);
 
@@ -5256,15 +5277,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     let guest = boot_host_update_guest(&lan_peer, &wan_peer);
     assert_lan_services_and_forwarding(&lan_peer, "before the update");
     let alice = https_login_admin(&guest, "alice", "secret12");
-    let (code, body) = alice
-        .exchange(
-            "POST",
-            "/api/administrators",
-            Some(r#"{"username":"bob","password":"secret34"}"#),
-            15,
-        )
-        .unwrap();
-    assert_eq!(code, 200, "{body}");
+    ui_create_administrator(&alice, "bob", "secret34");
     let revision = accepted_revision(&alice);
     let accepted_network = accepted_interfaces(&alice);
 
@@ -5327,9 +5340,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
             && !help.contains("apply <"),
         "the recovery menu distinguishes image rollback from network restoration: {help}"
     );
-    let status = serial_cmd(&guest, "status\n", 30, |text| {
-        text.contains("Previous Host image") && text.contains("recovery>")
-    });
+    let status = recovery_cmd(&guest, "status\n", 30, "Previous Host image");
     assert!(
         status.contains(&format!(
             "Previous Host image available for rollback-image: {previous}"
@@ -5343,9 +5354,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
         "console status reports the accepted update: {status}"
     );
 
-    let queued = serial_cmd(&guest, "rollback-image\n", 60, |text| {
-        text.contains("Host image rollback") && text.contains("recovery>")
-    });
+    let queued = recovery_cmd(&guest, "rollback-image\n", 60, "Host image rollback");
     assert!(
         queued.contains(&format!(
             "Host image rollback queued: the next boot runs the previous Host image {previous}"
@@ -5359,9 +5368,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
         "the outcome names the explicit reboot and keeps the network: {queued}"
     );
     // Queued, not activated: the newer Release keeps running until reboot.
-    let still = serial_cmd(&guest, "status\n", 30, |text| {
-        text.contains("Host image rollback queued") && text.contains("recovery>")
-    });
+    let still = recovery_cmd(&guest, "status\n", 30, "Host image rollback queued");
     assert!(
         still.contains(&format!(
             "Host image rollback queued: the next boot runs {previous}"
@@ -6380,10 +6387,7 @@ fn published_network_export_and_import_round_trip_through_the_ui() {
     assert!(!exported.contains("secret12") && !exported.contains("alice"), "no Identity configuration");
 
     // Identity configuration changed after the export must survive the import.
-    let (code, body) = alice
-        .exchange("POST", "/api/administrators", Some(r#"{"username":"bob","password":"secret34"}"#), 15)
-        .unwrap();
-    assert_eq!(code, 200, "{body}");
+    ui_create_administrator(&alice, "bob", "secret34");
 
     let write = |name: &str, content: &str| {
         let path = dir.join(name);
@@ -6564,10 +6568,7 @@ fn published_encrypted_network_export_round_trips_and_rejects_bad_passphrases_th
     }
 
     // Identity configuration changed after the export must survive every import.
-    let (code, body) = alice
-        .exchange("POST", "/api/administrators", Some(r#"{"username":"bob","password":"secret34"}"#), 15)
-        .unwrap();
-    assert_eq!(code, 200, "{body}");
+    ui_create_administrator(&alice, "bob", "secret34");
 
     let write = |name: &str, content: &str| {
         let path = dir.join(name);
@@ -6915,6 +6916,13 @@ fn serial_cmd(guest: &Guest, cmd: &str, secs: u64, pred: impl Fn(&str) -> bool) 
         .serial_write(cmd)
         .unwrap_or_else(|e| panic!("serial {cmd:?}: {e}"));
     serial_wait(guest, from, secs, pred)
+}
+
+/// Run a recovery menu command and wait for `needle` and the next prompt.
+fn recovery_cmd(guest: &Guest, cmd: &str, secs: u64, needle: &str) -> String {
+    serial_cmd(guest, cmd, secs, |text| {
+        text.contains(needle) && text.contains("recovery>")
+    })
 }
 
 fn serial_wait(guest: &Guest, from: usize, secs: u64, pred: impl Fn(&str) -> bool) -> String {
@@ -7799,6 +7807,10 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
     assert!(
         shown.contains(&wan_line) && shown.contains(&lan_line),
         "recovery status must list the untagged WAN and the operator-chosen LAN VLAN, serial:\n{shown}"
+    );
+    assert!(
+        shown.contains(&format!("{lan_line}  vlan 42 on {nic}")),
+        "operator-chosen LAN VID must be Desired state, serial:\n{shown}"
     );
     let exposure = shown
         .lines()
