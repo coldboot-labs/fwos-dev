@@ -4397,8 +4397,9 @@ fn published_ui_stages_host_update_over_ipv6_only_wan_without_delegation() {
     assert!(live.contains("There is no NAT66, NPTv6, or NAT64"), "{live}");
     let wan_cidr = live
         .split_whitespace()
+        .map(|word| word.trim_end_matches([';', ',']))
         .find(|word| word.starts_with("2001:db8:ff:") && word.ends_with("/64"))
-        .expect("WAN SLAAC address in live IPv6")
+        .unwrap_or_else(|| panic!("WAN SLAAC address in live IPv6: {live}"))
         .to_owned();
     let wan_address: std::net::IpAddr = wan_cidr.split('/').next().unwrap().parse().unwrap();
     let revision = accepted_revision(&session);
