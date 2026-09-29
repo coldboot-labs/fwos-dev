@@ -1715,8 +1715,15 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
     // A complete-state import can change more than routes. Add a WAN alias,
     // then induce a later WireGuard runtime failure by targeting the real WAN
     // NIC as though it were a WireGuard link. Recovery must remove the alias.
-    // A failed draft stays private and pending for its administrator (see
-    // dave below), so each failing import is by a separate administrator.
+    // Separate administrators are needed because one administrator cannot
+    // clear their own failed apply. The failed draft stays private and
+    // pending on the unchanged Accepted revision. Reconciliation only
+    // rebases a stale draft, so it answers 409. A new import, and the
+    // single-page applies, are refused while that draft is pending. The
+    // pages can only revise it: they cannot remove a WireGuard tunnel or
+    // express an empty pool. v1 has no way to discard a draft, so each
+    // failing import below is by a different administrator (dave shows the
+    // 409s and a revised reapply).
     for (name, password) in [("bob", "bob-secret"), ("carol", "carol-secret"), ("dave", "dave-secret")] {
         ui_create_administrator(&session, name, password);
     }
