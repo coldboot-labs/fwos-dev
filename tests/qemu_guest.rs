@@ -9,6 +9,9 @@ const WG_PRIVATE: &str = "yAnz5TF+lXXJte14tji3dzMe2arW8mOcy4V+1RU4hQE=";
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// The Appliance console's authenticated recovery mode after Bootstrap.
+const RECOVERY_BANNER: &str = "FWOS Appliance console: authenticated recovery";
+
 fn boot_apply_confirmation_route_guest() -> (Guest, NetworkPeer, NetworkPeer, String) {
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
     let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
@@ -603,7 +606,7 @@ fn authenticated_console_can_restore_previous_network_with_apply_confirmation_en
 }
 
 #[test]
-fn legacy_full_apply_remains_callable_but_needs_ui_confirmation_when_enabled() {
+fn imported_complete_desired_state_needs_ui_confirmation_when_enabled() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
         .expect("published Disk image boots without injected credentials");
@@ -626,27 +629,26 @@ fn legacy_full_apply_remains_callable_but_needs_ui_confirmation_when_enabled() {
         "apply_confirmation": true,
         "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}]
     });
-    serial_login_admin(&guest, "alice", "secret12");
-    let applied = serial_cmd(&guest, &format!("apply {proposed}\n"), 120, |text| {
-        text.contains("\"outcome\"")
-    });
-    assert!(
-        applied.contains("\"outcome\":\"pending_confirmation\"")
-            || applied.contains("\"outcome\": \"pending_confirmation\""),
-        "legacy Apply remains callable and awaits UI confirmation: {applied}"
+    // Complete Desired state, formerly the serial `apply`, now goes through
+    // the UI's import, private draft, and apply.
+    let (code, applied) = ui_import_and_apply(&alice, &proposed);
+    assert_eq!(code, 200, "{applied}");
+    assert_eq!(
+        applied["outcome"], "pending_confirmation",
+        "complete-state Apply awaits UI confirmation: {applied}"
     );
     let pending: serde_json::Value =
         serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
     assert_eq!(pending["pending"]["revision"], 3);
-    assert!(
-        pending["pending"]["applying"].is_null(),
-        "do not invent a legacy actor"
-    );
+    assert_eq!(pending["pending"]["applying"]["username"], "alice");
+    let confirmation = serde_json::json!({
+        "revision": 3, "confirmation_id": pending["pending"]["confirmation_id"],
+    });
     let (code, body) = alice
         .exchange(
             "POST",
             "/api/apply-confirmation/confirm",
-            Some(r#"{"revision":3}"#),
+            Some(&confirmation.to_string()),
             120,
         )
         .unwrap();
@@ -654,7 +656,7 @@ fn legacy_full_apply_remains_callable_but_needs_ui_confirmation_when_enabled() {
     let accepted: serde_json::Value =
         serde_json::from_str(&alice.get("/api/apply-confirmation").unwrap()).unwrap();
     assert_eq!(accepted["accepted_revision"], 3);
-    assert!(accepted["last_accepted"]["applying"].is_null());
+    assert_eq!(accepted["last_accepted"]["applying"]["username"], "alice");
     assert_eq!(accepted["last_accepted"]["confirming"]["username"], "alice");
 }
 
@@ -693,7 +695,6 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
         .expect("accept A through rendered UI");
     assert!(lan_peer.ping("198.51.100.2").unwrap());
     assert!(!lan_peer.ping("203.0.113.2").unwrap());
-    serial_login_admin(&guest, "alice", "secret12");
     let replacement = serde_json::json!({
         "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
         // Preflight accepts this; Kea Host activation rejects it after the
@@ -701,34 +702,44 @@ fn interrupted_apply_restores_accepted_route_after_external_reset() {
         "ui_exposure": [ui_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
         "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
     });
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let reference = ui_import_draft(&alice, &replacement);
     let from = guest.serial().len();
-    guest
-        .serial_write(&format!("apply {replacement}\n"))
-        .expect("send complete Desired state over authenticated serial console");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !lan_peer
-        .ping("203.0.113.2")
-        .expect("external replacement probe")
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "replacement never forwarded before cut; serial: {}",
-            guest.serial()
-        );
-    }
-    guest
-        .qemu_system_reset()
-        .expect("externally cut power during mutation and Host service reconciliation");
+    let interrupted = std::thread::scope(|scope| {
+        let apply = scope.spawn(|| {
+            alice.exchange(
+                "POST",
+                "/api/draft/apply",
+                Some(&reference.to_string()),
+                60,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !lan_peer
+            .ping("203.0.113.2")
+            .expect("external replacement probe")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement never forwarded before cut; serial: {}",
+                guest.serial()
+            );
+        }
+        guest
+            .qemu_system_reset()
+            .expect("externally cut power during mutation and Host service reconciliation");
+        apply.join().expect("UI apply request thread")
+    });
+    assert!(
+        !matches!(&interrupted, Ok((_, body)) if body.contains("\"outcome\"")),
+        "the interrupted apply returned an outcome before the external cut: {interrupted:?}"
+    );
     let rebooted = serial_wait(&guest, from, 300, |text| {
         text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
         rebooted.lines().any(|line| line.trim() == "admin:"),
         "owned appliance must reach authenticated console: {rebooted}"
-    );
-    assert!(
-        !rebooted.contains("\"outcome\""),
-        "the interrupted apply returned an outcome before the external cut: {rebooted}"
     );
     // The serial login prompt can precede netd's recovery and Host ACK.
     let recovery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -810,7 +821,6 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
     guest
         .browser_change_own_administrator_password("alice", "secret12", "new-secret12")
         .expect("current Identity changes after A is accepted");
-    serial_login_admin(&guest, "alice", "new-secret12");
     let replacement = serde_json::json!({
         "revision": 2, "hostname": "fwos-box", "interfaces": bootstrap["interfaces"],
         // The invalid pool delays acceptance until Kea rejects activation;
@@ -818,37 +828,50 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
         "ui_exposure": [ui_nic, required_nic], "lan_prefix": "10.56.0.0/24", "dhcp_pool": "",
         "routes": [{"to": "203.0.113.0/24", "via": "192.0.2.2", "dev": wan_nic}]
     });
+    // Bob's interrupted draft stays his; Alice applies again after recovery.
+    let alice = https_login_admin(&guest, "alice", "new-secret12");
+    ui_create_administrator(&alice, "bob", "bob-secret");
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let reference = ui_import_draft(&bob, &replacement);
     let from = guest.serial().len();
-    guest
-        .serial_write(&format!("apply {replacement}\n"))
-        .expect("submit replacement from authenticated console");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !lan_peer
-        .ping("203.0.113.2")
-        .expect("replacement traffic from external LAN")
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "replacement never forwarded; serial: {}",
-            guest.serial()
-        );
-    }
-    guest
-        .qemu_unplug_extra_nic()
-        .expect("externally remove only the required spare NIC before restart");
-    guest
-        .qemu_system_reset()
-        .expect("externally cut VM power during replacement");
+    let interrupted = std::thread::scope(|scope| {
+        let apply = scope.spawn(|| {
+            bob.exchange(
+                "POST",
+                "/api/draft/apply",
+                Some(&reference.to_string()),
+                60,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !lan_peer
+            .ping("203.0.113.2")
+            .expect("replacement traffic from external LAN")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replacement never forwarded; serial: {}",
+                guest.serial()
+            );
+        }
+        guest
+            .qemu_unplug_extra_nic()
+            .expect("externally remove only the required spare NIC before restart");
+        guest
+            .qemu_system_reset()
+            .expect("externally cut VM power during replacement");
+        apply.join().expect("UI apply request thread")
+    });
+    assert!(
+        !matches!(&interrupted, Ok((_, body)) if body.contains("\"outcome\"")),
+        "the interrupted apply returned an outcome before the external cut: {interrupted:?}"
+    );
     let rebooted = serial_wait(&guest, from, 300, |text| {
         text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
         rebooted.lines().any(|line| line.trim() == "admin:"),
         "authenticated console after failed restoration: {rebooted}"
-    );
-    assert!(
-        !rebooted.contains("\"outcome\""),
-        "the interrupted apply returned an outcome before the external cut: {rebooted}"
     );
     let lan_local = lan_peer.ping("10.56.0.1").unwrap();
     let wan_local = wan_peer.resolve_neighbor("192.0.2.1").unwrap();
@@ -888,12 +911,19 @@ fn failed_interrupted_restoration_blocks_forwarding_and_keeps_authenticated_cons
         status.contains("Recovery required"),
         "console must name in-flight recovery: {status}"
     );
-    let excluded = serial_cmd(&guest, &format!("apply {replacement}\n"), 15, |text| {
-        text.contains("\"restoration\"")
+    // No other apply can run around recovery: the UI is reached through the
+    // blocked forwarding path, and the recovery menu has no apply.
+    https_must_not_answer(&guest, 10, "UI while restoration has failed");
+    let excluded = serial_cmd(&guest, "apply {}\n", 15, |text| {
+        text.contains("unknown command")
     });
     assert!(
-        excluded.contains("\"required\""),
-        "another apply must be excluded throughout recovery: {excluded}"
+        excluded.contains("unknown command") && !excluded.contains("\"outcome\""),
+        "the recovery menu offers no apply during recovery: {excluded}"
+    );
+    assert!(
+        !lan_peer.ping("192.0.2.2").unwrap(),
+        "forwarding stays blocked"
     );
     let retry = serial_cmd(&guest, "restore-previous\n", 30, |text| {
         text.contains("\"restoration\"")
@@ -1163,39 +1193,39 @@ fn accepted_removal_of_lan_prefix_and_pool_stops_dhcp_on_external_lan() {
         "lan_prefix": "10.56.0.0/24"
     });
     https_bootstrap(&guest, &initial.to_string());
-    serial_login_admin(&guest, "alice", "secret12");
-    let enabled = serde_json::json!({
-        "revision": 1, "hostname": "fwos-box",
-        "interfaces": initial["interfaces"],
-        "ui_exposure": [ui_nic],
-        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.170-10.56.0.199"
-    });
-    let enabled_result = serial_cmd(&guest, &format!("apply {enabled}\n"), 90, |text| {
-        text.contains("\"outcome\"")
-    });
-    assert!(
-        enabled_result.contains("\"outcome\":\"accepted\"")
-            || enabled_result.contains("\"outcome\": \"accepted\""),
-        "valid DHCP enablement must be Accepted after Host activation: {enabled_result}"
-    );
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let lan_services = |services: serde_json::Value| {
+        let change = serde_json::json!({
+            "base_revision": accepted_revision(&alice), "services": services,
+        });
+        let (code, body) = alice
+            .exchange(
+                "POST",
+                "/api/lan-services/apply",
+                Some(&change.to_string()),
+                120,
+            )
+            .expect("LAN services apply reply");
+        assert_eq!(code, 200, "{body}");
+        assert!(body.contains("\"outcome\":\"accepted\""), "{body}");
+    };
+    // Valid DHCP enablement is Accepted only after Host activation.
+    lan_services(serde_json::json!({
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.170-10.56.0.199",
+    }));
     let offer = wait_dhcp_offer(&lan_peer);
     assert!(
         (170..=199).contains(&offer_octet(&offer)),
         "initial pool offer: {offer}"
     );
 
-    let disabled = serde_json::json!({
-        "revision": 2, "hostname": "fwos-box",
-        "interfaces": initial["interfaces"],
-        "ui_exposure": [ui_nic],
-        "lan_prefix": null, "dhcp_pool": null
-    });
-    let result = serial_cmd(&guest, &format!("apply {disabled}\n"), 90, |text| {
-        text.contains("\"outcome\"")
-    });
+    // Removing both the LAN prefix and the pool is a valid Accepted state.
+    lan_services(serde_json::json!({"lan_prefix": "", "dhcp_pool": ""}));
+    let services: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/lan-services").unwrap()).unwrap();
     assert!(
-        result.contains("\"outcome\":\"accepted\"") || result.contains("\"outcome\": \"accepted\""),
-        "valid complete-state DHCP disablement must be accepted: {result}"
+        services["lan_prefix"].is_null() && services["dhcp_pool"].is_null(),
+        "{services}"
     );
     let unexpected_offer = lan_peer
         .dhcp_offer()
@@ -1690,10 +1720,18 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         serde_json::from_str(&session.get("/api/draft").unwrap()).unwrap();
     assert_eq!(retained["status"], "pending", "failed draft stays private");
 
-    // A complete-state caller can change more than routes. Add a WAN alias,
+    // A complete-state import can change more than routes. Add a WAN alias,
     // then induce a later WireGuard runtime failure by targeting the real WAN
     // NIC as though it were a WireGuard link. Recovery must remove the alias.
-    serial_login_admin(&guest, "alice", "secret12");
+    // A failed draft stays private to its administrator, so each failing
+    // import below is by a separate administrator, and carol, without a
+    // draft, uses the LAN services page.
+    for (name, password) in [("bob", "bob-secret"), ("carol", "carol-secret"), ("dave", "dave-secret")] {
+        ui_create_administrator(&session, name, password);
+    }
+    let bob = https_login_admin(&guest, "bob", "bob-secret");
+    let carol = https_login_admin(&guest, "carol", "carol-secret");
+    let dave = https_login_admin(&guest, "dave", "dave-secret");
     let invalid_runtime = serde_json::json!({
         "revision": 2,
         "hostname": "fwos-box",
@@ -1707,16 +1745,14 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}],
         "wireguard": [{"name": wan_nic, "private_key": WG_PRIVATE, "addresses": ["10.13.13.1/24"]}]
     });
-    let failed = serial_cmd(&guest, &format!("apply {invalid_runtime}\n"), 90, |text| {
-        text.contains("\"restoration\"") || text.contains("\"outcome\"")
-    });
-    assert!(
-        failed.contains("\"outcome\":\"failed\"") || failed.contains("\"outcome\": \"failed\""),
+    let (code, failed) = ui_import_and_apply(&bob, &invalid_runtime);
+    assert_eq!(code, 502, "{failed}");
+    assert_eq!(
+        failed["outcome"], "failed",
         "complete-state apply must fail at runtime: {failed}"
     );
-    assert!(
-        failed.contains("\"restoration\":\"restored\"")
-            || failed.contains("\"restoration\": \"restored\""),
+    assert_eq!(
+        failed["restoration"], "restored",
         "complete-state apply must report restoration: {failed}"
     );
     wan_peer
@@ -1739,33 +1775,30 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "tentative Kea config must not launch a DHCP service"
     );
 
-    let mut enable_dhcp = invalid_runtime.clone();
-    enable_dhcp["interfaces"][2]["addresses"] = serde_json::json!(["192.0.2.1/24"]);
-    enable_dhcp["wireguard"] = serde_json::json!([]);
-    let accepted = serial_cmd(&guest, &format!("apply {enable_dhcp}\n"), 90, |text| {
-        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
-    });
-    assert!(
-        accepted.contains("\"outcome\":\"accepted\"")
-            || accepted.contains("\"outcome\": \"accepted\""),
-        "accepted DHCP enablement: {accepted}"
-    );
+    let lan_services = |pool: &str| {
+        let change = serde_json::json!({
+            "base_revision": accepted_revision(&carol),
+            "services": {"lan_prefix": "10.56.0.0/24", "dhcp_pool": pool},
+        });
+        let (code, body) = carol
+            .exchange(
+                "POST",
+                "/api/lan-services/apply",
+                Some(&change.to_string()),
+                120,
+            )
+            .expect("LAN services apply reply");
+        assert_eq!(code, 200, "accepted DHCP pool {pool}: {body}");
+        assert!(body.contains("\"outcome\":\"accepted\""), "{body}");
+    };
+    lan_services("10.56.0.100-10.56.0.129");
     let offer_a = wait_dhcp_offer(&lan_peer);
     assert!(
         (100..=129).contains(&offer_octet(&offer_a)),
         "pool A offer: {offer_a}"
     );
 
-    let mut edit_dhcp = enable_dhcp.clone();
-    edit_dhcp["revision"] = serde_json::json!(3);
-    edit_dhcp["dhcp_pool"] = serde_json::json!("10.56.0.170-10.56.0.199");
-    let edited = serial_cmd(&guest, &format!("apply {edit_dhcp}\n"), 90, |text| {
-        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
-    });
-    assert!(
-        edited.contains("\"outcome\":\"accepted\"") || edited.contains("\"outcome\": \"accepted\""),
-        "accepted DHCP pool edit: {edited}"
-    );
+    lan_services("10.56.0.170-10.56.0.199");
     let offer_b = lan_peer
         .dhcp_offer()
         .expect("DHCP immediately after accepted B")
@@ -1774,22 +1807,29 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         (170..=199).contains(&offer_octet(&offer_b)),
         "pool B offer after accepted edit: {offer_b}"
     );
+    let accepted_b = serde_json::json!({
+        "revision": 4,
+        "hostname": "fwos-box",
+        "interfaces": [
+            {"name": lan_nic, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": ui_nic, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": wan_nic, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [ui_nic],
+        "lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.170-10.56.0.199",
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": wan_nic}]
+    });
 
-    // Empty pool currently passes preflight but Kea rejects its generated
-    // config. Host activation must fail before netd can accept this revision,
-    // and both the former service process and Accepted B must be restored.
-    let mut invalid_host_config = edit_dhcp.clone();
-    invalid_host_config["revision"] = serde_json::json!(4);
+    // An empty pool passes preflight (and the import's validation), but Kea
+    // rejects its generated config. Host activation must fail before netd
+    // can accept this revision, and both the former service process and
+    // Accepted B must be restored.
+    let mut invalid_host_config = accepted_b.clone();
     invalid_host_config["dhcp_pool"] = serde_json::json!("");
-    let host_failure = serial_cmd(
-        &guest,
-        &format!("apply {invalid_host_config}\n"),
-        90,
-        |text| text.contains("\"restoration\"") || text.contains("\"outcome\""),
-    );
-    assert!(
-        host_failure.contains("\"restoration\":\"restored\"")
-            || host_failure.contains("\"restoration\": \"restored\""),
+    let (code, host_failure) = ui_import_and_apply(&dave, &invalid_host_config);
+    assert_eq!(code, 502, "{host_failure}");
+    assert_eq!(
+        host_failure["restoration"], "restored",
         "Host activation failure must restore B: {host_failure}"
     );
     let offer_after_host_failure = wait_dhcp_offer(&lan_peer);
@@ -1798,16 +1838,27 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "pool B offer after rejected Kea config: {offer_after_host_failure}"
     );
 
-    let mut failed_pool = edit_dhcp.clone();
-    failed_pool["revision"] = serde_json::json!(4);
-    failed_pool["dhcp_pool"] = serde_json::json!("10.56.0.130-10.56.0.159");
-    failed_pool["wireguard"] = invalid_runtime["wireguard"].clone();
-    let failed = serial_cmd(&guest, &format!("apply {failed_pool}\n"), 90, |text| {
-        text.contains("\"restoration\"") || text.contains("\"outcome\"")
+    // Dave revises his retained failed draft to pool C with the invalid
+    // tunnel, and applies it again.
+    let draft: serde_json::Value = serde_json::from_str(&dave.get("/api/draft").unwrap()).unwrap();
+    assert_eq!(draft["status"], "pending", "failed draft stays private: {draft}");
+    let revised = serde_json::json!({
+        "base_revision": draft["base_revision"], "version": draft["version"],
+        "services": {"lan_prefix": "10.56.0.0/24", "dhcp_pool": "10.56.0.130-10.56.0.159"},
+        "wireguard": [{"name": wan_nic, "private_key": WG_PRIVATE, "addresses": ["10.13.13.1/24"]}],
     });
-    assert!(
-        failed.contains("\"restoration\":\"restored\"")
-            || failed.contains("\"restoration\": \"restored\""),
+    let (code, body) = dave
+        .exchange("POST", "/api/draft/save", Some(&revised.to_string()), 30)
+        .expect("revise the failed private draft");
+    assert_eq!(code, 200, "{body}");
+    let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let (code, failed) = ui_apply_draft(
+        &dave,
+        &serde_json::json!({"base_revision": saved["base_revision"], "version": saved["version"]}),
+    );
+    assert_eq!(code, 502, "{failed}");
+    assert_eq!(
+        failed["restoration"], "restored",
         "failed DHCP pool edit must restore B: {failed}"
     );
     let offer_after_failure = wait_dhcp_offer(&lan_peer);
@@ -1816,15 +1867,16 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         "pool B offer after failed C edit: {offer_after_failure}"
     );
 
+    serial_login_admin(&guest, "alice", "secret12");
     let reboot_from = guest.serial().len();
     guest
         .serial_write("reboot\n")
         .expect("appliance console reboot");
     let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
-        text.contains("FWOS Appliance CLI")
+        text.contains(RECOVERY_BANNER)
     });
     assert!(
-        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        rebooted.contains(RECOVERY_BANNER) && !rebooted.contains("FWOS Bootstrap console"),
         "Accepted B must boot as an owned appliance: {rebooted}"
     );
     let session = https_login_admin(&guest, "alice", "secret12");
@@ -1836,20 +1888,20 @@ fn failed_runtime_route_apply_restores_accepted_forwarding_and_reports_recovery(
         (170..=199).contains(&offer_octet(&reboot_offer)),
         "Host worker must reactivate Accepted B after reboot: {reboot_offer}"
     );
-    serial_login_admin_from(&guest, "alice", "secret12", reboot_from);
 
-    let mut disable_dhcp = edit_dhcp.clone();
-    disable_dhcp["revision"] = serde_json::json!(4);
-    disable_dhcp["lan_prefix"] = serde_json::Value::Null;
-    disable_dhcp["dhcp_pool"] = serde_json::Value::Null;
-    let disabled = serial_cmd(&guest, &format!("apply {disable_dhcp}\n"), 90, |text| {
-        text.contains("\"outcome\":\"accepted\"") || text.contains("\"outcome\": \"accepted\"")
+    let carol = https_login_admin(&guest, "carol", "carol-secret");
+    let change = serde_json::json!({
+        "base_revision": 4, "services": {"lan_prefix": "", "dhcp_pool": ""},
     });
-    assert!(
-        disabled.contains("\"outcome\":\"accepted\"")
-            || disabled.contains("\"outcome\": \"accepted\""),
-        "accepted DHCP disablement: {disabled}"
-    );
+    let (code, disabled) = carol
+        .exchange(
+            "POST",
+            "/api/lan-services/apply",
+            Some(&change.to_string()),
+            120,
+        )
+        .expect("LAN services apply reply");
+    assert_eq!(code, 200, "accepted DHCP disablement: {disabled}");
     assert!(
         lan_peer
             .dhcp_offer()
@@ -2294,9 +2346,9 @@ fn two_administrators_reconcile_private_drafts_after_accepted_revision_changes()
         .serial_write("reboot\n")
         .expect("Appliance console reboot");
     let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
-        text.contains("FWOS Appliance CLI")
+        text.contains(RECOVERY_BANNER)
     });
-    assert!(rebooted.contains("FWOS Appliance CLI"));
+    assert!(rebooted.contains(RECOVERY_BANNER));
     let bob = https_login_admin(&guest, "bob", "bob-secret");
     let after_reboot: serde_json::Value =
         serde_json::from_str(&bob.get("/api/routes").unwrap()).unwrap();
@@ -2440,29 +2492,39 @@ fn published_graphical_static_route_changes_external_peer_forwarding() {
         );
     }
 
-    serial_login_admin(&guest, "alice", "secret12");
-    let malformed = serial_cmd(
-        &guest,
-        "apply {\"interfaces\":[],\"ui_exposure\":[],\"routes\":[]}\n",
-        20,
-        |text| text.contains("rejected"),
+    let malformed = serde_json::json!({
+        "format": "fwos-network-desired-state", "format_version": 1,
+        "desired": {"interfaces": [], "ui_exposure": [], "routes": []},
+    });
+    let request = serde_json::json!({
+        "base_revision": 3, "content": toml::to_string(&malformed).unwrap(),
+    });
+    let (code, rejected) = session
+        .exchange(
+            "POST",
+            "/api/desired-state/import",
+            Some(&request.to_string()),
+            30,
+        )
+        .expect("import reply");
+    assert_eq!(
+        code, 400,
+        "malformed complete Desired state must be rejected: {rejected}"
     );
-    assert!(
-        malformed.contains("rejected"),
-        "malformed complete Desired state must be rejected: {malformed}"
-    );
+    assert!(session.get("/api/draft").unwrap().contains("\"status\":\"none\""));
     assert!(lan_peer
         .ping("203.0.113.2")
-        .expect("legacy rejected apply leaves forwarding intact"));
+        .expect("rejected import leaves forwarding intact"));
+    serial_login_admin(&guest, "alice", "secret12");
     let reboot_from = guest.serial().len();
     guest
         .serial_write("reboot\n")
         .expect("normal Appliance console reboot");
     let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
-        text.contains("FWOS Appliance CLI")
+        text.contains(RECOVERY_BANNER)
     });
     assert!(
-        rebooted.contains("FWOS Appliance CLI"),
+        rebooted.contains(RECOVERY_BANNER),
         "Accepted Desired state reboot: {rebooted}"
     );
     let session = https_login_admin(&guest, "alice", "secret12");
@@ -2602,10 +2664,10 @@ fn published_local_identity_protects_https_management() {
         "logout revokes the server-side session, not just the browser cookie"
     );
     let admin_ready = serial_wait(&guest, 0, 90, |text| {
-        text.contains("FWOS Appliance CLI") && text.lines().any(|line| line.trim() == "admin:")
+        text.contains(RECOVERY_BANNER) && text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
-        admin_ready.contains("FWOS Appliance CLI")
+        admin_ready.contains(RECOVERY_BANNER)
             && admin_ready.lines().any(|line| line.trim() == "admin:"),
         "Bootstrap must hand serial input to the administrator prompt before login; serial tail:\n{}",
         serial_tail(&admin_ready, 4000)
@@ -2640,10 +2702,10 @@ fn published_local_identity_protects_https_management() {
         .serial_write("reboot\n")
         .expect("authenticated console reboot");
     let rebooted = serial_wait(&guest, reboot_from, 300, |text| {
-        text.contains("FWOS Appliance CLI")
+        text.contains(RECOVERY_BANNER)
     });
     assert!(
-        rebooted.contains("FWOS Appliance CLI"),
+        rebooted.contains(RECOVERY_BANNER),
         "authenticated console must return after reboot"
     );
     assert!(
@@ -2809,10 +2871,10 @@ fn published_administrator_creates_distinct_local_login_in_rendered_ui() {
     );
 
     let admin_ready = serial_wait(&guest, 0, 90, |text| {
-        text.contains("FWOS Appliance CLI") && text.lines().any(|line| line.trim() == "admin:")
+        text.contains(RECOVERY_BANNER) && text.lines().any(|line| line.trim() == "admin:")
     });
     assert!(
-        admin_ready.contains("FWOS Appliance CLI"),
+        admin_ready.contains(RECOVERY_BANNER),
         "Appliance console must offer administrator login"
     );
     let password_prompt = serial_cmd(&guest, "alice\n", 15, |text| text.contains("password:"));
@@ -2977,6 +3039,110 @@ fn https_login_admin<'a>(
     }
 }
 
+/// Complete network Desired state as the FWOS network export file that an
+/// administrator imports through the UI. TOML has no null, so those keys are
+/// omitted, as in an export.
+fn network_export_file(desired: &serde_json::Value) -> String {
+    fn without_nulls(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k.clone(), without_nulls(v)))
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+            serde_json::Value::Array(items) => {
+                items.iter().map(without_nulls).collect::<Vec<_>>().into()
+            }
+            other => other.clone(),
+        }
+    }
+    let file = serde_json::json!({
+        "format": "fwos-network-desired-state", "format_version": 1,
+        "desired": without_nulls(desired),
+    });
+    toml::to_string(&file).expect("encode network export file")
+}
+
+#[test]
+fn network_export_file_omits_nulls_and_keeps_the_export_format() {
+    let file = network_export_file(&serde_json::json!({
+        "revision": 2, "hostname": "fwos-box", "lan_prefix": null,
+        "interfaces": [{"name": "enp1s0", "role": "wan", "addresses": ["192.0.2.1/24"]}],
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.2", "dev": null}],
+        "dhcp_pool": ""
+    }));
+    let parsed: toml::Value = toml::from_str(&file).expect(&file);
+    assert_eq!(parsed["format"].as_str(), Some("fwos-network-desired-state"));
+    assert_eq!(parsed["format_version"].as_integer(), Some(1));
+    let desired = &parsed["desired"];
+    assert!(desired.get("lan_prefix").is_none(), "{file}");
+    assert!(desired["routes"][0].get("dev").is_none(), "{file}");
+    assert_eq!(desired["dhcp_pool"].as_str(), Some(""), "{file}");
+    assert_eq!(desired["interfaces"][0]["role"].as_str(), Some("wan"), "{file}");
+}
+
+/// Import complete Desired state into this administrator's private draft
+/// through the UI; nothing live changes. Returns the draft reference.
+fn ui_import_draft(
+    session: &fwos_dev::HttpsSession<'_>,
+    desired: &serde_json::Value,
+) -> serde_json::Value {
+    let request = serde_json::json!({
+        "base_revision": accepted_revision(session),
+        "content": network_export_file(desired),
+    });
+    let (code, body) = session
+        .exchange(
+            "POST",
+            "/api/desired-state/import",
+            Some(&request.to_string()),
+            30,
+        )
+        .expect("network import reply");
+    assert_eq!(code, 200, "import into the private draft: {body}");
+    let draft: serde_json::Value = serde_json::from_str(&body).expect("import reply JSON");
+    serde_json::json!({"base_revision": draft["base_revision"], "version": draft["version"]})
+}
+
+/// Review and apply this administrator's private draft through the UI's
+/// shared apply engine; returns the HTTPS status and the apply outcome.
+fn ui_apply_draft(
+    session: &fwos_dev::HttpsSession<'_>,
+    reference: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let (code, body) = session
+        .exchange(
+            "POST",
+            "/api/draft/apply",
+            Some(&reference.to_string()),
+            150,
+        )
+        .expect("draft apply reply");
+    let outcome = serde_json::from_str(&body)
+        .unwrap_or_else(|_| panic!("draft apply outcome is not JSON ({code}): {body}"));
+    (code, outcome)
+}
+
+/// Complete Desired state, imported and applied through the UI: the v1
+/// replacement for the retired serial `apply`.
+fn ui_import_and_apply(
+    session: &fwos_dev::HttpsSession<'_>,
+    desired: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let reference = ui_import_draft(session, desired);
+    ui_apply_draft(session, &reference)
+}
+
+/// Create a local administrator through the UI's authenticated API.
+fn ui_create_administrator(session: &fwos_dev::HttpsSession<'_>, username: &str, password: &str) {
+    let body = serde_json::json!({"username": username, "password": password});
+    let (code, reply) = session
+        .exchange("POST", "/api/administrators", Some(&body.to_string()), 30)
+        .expect("create administrator reply");
+    assert_eq!(code, 200, "create {username}: {reply}");
+}
+
 fn https_authenticated_status(guest: &Guest) -> Result<String, fwos_dev::Error> {
     guest
         .https_login(r#"{"source":"local","username":"alice","password":"secret12"}"#)?
@@ -3121,7 +3287,7 @@ fn published_guest_bootstrap_console_on_serial() {
     let lower = serial.to_ascii_lowercase();
     assert!(
         !lower.contains("login:"),
-        "Appliance CLI owns serial; no Host shell login, serial:\n{serial}"
+        "Appliance console owns serial; no Host shell login, serial:\n{serial}"
     );
     assert!(
         lower.contains("bootstrap"),
@@ -3188,7 +3354,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     let lower = serial.to_ascii_lowercase();
     assert!(
         !lower.contains("login:") && !lower.contains("admin:"),
-        "unauthenticated Bootstrap console is not the admin Appliance CLI, serial:\n{serial}"
+        "unauthenticated Bootstrap console is not authenticated recovery, serial:\n{serial}"
     );
     assert_no_ssh(&guest, "before Bootstrap");
 
@@ -3337,13 +3503,13 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         let _ = guest.serial_write("\n");
         std::thread::sleep(std::time::Duration::from_secs(1));
         last = guest.serial();
-        if last.contains("FWOS Appliance CLI") {
+        if last.contains(RECOVERY_BANNER) {
             break;
         }
     }
     assert!(
-        last.contains("FWOS Appliance CLI"),
-        "after Bootstrap, serial must be the admin Appliance CLI, not the Bootstrap console; serial:\n{last}"
+        last.contains(RECOVERY_BANNER),
+        "after Bootstrap, serial must be authenticated recovery, not the Bootstrap console; serial:\n{last}"
     );
     let after_switch = last.rsplit("Bootstrap complete.").next().unwrap_or(&last);
     let tail = serial_tail(after_switch, 4000).to_ascii_lowercase();
@@ -3351,12 +3517,12 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         !tail.contains("fwos bootstrap console")
             && !tail.contains("ephemeral")
             && !tail.contains("reach the ui"),
-        "admin Appliance CLI must not keep first-boot ephemeral addressing as the UX; serial:\n{last}"
+        "authenticated recovery must not keep first-boot ephemeral addressing as the UX; serial:\n{last}"
     );
 
     guest
         .serial_write("alice\n")
-        .expect("admin name on Appliance CLI");
+        .expect("admin name on Appliance console");
     let mut saw_password = false;
     for _ in 0..15 {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -3372,29 +3538,29 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     }
     assert!(
         saw_password,
-        "Appliance CLI must prompt for the admin password, serial:\n{last}"
+        "Appliance console must prompt for the admin password, serial:\n{last}"
     );
     guest
         .serial_write("secret12\n")
-        .expect("admin password on Appliance CLI");
+        .expect("admin password on Appliance console");
     let mut logged_in = false;
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         last = guest.serial();
         let tail = serial_tail(&last, 3000);
-        if tail.contains("fwos>") || tail.contains("fwos-box") {
+        if tail.contains("recovery>") || tail.contains("fwos-box") {
             logged_in = true;
             break;
         }
     }
     assert!(
         logged_in,
-        "admin must authenticate into the Appliance CLI, serial:\n{last}"
+        "admin must authenticate into authenticated recovery, serial:\n{last}"
     );
 
     guest
         .serial_write("status\n")
-        .expect("status on Appliance CLI");
+        .expect("status on Appliance console");
     let mut status_cli = String::new();
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -3406,7 +3572,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     let st_tail = serial_tail(&status_cli, 4000);
     assert!(
         st_tail.contains("fwos-box"),
-        "Appliance CLI status must show the hostname, serial:\n{status_cli}"
+        "Appliance console status must show the hostname, serial:\n{status_cli}"
     );
     let after_login = status_cli.rsplit("password:").next().unwrap_or(&status_cli);
     assert!(
@@ -3422,7 +3588,7 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
     let shell_tail = serial_tail(&after_shell, 2000);
     assert!(
         shell_tail.contains("unknown command"),
-        "Appliance CLI must reject a shell command, serial:\n{after_shell}"
+        "Appliance console must reject a shell command, serial:\n{after_shell}"
     );
     assert!(
         !shell_tail.lines().any(|l| l.trim() == "SHELL_RAN"),
@@ -3439,11 +3605,11 @@ fn published_first_boot_console_wizard_ui_in_mgmt_no_ssh() {
         .unwrap_or(&after_static);
     assert!(
         static_tail.contains("unknown command"),
-        "admin CLI must not offer first-boot ephemeral addressing, serial:\n{after_static}"
+        "authenticated recovery must not offer first-boot ephemeral addressing, serial:\n{after_static}"
     );
     assert!(
-        static_tail.contains("fwos>") && !static_tail.contains("FWOS Bootstrap console"),
-        "rejected ephemeral static must stay in the Appliance CLI, serial:\n{after_static}"
+        static_tail.contains("recovery>") && !static_tail.contains("FWOS Bootstrap console"),
+        "rejected ephemeral static must stay in authenticated recovery, serial:\n{after_static}"
     );
 
     assert_no_ssh(&guest, "after Bootstrap");
@@ -3506,12 +3672,14 @@ fn published_two_nic_user_net_wan_stops_https_after_apply() {
     );
 
     serial_login_admin(&guest, "alice", "secret12");
-    let shown = serial_cmd(&guest, "show\n", 20, |t| {
-        t.contains("wan") && t.contains("lan") && t.contains(&wan_nic) && t.contains(&lan_nic)
+    let wan_line = format!("{wan_nic}  wan");
+    let lan_line = format!("{lan_nic}  lan");
+    let shown = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains(&wan_line) && t.contains(&lan_line)
     });
     assert!(
-        shown.contains(&wan_nic) && shown.contains(&lan_nic),
-        "serial must still work and show WAN+LAN Desired state, serial:\n{shown}"
+        shown.contains(&wan_line) && shown.contains(&lan_line),
+        "authenticated recovery status must still work and show WAN+LAN roles, serial:\n{shown}"
     );
 }
 
@@ -3654,84 +3822,141 @@ fn published_three_nic_mgmt_https_after_bootstrap() {
     );
 
     serial_login_admin(&guest, "alice", "secret12");
-    let shown = serial_cmd(&guest, "show\n", 20, |t| {
-        t.contains("role = \"mgmt\"")
-            && t.contains(&mgmt_nic)
-            && t.contains(&wan_nic)
-            && t.contains(&lan_nic)
+    let mgmt_line = format!("{mgmt_nic}  mgmt");
+    let shown = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains(&mgmt_line) && t.contains("UI exposure:")
     });
     assert!(
-        shown.contains("role = \"mgmt\"") && shown.contains(&mgmt_nic),
-        "Appliance CLI show must list the Management NIC in fwd, serial:\n{shown}"
+        shown.contains(&mgmt_line)
+            && shown.contains(&format!("{wan_nic}  wan"))
+            && shown.contains(&format!("{lan_nic}  lan")),
+        "recovery status must list the Management NIC and its peers in Accepted Desired state, serial:\n{shown}"
     );
     assert!(
-        shown.contains("ui_exposure") && shown.contains(&format!("\"{mgmt_nic}\"")),
+        shown
+            .lines()
+            .any(|l| l.trim().starts_with("UI exposure:") && l.split_whitespace().any(|w| w == mgmt_nic)),
         "UI exposure after apply includes the Management NIC, serial:\n{shown}"
-    );
-    assert!(
-        !shown.contains("placement =") && !shown.contains("placement=mgmt"),
-        "Desired state must not move the Management NIC into the Management netns, serial:\n{shown}"
     );
 }
 
+/// The shipped v1 operator console is the Appliance console: Bootstrap, then
+/// limited authenticated recovery. The retired full-CLI commands are not
+/// available on it, and the UI does their work.
 #[test]
-fn published_serial_cli_applies_full_desired_state() {
+fn published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli() {
     let _guard = guest_lock();
     let guest = Guest::boot_published_host_image_two_nics()
         .expect("published two-NIC Disk image must boot under QEMU");
-    let serial = guest.serial();
     assert!(
-        serial.contains("FWOS Bootstrap console"),
-        "published first-boot serial must be the Bootstrap console, serial:\n{serial}"
+        guest.serial().contains("FWOS Bootstrap console"),
+        "published first-boot serial must be the Bootstrap console, serial:\n{}",
+        guest.serial()
     );
     let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
-    let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
-    https_bootstrap(&guest, &payload);
+
+    // One Appliance console Host program ships; the full-CLI program and its
+    // addon image do not.
+    assert!(
+        fwos_dev::host_image_has_path("/usr/bin/fwos-console").expect("inspect Host image"),
+        "the Appliance console Host program must ship"
+    );
+    for retired in ["/usr/bin/fwos", "/usr/lib/fwos/addons/cli"] {
+        assert!(
+            !fwos_dev::host_image_has_path(retired).expect("inspect Host image"),
+            "retired full-CLI entry point {retired} still ships"
+        );
+    }
+
+    // Bootstrap console: temporary addressing only.
+    let help = serial_cmd(&guest, "help\n", 15, |t| t.contains("slaac"));
+    assert!(
+        help.contains("static") && help.contains("dhcp") && help.contains("slaac"),
+        "Bootstrap console help, serial:\n{help}"
+    );
+    assert!(!help.contains("update"), "Bootstrap console help: {help}");
+    for retired in ["update 10.0.2.2:5000/fwos:next", "apply {}", "show"] {
+        let out = serial_cmd(&guest, &format!("{retired}\n"), 15, |t| {
+            t.contains("unknown command")
+        });
+        assert!(
+            out.contains("unknown command") && !out.contains("\"ok\""),
+            "Bootstrap console must not offer {retired:?}, serial:\n{out}"
+        );
+    }
+
+    https_bootstrap(&guest, &wan_lan_bootstrap_json(&lan_nic, &wan_nic));
     serial_login_admin(&guest, "alice", "secret12");
-
-    let full = format!(
-        r#"{{"hostname":"fwos-box","interfaces":[{{"name":"{lan_nic}","role":"lan"}},{{"name":"{wan_nic}","role":"wan","addresses":["192.0.2.1/24"]}}],"ui_exposure":["{lan_nic}"],"lan_prefix":"192.168.1.0/24","dhcp_pool":"192.168.1.100-192.168.1.200","wireguard":[{{"name":"wg0","private_key":"{WG_PRIVATE}","listen_port":51820,"addresses":["10.13.13.1/24"]}}],"routes":[{{"to":"198.51.100.0/24","via":"192.0.2.254"}}],"nft_extra":["ip saddr 203.0.113.50 drop"],"qdiscs":[{{"dev":"{wan_nic}","kind":"fq_codel"}}]}}"#
+    let serial = guest.serial();
+    assert!(
+        serial.contains(RECOVERY_BANNER) && !serial.contains("Appliance CLI"),
+        "after Bootstrap the console is authenticated recovery, not a CLI, serial:\n{serial}"
     );
-    let after_apply = serial_cmd(&guest, &format!("apply {full}\n"), 90, |t| {
-        t.contains("\"ok\": true") || t.contains("\"ok\":true")
+
+    // Authenticated recovery menu: only the agreed recovery operations.
+    let help = serial_cmd(&guest, "help\n", 15, |t| t.contains("in the UI"));
+    let offered: Vec<&str> = help
+        .lines()
+        .filter(|l| !l.starts_with(' '))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    for command in ["status", "restore-previous", "rollback-image", "reboot", "logout"] {
+        assert!(offered.contains(&command), "{command} missing, serial:\n{help}");
+    }
+    for retired in ["show", "apply", "update", "rollback", "stage"] {
+        assert!(
+            !offered.contains(&retired),
+            "recovery menu offers {retired}, serial:\n{help}"
+        );
+    }
+
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let revision = accepted_revision(&alice);
+    let status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/status").unwrap()).unwrap();
+    let full = serde_json::json!({
+        "revision": revision,
+        "hostname": "fwos-box",
+        "interfaces": status["interfaces"],
+        "ui_exposure": status["ui_exposure"],
+        "lan_prefix": "192.168.1.0/24", "dhcp_pool": "192.168.1.100-192.168.1.200",
+        "wireguard": [{"name": "wg0", "private_key": WG_PRIVATE, "listen_port": 51820,
+            "addresses": ["10.13.13.1/24"]}],
+        "routes": [{"to": "198.51.100.0/24", "via": "192.0.2.254"}],
+        "nft_extra": ["ip saddr 203.0.113.50 drop"],
+        "qdiscs": [{"dev": wan_nic, "kind": "fq_codel"}]
     });
-    assert!(
-        after_apply.contains("\"ok\": true") || after_apply.contains("\"ok\":true"),
-        "Appliance CLI on serial must apply full Desired state via netd, serial:\n{after_apply}"
+    let retired_commands = [
+        "show".to_string(),
+        format!("apply {full}"),
+        "apply /var/lib/fwos/desired.toml".to_string(),
+        "update 10.0.2.2:5000/fwos:next".to_string(),
+        "update".to_string(),
+        "rollback".to_string(),
+        "stage 10.0.2.2:5000/fwos:next".to_string(),
+    ];
+    for retired in &retired_commands {
+        let out = serial_cmd(&guest, &format!("{retired}\n"), 15, |t| {
+            t.contains("unknown command") && t.contains("recovery>")
+        });
+        assert!(
+            out.contains("unknown command"),
+            "recovery must not offer {retired:?}, serial:\n{out}"
+        );
+        assert!(
+            !out.contains("\"ok\"") && !out.contains("hostname =") && !out.contains("reboot_required"),
+            "{retired:?} reached netd, Desired state, or the Host update program, serial:\n{out}"
+        );
+    }
+    assert_eq!(
+        accepted_revision(&alice),
+        revision,
+        "retired commands leave Accepted Desired state unchanged"
     );
-
-    let shown = serial_cmd(&guest, "show\n", 20, |t| {
-        t.contains("name = \"wg0\"")
-            && t.contains("198.51.100.0/24")
-            && t.contains("203.0.113.50")
-            && t.contains("fq_codel")
-    });
-    assert!(
-        shown.contains("name = \"wg0\"")
-            && shown.contains("198.51.100.0/24")
-            && shown.contains("203.0.113.50")
-            && shown.contains("fq_codel"),
-        "show must round-trip TOML on /var (WG, extra nft, static routes), serial:\n{shown}"
-    );
-
-    let after_toml = serial_cmd(&guest, "apply /var/lib/fwos/desired.toml\n", 90, |t| {
-        t.contains("\"ok\": true") || t.contains("\"ok\":true")
-    });
-    assert!(
-        after_toml.contains("\"ok\": true") || after_toml.contains("\"ok\":true"),
-        "Appliance CLI must apply break-glass TOML from /var, serial:\n{after_toml}"
-    );
-
-    let after_update = serial_cmd(&guest, "update\n", 15, |t| t.contains("usage: update"));
-    assert!(
-        after_update.contains("usage: update"),
-        "Appliance CLI update without a Host image must print usage, serial:\n{after_update}"
-    );
-    assert!(
-        !after_update.to_ascii_lowercase().contains("reboot")
-            && !after_update.to_ascii_lowercase().contains("staged"),
-        "update without an image must not stage, serial:\n{after_update}"
-    );
+    let host = host_update_status(&guest);
+    assert_eq!(host["staged"], "", "nothing was staged: {host}");
+    assert_eq!(host["rollback_queued"], false, "no rollback queued: {host}");
+    assert_eq!(host["operation"]["state"], "idle", "no Host update ran: {host}");
 
     guest
         .serial_write("echo SHELL_RAN\n")
@@ -3740,18 +3965,80 @@ fn published_serial_cli_applies_full_desired_state() {
     let after_shell = guest.serial();
     let shell_tail = serial_tail(&after_shell, 2000);
     assert!(
-        shell_tail.contains("unknown command"),
-        "serial must stay the admin Appliance CLI, serial:\n{after_shell}"
+        shell_tail.contains("unknown command")
+            && !shell_tail.lines().any(|l| l.trim() == "SHELL_RAN"),
+        "serial must stay authenticated recovery, not a Host shell, serial:\n{after_shell}"
     );
+
+    // The UI replaces the retired complete-state apply and show.
+    let (code, applied) = ui_import_and_apply(&alice, &full);
+    assert_eq!(code, 200, "{applied}");
+    assert_eq!(applied["outcome"], "accepted", "{applied}");
+    let (code, exported) = alice
+        .exchange(
+            "POST",
+            "/api/desired-state/export",
+            Some(r#"{"acknowledge_sensitive":true}"#),
+            15,
+        )
+        .unwrap();
+    assert_eq!(code, 200);
+    let exported: serde_json::Value = serde_json::from_str(&exported).expect("export JSON");
+    let exported = exported["content"].as_str().expect("export file content");
+    for expected in ["name = \"wg0\"", "198.51.100.0/24", "203.0.113.50", "fq_codel", WG_PRIVATE] {
+        assert!(
+            exported.contains(expected),
+            "UI export round-trips complete Desired state ({expected} missing)"
+        );
+    }
+
+    // Authenticated recovery still sees and restores network revisions.
+    let recovery = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains("Previous accepted network revision:")
+    });
     assert!(
-        !shell_tail.lines().any(|l| l.trim() == "SHELL_RAN"),
-        "serial must not be a Host shell, serial:\n{after_shell}"
+        recovery.contains(&format!("Accepted network revision: {}", revision + 1))
+            && recovery.contains(&format!("Previous accepted network revision: {revision}")),
+        "recovery status, serial:\n{recovery}"
     );
-    assert_no_ssh(&guest, "after serial apply");
+    let restored = serial_cmd(&guest, "restore-previous\n", 120, |t| t.contains("\"outcome\""));
+    assert!(
+        restored.contains("\"outcome\":\"accepted\""),
+        "console restoration, serial:\n{restored}"
+    );
+    let routes: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/routes").unwrap()).unwrap();
+    assert_eq!(routes["revision"], revision + 2);
+    assert_eq!(routes["routes"], serde_json::json!([]));
+    assert_no_ssh(&guest, "after the v1 console scope checks");
+}
+
+/// Stage `image` from the rendered UI and wait until staging ends.
+fn stage_from_ui(guest: &Guest, image: &str) -> serde_json::Value {
+    let started = guest
+        .browser_host_update("stage", "alice", "secret12", image)
+        .expect("rendered stage request");
+    assert!(
+        started["result"].as_str().unwrap_or_default().contains("started"),
+        "{started}"
+    );
+    wait_until(
+        1200,
+        std::time::Duration::from_secs(5),
+        "Host update staging must finish",
+        || {
+            let status = host_update_status(guest);
+            if status["operation"]["state"] == "staging" {
+                Err(status.to_string())
+            } else {
+                Ok(status)
+            }
+        },
+    )
 }
 
 #[test]
-fn published_serial_stages_host_update_then_reboot_applies() {
+fn published_ui_staged_host_update_activates_on_console_reboot_and_rolls_back_from_recovery() {
     let _guard = guest_lock();
     let registry = LocalRegistry::publish_next_release()
         .expect("Workstation-local registry must serve a newer Release");
@@ -3764,274 +4051,132 @@ fn published_serial_stages_host_update_then_reboot_applies() {
     );
     let (lan_nic, wan_nic) = published_user_net_and_extra(&guest);
     let image = registry.guest_image();
-
-    let refused = serial_cmd(&guest, &format!("update {image}\n"), 30, |t| {
-        let l = t.to_ascii_lowercase();
-        l.contains("admin") || l.contains("refus")
-    });
-    let refused_l = refused.to_ascii_lowercase();
-    assert!(
-        refused_l.contains("admin") || refused_l.contains("refus"),
-        "Host update must be refused until an admin exists, serial:\n{refused}"
-    );
-    assert!(
-        !refused.contains("\"ok\": true") && !refused.contains("\"ok\":true"),
-        "Host update must not be accepted before an admin exists, serial:\n{refused}"
-    );
-
     let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     https_bootstrap(&guest, &payload);
     serial_login_admin(&guest, "alice", "secret12");
 
-    // The UI Host update flow is covered by
-    // published_ui_stages_host_update_keeps_forwarding_and_reboots_offline;
-    // this legacy serial adapter stays callable until its retirement.
+    // Routine Host update staging is a UI workflow.
     let before_len = guest.serial().len();
-    let staged = serial_cmd(&guest, &format!("update {image}\n"), 1200, |t| {
-        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
-            && t.to_ascii_lowercase().contains("reboot_required")
-    });
+    let staged = stage_from_ui(&guest, &image);
+    assert_eq!(staged["operation"]["state"], "idle", "{staged}");
+    assert_eq!(staged["reboot_required"], true, "{staged}");
+    let next_image = staged["staged"].as_str().unwrap_or_default().to_string();
     assert!(
-        staged.contains("\"ok\": true") || staged.contains("\"ok\":true"),
-        "Appliance CLI on serial must stage a Host update from the Workstation-local registry, serial:\n{staged}"
+        next_image.contains("fwos:next") || next_image.contains(&image),
+        "a Release is one tag; staged image must be the Workstation-local Release: {staged}"
     );
+    let previous = staged["booted"].as_str().unwrap_or_default().to_string();
+    assert!(!previous.is_empty() && !previous.contains("fwos:next"), "{staged}");
+    let new = guest.serial()[before_len..].to_string();
     assert!(
-        staged.to_ascii_lowercase().contains("reboot_required") && staged.contains("true"),
-        "staging must report that a reboot is required, serial:\n{staged}"
-    );
-    assert!(
-        staged.contains("fwos:next") || staged.contains(&image),
-        "a Release is one tag; staged image must be the Workstation-local Release, serial:\n{staged}"
-    );
-
-    let after = guest.serial();
-    let new = if after.len() > before_len {
-        &after[before_len..]
-    } else {
-        after.as_str()
-    };
-    let new_l = new.to_ascii_lowercase();
-    assert!(
-        !new_l.contains("linux version") && !new.contains("FWOS Bootstrap console"),
+        !new.to_ascii_lowercase().contains("linux version")
+            && !new.contains("FWOS Bootstrap console"),
         "Host update must not reboot by itself, serial:\n{new}"
     );
 
+    // The recovery menu reports the staged Host update, and its reboot
+    // activates it.
     let still = serial_cmd(&guest, "status\n", 20, |t| {
-        t.contains("fwos-box") && t.contains("fwos>")
+        t.contains("fwos-box") && t.contains("recovery>") && t.contains("Host update staged")
     });
     assert!(
-        still.contains("fwos-box") && still.contains("fwos>"),
-        "running bootc deployment is unchanged; Appliance CLI session must survive staging, serial:\n{still}"
+        still.contains("Host update staged: the next boot runs")
+            && still.contains("Reboot required"),
+        "authenticated recovery status must show the staged Host update, serial:\n{still}"
     );
-
-    let mut ui_status = String::new();
-    for _ in 0..30 {
-        match https_authenticated_status(&guest) {
-            Ok(body) => {
-                ui_status = body;
-                if ui_status.contains("\"bootstrapped\"") && ui_status.contains("true") {
-                    break;
-                }
-            }
-            Err(e) => ui_status = e.to_string(),
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    assert!(
-        ui_status.contains("\"bootstrapped\"") && ui_status.contains("true"),
-        "Forwarding must keep running after staging; UI status:\n{ui_status}; serial:\n{}",
-        guest.serial()
-    );
-    assert!(
-        ui_status.contains("\"wan\"") && ui_status.contains("192.0.2.1"),
-        "WAN role must still be applied after staging, status:\n{ui_status}"
-    );
-    assert_no_ssh(&guest, "after Host update stage");
-
-    let previous = json_string_field(&staged, "booted");
-    let next_image = json_string_field(&staged, "staged")
-        .filter(|s| s.contains("fwos:next") || s.contains(&image))
-        .unwrap_or_else(|| image.clone());
     let from = guest.serial().len();
     guest
         .serial_write("reboot\n")
-        .expect("explicit Appliance CLI reboot after stage");
-    let rebooted = serial_wait(&guest, from, 300, |t| {
-        t.to_ascii_lowercase().contains("fwos appliance cli")
-    });
+        .expect("explicit recovery reboot after UI stage");
+    let rebooted = serial_wait(&guest, from, 300, |t| t.contains(RECOVERY_BANNER));
     assert!(
-        rebooted.to_ascii_lowercase().contains("fwos appliance cli"),
+        rebooted.contains(RECOVERY_BANNER),
         "operator reboot on serial must restart the guest onto the staged bootc deployment, serial:\n{rebooted}"
     );
-    assert!(
-        !serial_tail(&rebooted, 4000).contains("unknown command"),
-        "Appliance CLI reboot must be a command, not a Host shell, serial:\n{rebooted}"
-    );
-
     serial_login_admin_from(&guest, "alice", "secret12", from);
     let deployed = serial_cmd(&guest, "status\n", 30, |t| {
         t.contains("fwos-box")
             && t.contains("fwd: yes")
             && t.contains("mgmt: yes")
             && t.contains("netd: running")
-            && (t.contains("fwos:next") || t.contains(&image) || t.contains(&next_image))
+            && t.contains("booted:")
     });
-    assert!(
-        deployed.contains("fwos-box"),
-        "/var is shared across bootc deployments; hostname must survive reboot, serial:\n{deployed}"
-    );
     assert!(
         deployed.contains("bootstrapped"),
         "/var is shared; Bootstrap stamp must survive reboot, serial:\n{deployed}"
     );
-    assert!(
-        deployed.contains("fwos:next")
-            || deployed.contains(&image)
-            || deployed.contains(&next_image),
-        "guest must come up on the new bootc deployment, serial:\n{deployed}"
-    );
     let booted = json_status_image(&deployed, "booted").unwrap_or_default();
     let rollback = json_status_image(&deployed, "rollback").unwrap_or_default();
-    let staged_after = json_status_image(&deployed, "staged").unwrap_or_default();
     assert!(
-        booted.contains("fwos:next") || booted.contains(&image) || booted.contains(&next_image),
+        booted.contains("fwos:next") || booted.contains(&next_image),
         "booted bootc deployment must be the new Host image, serial:\n{deployed}"
     );
     assert!(
-        staged_after.is_empty()
-            || (!staged_after.contains("fwos:next") && !staged_after.contains(&image)),
+        json_status_image(&deployed, "staged").is_none(),
         "reboot must consume the staged deployment, serial:\n{deployed}"
     );
     assert!(
-        deployed.contains("rollback:") && !rollback.contains("fwos:next"),
-        "previous bootc deployment remains the rollback target, serial:\n{deployed}"
-    );
-    if let Some(prev) = previous.as_deref() {
-        if !prev.is_empty() && !prev.contains("fwos:next") {
-            assert!(
-                rollback.contains(prev) || deployed.contains(prev),
-                "rollback target must be the previously booted image {prev}, serial:\n{deployed}"
-            );
-        }
-    }
-    assert!(
-        deployed.contains("fwd: yes") && deployed.contains("mgmt: yes"),
-        "fwd and mgmt must exist after the Host-update reboot, serial:\n{deployed}"
-    );
-    assert!(
-        deployed.contains("netd: running"),
-        "netd must be running after the Host-update reboot, serial:\n{deployed}"
+        rollback.contains(&previous),
+        "previous bootc deployment {previous} remains the rollback target, serial:\n{deployed}"
     );
 
-    let mut ui_after = String::new();
-    for _ in 0..180 {
-        match https_authenticated_status(&guest) {
-            Ok(body) => {
-                ui_after = body;
-                if ui_after.contains("\"bootstrapped\"") && ui_after.contains("true") {
-                    break;
-                }
-            }
-            Err(e) => ui_after = e.to_string(),
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    let accepted = wait_update_accepted(&guest);
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let status: serde_json::Value =
+        serde_json::from_str(&alice.get("/api/status").unwrap()).unwrap();
+    assert_eq!(status["bootstrapped"], true, "{status}");
     assert!(
-        ui_after.contains("\"bootstrapped\"") && ui_after.contains("true"),
-        "after reboot, HTTPS UI in mgmt must still serve status; got:\n{ui_after}; serial:\n{}",
-        guest.serial()
+        status.to_string().contains("fwos-box")
+            && status.to_string().contains("\"wan\"")
+            && status.to_string().contains("\"lan\""),
+        "HTTPS status must show hostname and interface roles from shared /var: {status}"
     );
-    assert!(
-        ui_after.contains("fwos-box")
-            && ui_after.contains("\"wan\"")
-            && ui_after.contains("\"lan\""),
-        "HTTPS status must show hostname and interface roles from shared /var, status:\n{ui_after}"
-    );
+    // Desired state that fails validation must not roll back the Host image.
+    let invalid = serde_json::json!({
+        "base_revision": accepted_revision(&alice), "content": "this-is-not-desired-state",
+    });
+    let (code, _) = alice
+        .exchange(
+            "POST",
+            "/api/desired-state/import",
+            Some(&invalid.to_string()),
+            30,
+        )
+        .unwrap();
+    assert_eq!(code, 400, "invalid Desired state is rejected");
+    assert_eq!(host_update_status(&guest)["booted"], accepted["booted"]);
 
-    let bad = serial_cmd(&guest, "apply this-is-not-desired-state\n", 20, |t| {
-        let l = t.to_ascii_lowercase();
-        l.contains("error")
-            || l.contains("parse")
-            || l.contains("\"ok\": false")
-            || l.contains("\"ok\":false")
+    // Manual rollback is the recovery menu's rollback-image.
+    let rolled = serial_cmd(&guest, "rollback-image\n", 60, |t| {
+        t.contains("Host image rollback") && t.contains("recovery>")
     });
     assert!(
-        !bad.contains("\"ok\": true") && !bad.contains("\"ok\":true"),
-        "invalid Desired state must not apply, serial:\n{bad}"
+        rolled.contains("Host image rollback queued") && rolled.contains(&previous),
+        "rollback-image must queue the previous bootc deployment, serial:\n{rolled}"
     );
-    let still_next = serial_cmd(&guest, "status\n", 20, |t| {
-        t.contains("fwos-box")
-            && (t.contains("fwos:next") || t.contains(&image) || t.contains(&next_image))
-    });
-    let still_booted = json_status_image(&still_next, "booted").unwrap_or_default();
-    assert!(
-        still_booted.contains("fwos:next")
-            || still_booted.contains(&image)
-            || still_booted.contains(&next_image)
-            || still_next.contains("fwos:next"),
-        "Desired state that fails to apply must not roll back the Host image, serial:\n{still_next}"
-    );
-
-    let help = serial_cmd(&guest, "help\n", 10, |t| t.contains("logout"));
-    assert!(
-        help.contains("status")
-            && help.contains("restore-previous")
-            && help.contains("reboot")
-            && help.contains("rollback-image")
-            && !help.lines().any(|l| l.trim() == "rollback")
-            && !help.contains("apply <"),
-        "v1 recovery help must stay limited while legacy commands remain callable, serial:\n{help}"
-    );
-    // The old full-CLI adapter stays callable until its separate retirement.
-    let rolled = serial_cmd(&guest, "rollback\n", 60, |t| {
-        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
-            && t.to_ascii_lowercase().contains("reboot_required")
-    });
-    assert!(
-        rolled.contains("\"ok\": true") || rolled.contains("\"ok\":true"),
-        "Appliance CLI rollback must queue the previous bootc deployment, serial:\n{rolled}"
-    );
-    assert!(
-        !serial_tail(&rolled, 4000).contains("unknown command"),
-        "rollback must be an Appliance CLI command, serial:\n{rolled}"
-    );
-
     let from_rb = guest.serial().len();
     guest
         .serial_write("reboot\n")
         .expect("explicit reboot after manual rollback");
-    let rb_boot = serial_wait(&guest, from_rb, 300, |t| {
-        t.to_ascii_lowercase().contains("fwos appliance cli")
-    });
+    let rb_boot = serial_wait(&guest, from_rb, 300, |t| t.contains(RECOVERY_BANNER));
     assert!(
-        rb_boot.to_ascii_lowercase().contains("fwos appliance cli"),
+        rb_boot.contains(RECOVERY_BANNER),
         "manual rollback reboot must restart the guest, serial:\n{rb_boot}"
     );
     serial_login_admin_from(&guest, "alice", "secret12", from_rb);
     let back = serial_cmd(&guest, "status\n", 30, |t| {
-        t.contains("fwos-box")
-            && t.contains("fwd: yes")
-            && t.contains("netd: running")
-            && t.contains("booted:")
+        t.contains("fwos-box") && t.contains("netd: running") && t.contains("booted:")
     });
     let back_booted = json_status_image(&back, "booted").unwrap_or_default();
     assert!(
-        back.contains("booted:") && !back_booted.contains("fwos:next"),
-        "manual rollback must return the previous bootc deployment, serial:\n{back}"
+        back_booted.contains(&previous),
+        "manual rollback must boot {previous}, serial:\n{back}"
     );
-    if let Some(prev) = previous.as_deref() {
-        if !prev.is_empty() && !prev.contains("fwos:next") {
-            assert!(
-                back_booted.contains(prev) || back.contains(prev),
-                "manual rollback must boot {prev}, serial:\n{back}"
-            );
-        }
-    }
     assert!(
-        back.contains("netd: running"),
-        "netd must be running after manual rollback, serial:\n{back}"
+        back.contains("fwd: yes") && back.contains("mgmt: yes"),
+        "fwd and mgmt must exist after manual rollback, serial:\n{back}"
     );
-    assert_no_ssh(&guest, "after Host update reboot");
+    assert_no_ssh(&guest, "after Host update reboot and rollback");
 }
 
 fn host_update_status(guest: &Guest) -> serde_json::Value {
@@ -4119,9 +4264,9 @@ fn wait_staging_done(
 }
 
 fn wait_ui_reboot(guest: &Guest, from: usize) {
-    let rebooted = serial_wait(guest, from, 600, |text| text.contains("FWOS Appliance CLI"));
+    let rebooted = serial_wait(guest, from, 600, |text| text.contains(RECOVERY_BANNER));
     assert!(
-        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        rebooted.contains(RECOVERY_BANNER) && !rebooted.contains("FWOS Bootstrap console"),
         "UI reboot must restart the owned appliance: {rebooted}"
     );
 }
@@ -4216,7 +4361,7 @@ fn published_ui_stages_host_update_keeps_forwarding_and_reboots_offline() {
     assert_eq!(staged["reboot_required"], true, "{staged}");
     let new = &guest.serial()[from..];
     assert!(
-        !new.contains("FWOS Appliance CLI"),
+        !new.contains(RECOVERY_BANNER),
         "staging must not reboot: {new}"
     );
     let rendered = guest
@@ -4502,7 +4647,7 @@ fn published_ui_stages_host_update_over_ipv6_only_wan_without_delegation() {
 }
 
 #[test]
-fn published_serial_rolls_back_host_update_when_netd_is_dead() {
+fn published_host_update_rolls_back_when_netd_is_dead() {
     let _guard = guest_lock();
     let registry = LocalRegistry::publish_dead_netd_release()
         .expect("Workstation-local registry must serve a Release with dead netd");
@@ -4518,39 +4663,26 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
 
     let payload = wan_lan_bootstrap_json(&lan_nic, &wan_nic);
     https_bootstrap(&guest, &payload);
-    serial_login_admin(&guest, "alice", "secret12");
 
-    let prior = serial_cmd(&guest, "status\n", 20, |t| {
-        t.contains("fwos-box") && t.contains("netd: running")
-    });
-    let previous = json_status_image(&prior, "booted").unwrap_or_default();
-
-    let staged = serial_cmd(&guest, &format!("update {image}\n"), 1200, |t| {
-        (t.contains("\"ok\": true") || t.contains("\"ok\":true"))
-            && t.to_ascii_lowercase().contains("reboot_required")
-    });
-    assert!(
-        staged.contains("\"ok\": true") || staged.contains("\"ok\":true"),
-        "Appliance CLI must stage the dead-netd Release, serial:\n{staged}"
-    );
+    let staged = stage_from_ui(&guest, &image);
+    assert_eq!(staged["reboot_required"], true, "UI must stage the dead-netd Release: {staged}");
+    let previous = staged["booted"].as_str().unwrap_or_default().to_string();
 
     let from = guest.serial().len();
-    guest
-        .serial_write("reboot\n")
-        .expect("explicit Appliance CLI reboot onto the dead-netd deployment");
-    let rolled = serial_wait(&guest, from, 600, |t| {
-        t.to_ascii_lowercase().matches("fwos appliance cli").count() >= 2
-    });
+    let rendered = guest
+        .browser_host_update("reboot", "alice", "secret12", "")
+        .expect("rendered reboot onto the dead-netd deployment");
     assert!(
-        rolled.to_ascii_lowercase().matches("fwos appliance cli").count() >= 2,
+        rendered["result"].as_str().unwrap_or_default().starts_with("Rebooting"),
+        "{rendered}"
+    );
+    let rolled = serial_wait(&guest, from, 600, |t| t.matches(RECOVERY_BANNER).count() >= 2);
+    assert!(
+        rolled.matches(RECOVERY_BANNER).count() >= 2,
         "failed appliance health (dead netd) must reboot into the previous bootc deployment, serial:\n{rolled}"
     );
 
-    let serial_now = guest.serial();
-    let login_from = serial_now
-        .to_ascii_lowercase()
-        .rfind("fwos appliance cli")
-        .unwrap_or(from);
+    let login_from = guest.serial().rfind(RECOVERY_BANNER).unwrap_or(from);
     serial_login_admin_from(&guest, "alice", "secret12", login_from);
     let deployed = serial_cmd(&guest, "status\n", 30, |t| {
         t.contains("fwos-box")
@@ -4563,12 +4695,10 @@ fn published_serial_rolls_back_host_update_when_netd_is_dead() {
         deployed.contains("booted:") && !booted.contains("fwos:next"),
         "auto rollback must leave the previous bootc deployment booted, not the dead-netd Release, serial:\n{deployed}"
     );
-    if !previous.is_empty() && !previous.contains("fwos:next") {
-        assert!(
-            booted.contains(&previous) || deployed.contains(&previous),
-            "rollback target must be the previously booted image {previous}, serial:\n{deployed}"
-        );
-    }
+    assert!(
+        booted.contains(&previous),
+        "rollback target must be the previously booted image {previous}, serial:\n{deployed}"
+    );
     assert!(
         deployed.contains("fwd: yes") && deployed.contains("mgmt: yes"),
         "fwd and mgmt must exist after automatic rollback, serial:\n{deployed}"
@@ -4764,10 +4894,10 @@ fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps
 
     // No operator action: appliance health reboots into the previous Release.
     let rolled = serial_wait(&guest, from, 600, |text| {
-        text.matches("FWOS Appliance CLI").count() >= 2
+        text.matches(RECOVERY_BANNER).count() >= 2
     });
     assert!(
-        rolled.matches("FWOS Appliance CLI").count() >= 2,
+        rolled.matches(RECOVERY_BANNER).count() >= 2,
         "failed appliance health must reboot into the previous bootc deployment: {rolled}"
     );
     let status = host_update_status_as(&guest, "secret56");
@@ -4814,7 +4944,7 @@ fn published_host_update_rolls_back_when_lan_services_are_not_restored_and_keeps
             Err(error) => assert!(error.to_string().contains("401"), "{error}"),
         }
     }
-    let login_from = guest.serial().rfind("FWOS Appliance CLI").unwrap_or(from);
+    let login_from = guest.serial().rfind(RECOVERY_BANNER).unwrap_or(from);
     serial_login_admin_from(&guest, "alice", "secret56", login_from);
     assert_no_ssh(&guest, "after automatic rollback of broken LAN services");
 }
@@ -4896,10 +5026,10 @@ fn published_host_update_rollback_restores_the_pre_update_network_as_a_new_revis
     // No operator action: appliance health reboots into the previous Release,
     // which restores the pre-update network as a new Accepted revision.
     let rolled = serial_wait(&guest, from, 600, |text| {
-        text.matches("FWOS Appliance CLI").count() >= 2
+        text.matches(RECOVERY_BANNER).count() >= 2
     });
     assert!(
-        rolled.matches("FWOS Appliance CLI").count() >= 2,
+        rolled.matches(RECOVERY_BANNER).count() >= 2,
         "failed appliance health must reboot into the previous bootc deployment: {rolled}"
     );
     let status = wait_network_restoration(&guest, "secret56");
@@ -5180,7 +5310,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
         .expect("pull the UI NIC cable");
     https_must_not_answer(&guest, 5, "with the UI NIC unplugged");
 
-    let console_from = guest.serial().rfind("FWOS Appliance CLI").unwrap_or(from);
+    let console_from = guest.serial().rfind(RECOVERY_BANNER).unwrap_or(from);
     assert_serial_logins_refused(
         &guest,
         console_from,
@@ -5198,7 +5328,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
         "the recovery menu distinguishes image rollback from network restoration: {help}"
     );
     let status = serial_cmd(&guest, "status\n", 30, |text| {
-        text.contains("Previous Host image") && text.contains("fwos>")
+        text.contains("Previous Host image") && text.contains("recovery>")
     });
     assert!(
         status.contains(&format!(
@@ -5214,7 +5344,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     );
 
     let queued = serial_cmd(&guest, "rollback-image\n", 60, |text| {
-        text.contains("Host image rollback") && text.contains("fwos>")
+        text.contains("Host image rollback") && text.contains("recovery>")
     });
     assert!(
         queued.contains(&format!(
@@ -5230,7 +5360,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     );
     // Queued, not activated: the newer Release keeps running until reboot.
     let still = serial_cmd(&guest, "status\n", 30, |text| {
-        text.contains("Host image rollback queued") && text.contains("fwos>")
+        text.contains("Host image rollback queued") && text.contains("recovery>")
     });
     assert!(
         still.contains(&format!(
@@ -5255,7 +5385,7 @@ fn published_serial_image_rollback_without_the_ui_keeps_the_network_revision_and
     let serial = guest.serial();
     let rebooted = &serial[from_rb..];
     assert!(
-        rebooted.contains("FWOS Appliance CLI") && !rebooted.contains("FWOS Bootstrap console"),
+        rebooted.contains(RECOVERY_BANNER) && !rebooted.contains("FWOS Bootstrap console"),
         "the image rollback reboot must not reopen Bootstrap: {rebooted}"
     );
     serial_login_admin_from(&guest, "alice", "secret56", guest.serial().len());
@@ -6724,7 +6854,7 @@ fn serial_login_admin_from(guest: &Guest, user: &str, password: &str, from: usiz
         } else {
             last.as_str()
         };
-        if new.contains("FWOS Appliance CLI") || new.contains("admin:") {
+        if new.contains(RECOVERY_BANNER) || new.contains("admin:") {
             break;
         }
         let _ = guest.serial_write("\n");
@@ -6736,12 +6866,12 @@ fn serial_login_admin_from(guest: &Guest, user: &str, password: &str, from: usiz
         last.as_str()
     };
     assert!(
-        new.contains("FWOS Appliance CLI") || last.contains("FWOS Appliance CLI"),
-        "after Bootstrap, serial must be the admin Appliance CLI; serial:\n{last}"
+        new.contains(RECOVERY_BANNER) || last.contains(RECOVERY_BANNER),
+        "after Bootstrap, serial must be authenticated recovery; serial:\n{last}"
     );
     guest
         .serial_write(&format!("{user}\n"))
-        .expect("admin name on Appliance CLI");
+        .expect("admin name on Appliance console");
     let mut saw_password = false;
     for _ in 0..15 {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -6757,24 +6887,24 @@ fn serial_login_admin_from(guest: &Guest, user: &str, password: &str, from: usiz
     }
     assert!(
         saw_password,
-        "Appliance CLI must prompt for the admin password, serial:\n{last}"
+        "Appliance console must prompt for the admin password, serial:\n{last}"
     );
     guest
         .serial_write(&format!("{password}\n"))
-        .expect("admin password on Appliance CLI");
+        .expect("admin password on Appliance console");
     let mut logged_in = false;
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         last = guest.serial();
         let tail = serial_tail(&last, 3000);
-        if tail.contains("fwos>") {
+        if tail.contains("recovery>") {
             logged_in = true;
             break;
         }
     }
     assert!(
         logged_in,
-        "admin must authenticate into the Appliance CLI, serial:\n{}",
+        "admin must authenticate into authenticated recovery, serial:\n{}",
         last.replace(password, "[redacted]")
     );
 }
@@ -6905,7 +7035,7 @@ fn post_bootstrap_observe_serial(guest: &Guest, payload: &str) {
     };
     let mut last = guest.serial();
     for _ in 0..120 {
-        if last.contains("Bootstrap complete") || last.contains("FWOS Appliance CLI") {
+        if last.contains("Bootstrap complete") || last.contains(RECOVERY_BANNER) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -7493,9 +7623,9 @@ fn published_console_opt_survives_reboot_before_bootstrap() {
         "reboot before Bootstrap must return to the Bootstrap console; serial:\n{last}"
     );
     assert!(
-        !serial_tail(new, 4000).contains("FWOS Appliance CLI")
+        !serial_tail(new, 4000).contains(RECOVERY_BANNER)
             || serial_tail(new, 4000).contains("FWOS Bootstrap console"),
-        "reboot before Bootstrap is not the admin Appliance CLI; serial:\n{last}"
+        "reboot before Bootstrap is not authenticated recovery; serial:\n{last}"
     );
 
     let mut after = String::new();
@@ -7661,30 +7791,28 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
     );
 
     serial_login_admin(&guest, "alice", "secret12");
-    let shown = serial_cmd(&guest, "show\n", 20, |t| {
-        t.contains("role = \"wan\"")
-            && t.contains("role = \"lan\"")
-            && t.contains(&lan)
-            && t.contains("vlan = 42")
+    let wan_line = format!("{nic}  wan");
+    let lan_line = format!("{lan}  lan");
+    let shown = serial_cmd(&guest, "status\n", 20, |t| {
+        t.contains(&wan_line) && t.contains(&lan_line) && t.contains("UI exposure:")
     });
     assert!(
-        shown.contains("role = \"wan\"") && shown.contains("role = \"lan\""),
-        "Appliance CLI show must list WAN and LAN L2s, serial:\n{shown}"
+        shown.contains(&wan_line) && shown.contains(&lan_line),
+        "recovery status must list the untagged WAN and the operator-chosen LAN VLAN, serial:\n{shown}"
+    );
+    let exposure = shown
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with("UI exposure:"))
+        .unwrap_or_default();
+    assert_eq!(
+        exposure,
+        format!("UI exposure: {lan}"),
+        "UI exposure after apply is the LAN L2, not the WAN parent, serial:\n{shown}"
     );
     assert!(
-        shown.contains(&lan) && shown.contains("vlan = 42"),
-        "operator-chosen LAN VID must be Desired state, serial:\n{shown}"
-    );
-    assert!(
-        shown.contains("ui_exposure") && shown.contains(&format!("\"{lan}\"")),
-        "UI exposure after apply is the LAN L2, serial:\n{shown}"
-    );
-    assert!(
-        !shown.contains(&format!("ui_exposure = [\"{nic}\"]")),
-        "UI exposure must not be the WAN parent, serial:\n{shown}"
-    );
-    assert!(
-        !shown.contains("stick"),
+        !serial_tail(&shown, 2000).contains("stick"),
         "one-NIC WAN+LAN Desired state has no stick role, serial:\n{shown}"
     );
     let from = guest.serial().len();
@@ -7705,10 +7833,13 @@ fn published_one_nic_untagged_wan_stops_https_after_apply() {
         "reboot must not re-expose temporary HTTPS on the untagged WAN",
     );
     serial_login_admin_from(&guest, "alice", "secret12", from);
-    let after = serial_cmd(&guest, "show\n", 20, |text| {
-        text.contains("role = \"wan\"") && text.contains("role = \"lan\"")
+    let after = serial_cmd(&guest, "status\n", 20, |text| {
+        text.contains(&wan_line) && text.contains(&lan_line)
     });
-    assert!(after.contains(&lan) && after.contains("ui_exposure"));
+    assert!(
+        after.contains(&lan_line) && after.contains(&format!("UI exposure: {lan}")),
+        "one-NIC Accepted state survives reboot, serial:\n{after}"
+    );
 }
 
 #[test]
@@ -7724,7 +7855,7 @@ fn installer_writes_host_image_onto_empty_disk() {
     let lower = serial.to_ascii_lowercase();
     assert!(
         !lower.contains("login:"),
-        "Appliance CLI owns serial after First install; serial:\n{serial}"
+        "Appliance console owns serial after First install; serial:\n{serial}"
     );
 
     https_must_not_answer(&guest, 10, "after First install, before a console opt");

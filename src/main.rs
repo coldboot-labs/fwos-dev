@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         },
         Some("run") => match fwos_dev::Guest::boot_published_host_image() {
             Ok(guest) => {
-                println!("guest is up. Observe serial (Appliance CLI) and HTTPS (UI).");
+                println!("guest is up. Observe serial (Appliance console) and HTTPS (UI).");
                 println!(
                     "  UI: https://127.0.0.1:{}/ (self-signed)",
                     guest.https_port()

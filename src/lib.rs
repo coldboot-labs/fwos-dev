@@ -33,7 +33,6 @@ const NEXT_IMAGE_TAG: &str = "localhost/fwos:next";
 const REGISTRY_IMAGE: &str = "docker.io/library/registry:2";
 const HOST_PROGRAM_TAG: &str = "localhost/fwos-fwd-setup:dev";
 const NETD_IMAGE_TAG: &str = "localhost/fwos-netd:dev";
-const CLI_IMAGE_TAG: &str = "localhost/fwos-cli:dev";
 const UI_IMAGE_TAG: &str = "localhost/fwos-ui:dev";
 const KEA_IMAGE_TAG: &str = "localhost/fwos-kea:dev";
 const UNBOUND_IMAGE_TAG: &str = "localhost/fwos-unbound:dev";
@@ -1295,7 +1294,7 @@ impl Guest {
     }
 
     fn wait_for_serial_timeout(&mut self, needle: &str, wait: Duration) -> Result<(), Error> {
-        progress("waiting for Appliance CLI");
+        progress("waiting for the Appliance console");
         let deadline = Instant::now() + wait;
         loop {
             if let Some(status) = self
@@ -1464,7 +1463,7 @@ struct HostImageParts {
     addons: PathBuf,
     binary: PathBuf,
     netd: PathBuf,
-    cli: PathBuf,
+    console: PathBuf,
     ui: PathBuf,
     update: PathBuf,
 }
@@ -1482,11 +1481,11 @@ fn host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         )));
     }
     let addons = builtin_addons_dir()?;
-    let cli = release.join("fwos");
-    if !cli.is_file() {
+    let console = release.join("fwos-console");
+    if !console.is_file() {
         return Err(Error::from_message(format!(
             "cargo build did not produce {}",
-            cli.display()
+            console.display()
         )));
     }
     let ui = release.join("fwos-ui");
@@ -1509,7 +1508,7 @@ fn host_image_parts(image_dir: &Path) -> Result<HostImageParts, Error> {
         addons,
         binary,
         netd,
-        cli,
+        console,
         ui,
         update,
     })
@@ -1520,7 +1519,6 @@ impl HostImageParts {
         build_host_program_image(&self.src, &self.binary)?;
         progress("building Built-in addons");
         build_netd_image(&self.addons, &self.netd)?;
-        build_cli_image(&self.addons, &self.cli)?;
         build_ui_image(&self.addons, &self.ui)?;
         build_vendor_image(&self.addons.join("kea"), KEA_IMAGE_TAG)?;
         build_vendor_image(&self.addons.join("unbound"), UNBOUND_IMAGE_TAG)
@@ -1532,11 +1530,10 @@ impl HostImageParts {
             || source_newer_than(&self.image_dir, artifact)?
             || file_newer_than(&self.binary, artifact)?
             || file_newer_than(&self.netd, artifact)?
-            || file_newer_than(&self.cli, artifact)?
+            || file_newer_than(&self.console, artifact)?
             || file_newer_than(&self.ui, artifact)?
             || file_newer_than(&self.update, artifact)?
             || file_newer_than(&self.addons.join("netd").join("Containerfile"), artifact)?
-            || file_newer_than(&self.addons.join("cli").join("Containerfile"), artifact)?
             || file_newer_than(&self.addons.join("ui").join("Containerfile"), artifact)?
             || ui_sources_newer(&self.addons.join("ui"), artifact)?
             || file_newer_than(&self.addons.join("kea").join("Containerfile"), artifact)?
@@ -1700,28 +1697,6 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-fn build_cli_image(addons: &Path, binary: &Path) -> Result<(), Error> {
-    let context = binary
-        .parent()
-        .ok_or_else(|| Error::from_message("cli path has no parent"))?;
-    let dockerfile = addons.join("cli").join("Containerfile");
-    let output = Command::new("sudo")
-        .args(["podman", "build", "-t", CLI_IMAGE_TAG, "-f"])
-        .arg(&dockerfile)
-        .arg(context)
-        .output()
-        .map_err(|e| Error::from_io("running podman build for cli", e))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(Error::from_message(format!(
-            "podman build of cli failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
 }
 
 fn build_netd_image(addons: &Path, binary: &Path) -> Result<(), Error> {
@@ -2348,6 +2323,35 @@ pub fn build_published_host_image_disk() -> Result<PathBuf, Error> {
     let image_dir = host_image_dir()?;
     ensure_host_qcow2(&disk_path, &image_dir)?;
     Ok(disk_path)
+}
+
+/// Whether `path` exists in the Host image that the published Disk image was
+/// built from. This inspects the local Release image on the Workstation, not
+/// a guest: build or boot the published Disk image first.
+pub fn host_image_has_path(path: &str) -> Result<bool, Error> {
+    let output = Command::new("sudo")
+        .args([
+            "podman",
+            "run",
+            "--rm",
+            "--network=none",
+            "--entrypoint",
+            "/usr/bin/test",
+            HOST_IMAGE_TAG,
+            "-e",
+            path,
+        ])
+        .output()
+        .map_err(|e| Error::from_io("running podman to inspect the Host image", e))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::from_message(format!(
+            "inspecting {path} in {HOST_IMAGE_TAG} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
 }
 
 /// Anaconda Installer ISO from the same Host image (self-contained, no registry).

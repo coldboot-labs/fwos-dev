@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 age = { version = "0.12", features = ["armor"] }
+toml = "0.8"
 
 # The encrypted export test runs scrypt; unoptimized it takes minutes.
 [profile.dev.package."*"]

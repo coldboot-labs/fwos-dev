@@ -9,10 +9,12 @@ fwos-dev build            # Disk image with no SSH key and no password (cached)
 fwos-dev build published  # same Disk image
 fwos-dev build installer  # Anaconda Installer ISO from the same Host image (UEFI, self-contained)
 fwos-dev run              # boot the Disk image under QEMU; observe serial and HTTPS
-cargo test                # QEMU guests on serial (Appliance CLI) and HTTPS (UI); never SSH
+cargo test                # QEMU guests on serial (Appliance console) and HTTPS (UI); never SSH
 ```
 
-The Disk image has no injected key and no default password. Observe it on the Bootstrap console over serial and the UI over HTTPS. Disks are cached under `$XDG_CACHE_HOME/fwos-dev/fwos-host/` (or `~/.cache/fwos-dev/fwos-host/`). `build` and `cargo test` run `sudo podman`; the first image build can take several minutes.
+The Disk image has no injected key and no default password. Observe it on the Bootstrap console over serial and the UI over HTTPS.
+
+`fwos-dev` is Workstation tooling, not an appliance interface. On the guest, serial is the Appliance console: the Bootstrap console before ownership, then a limited authenticated recovery menu (`status`, `restore-previous`, `rollback-image`, `reboot`). The full Appliance CLI is deferred to v2, so tests drive routine configuration and Host update through the UI over HTTPS, and use serial only for Bootstrap and those recovery operations. `published_v1_console_offers_only_bootstrap_and_recovery_not_the_full_cli` checks that the retired full-CLI commands (`show`, `apply`, `update`, `rollback`) are not available on either console mode and change nothing, that the built Host image ships the one Appliance console program (`fwos-console`) and no `fwos` CLI or CLI addon, and that the UI's complete-state import and the recovery menu still work. Tests that need a complete Desired state import it through the UI into a private draft and apply that draft, as an administrator would. Disks are cached under `$XDG_CACHE_HOME/fwos-dev/fwos-host/` (or `~/.cache/fwos-dev/fwos-host/`). `build` and `cargo test` run `sudo podman`; the first image build can take several minutes.
 
 ## Browser acceptance checks
 
