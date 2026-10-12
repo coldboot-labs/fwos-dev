@@ -6021,6 +6021,89 @@ fn published_lan_services_move_dhcp_and_dns_with_a_vlan_draft() {
 }
 
 #[test]
+fn published_vlan_services_and_firewall_apply_as_one_reviewed_revision() {
+    let _guard = guest_lock();
+    let lan_peer = NetworkPeer::new().expect("isolated LAN peer");
+    let wan_peer = NetworkPeer::new().expect("isolated WAN peer");
+    lan_peer.add_address("10.56.0.2/24").unwrap();
+    lan_peer.add_route("192.0.2.2/32", "10.56.0.1").unwrap();
+    wan_peer.add_address("192.0.2.2/24").unwrap();
+    let guest = Guest::boot_published_host_image_with_user_net_and_peers(&[&lan_peer, &wan_peer])
+        .expect("published Disk image");
+    let mgmt = opt_user_net(&guest);
+    let peers: Vec<String> = wait_console_nics(&guest)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name != &mgmt)
+        .collect();
+    let (lan, wan) = (peers[0].clone(), peers[1].clone());
+    let bootstrap = serde_json::json!({
+        "hostname": "fwos-box", "admin": "alice", "password": "secret12",
+        "interfaces": [
+            {"name": mgmt, "role": "mgmt", "addresses": ["10.0.2.15/24"]},
+            {"name": lan, "role": "lan", "addresses": ["10.56.0.1/24"]},
+            {"name": wan, "role": "wan", "addresses": ["192.0.2.1/24"]}
+        ],
+        "ui_exposure": [mgmt],
+        "lan_prefix": "10.56.0.0/24",
+        "dhcp_pool": "10.56.0.100-10.56.0.140"
+    });
+    https_bootstrap(&guest, &bootstrap.to_string());
+    let alice = https_login_admin(&guest, "alice", "secret12");
+    let before = accepted_revision(&alice);
+    assert!(lan_peer.ping("10.56.0.1").unwrap());
+    assert!(lan_peer.ping("192.0.2.2").unwrap());
+
+    let vlan = format!("{lan}.20");
+    guest
+        .browser_configure_interfaces(
+            "save-draft", "alice", "secret12",
+            &serde_json::json!([
+                {"op": "set", "name": lan, "role": "unused"},
+                {"op": "add-vlan", "name": vlan, "parent": lan, "vlan": 20,
+                 "role": "lan", "addresses": "192.168.20.1/24", "expose": false}
+            ]),
+            "",
+        )
+        .expect("VLAN joins the private draft");
+    guest
+        .browser_configure_lan_services(
+            "save-draft", "alice", "secret12",
+            "192.168.20.0/24", "192.168.20.50-192.168.20.80", "",
+        )
+        .expect("LAN services join the same draft");
+    guest
+        .browser_configure_policy(
+            "save-draft", "alice", "secret12", "", "192.168.20.0/24", "icmp", "drop", "",
+        )
+        .expect("firewall policy joins the same draft");
+    assert_eq!(accepted_revision(&alice), before, "saving cannot apply a draft");
+    assert!(lan_peer.ping("10.56.0.1").unwrap(), "draft policy is not live");
+    assert!(lan_peer.ping("192.0.2.2").unwrap(), "draft preserves forwarding");
+
+    guest
+        .browser_configure_policy(
+            "apply-draft", "alice", "secret12", "", "", "any", "drop",
+            "vlan 20\n192.168.20.50-192.168.20.80\nFirewall policy: ip saddr 192.168.20.0/24",
+        )
+        .expect("one rendered review applies the VLAN, services, and firewall policy");
+    assert_eq!(accepted_revision(&alice), before + 1);
+    let interfaces = alice.get("/api/interfaces").unwrap();
+    assert!(interfaces.contains(&vlan), "VLAN is accepted: {interfaces}");
+    let policy = alice.get("/api/firewall").unwrap();
+    assert!(policy.contains("192.168.20.0/24"), "firewall is accepted: {policy}");
+
+    lan_peer.add_vlan(20, "192.168.20.2/24").unwrap();
+    let lease = wait_vlan_offer(&lan_peer, "eth0.20");
+    let octet = lease.split('.').next_back().unwrap().parse::<u8>().unwrap();
+    assert!((50..=80).contains(&octet), "VLAN DHCP lease: {lease}");
+    lan_peer.add_address_on("eth0.20", &format!("{lease}/24")).unwrap();
+    assert!(wait_dns(&lan_peer, "192.168.20.1", &lease));
+    assert!(!lan_peer.ping("192.168.20.1").unwrap(), "accepted firewall drops VLAN input");
+    peer_https_stays_down(&wan_peer, "192.0.2.1");
+}
+
+#[test]
 fn published_firewall_policy_blocks_lan_input_and_keeps_forwarding() {
     let _guard = guest_lock();
     let lan_peer = NetworkPeer::new().expect("isolated LAN peer");

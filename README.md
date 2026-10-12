@@ -145,3 +145,7 @@ while failed fixture commands fail the test.
 
 Serialize appliance test runs across checkouts: the normal image builder uses
 shared local Podman image tags even when `XDG_CACHE_HOME` is different.
+
+The integrated v1 Disk image and Installer qualification for issue #78, including
+source versions, artifact hashes, environment, commands, and observed results,
+is recorded in [`qualification/issue-78.md`](qualification/issue-78.md).

@@ -41,8 +41,9 @@ try {
     stage = "draft-review";
     await page.getByRole("button", { name: "Review pending draft", exact: true }).click();
     const review = await page.locator("#draft-review-summary").textContent();
-    if (!review?.includes(input.expectInReview || "Firewall policy")) {
-      throw new Error("draft review omits the firewall policy");
+    const required = (input.expectInReview || "Firewall policy").split("\n");
+    if (!required.every((text) => review?.includes(text))) {
+      throw new Error("draft review omits a proposed section");
     }
     stage = "draft-apply";
     await page.getByRole("button", { name: "Apply reviewed draft", exact: true }).click();
