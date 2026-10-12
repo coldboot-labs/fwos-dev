@@ -307,6 +307,8 @@ impl Guest {
             } else {
                 create_empty_qcow2(&path)?;
             }
+            fs::copy(&path, work.join(format!("disk{}-before.qcow2", i + 1)))
+                .map_err(|e| Error::from_io("saving Installer disk before approval", e))?;
             disks.push(path);
         }
         let linux = extract_iso_linux(&iso, &work)?;
@@ -330,11 +332,87 @@ impl Guest {
             serial_log: &serial_log,
             serial_sock: &serial_sock,
             monitor: &monitor,
-            no_reboot: false,
+            no_reboot: true,
         })?;
         let ready = guest.wait_for_serial_timeout(needle, INSTALLER_PROMPT_WAIT);
         guest.wait_or_stop(ready)?;
         Ok(guest)
+    }
+
+    /// Compare each Installer target with its preboot virtual contents after QEMU stops.
+    /// The returned entries follow the serial disk order (disk1, disk2, ...).
+    pub fn installer_disk_changes_after_stop(mut self) -> Result<Vec<bool>, Error> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|e| Error::from_io("checking Installer QEMU", e))?
+            .is_none()
+        {
+            self.child
+                .kill()
+                .map_err(|e| Error::from_io("stopping Installer QEMU", e))?;
+        }
+        self.child
+            .wait()
+            .map_err(|e| Error::from_io("waiting for Installer QEMU", e))?;
+        let work = self
+            .serial_log
+            .parent()
+            .ok_or_else(|| Error::from_message("Installer work directory missing"))?;
+        let mut changes = Vec::new();
+        for i in 1.. {
+            let disk = work.join(format!("disk{i}.qcow2"));
+            if !disk.exists() {
+                break;
+            }
+            let before = work.join(format!("disk{i}-before.qcow2"));
+            let output = Command::new("qemu-img")
+                .args(["compare", "-f", "qcow2", "-F", "qcow2"])
+                .arg(&before)
+                .arg(&disk)
+                .output()
+                .map_err(|e| Error::from_io("comparing Installer disk contents", e))?;
+            match output.status.code() {
+                Some(0) => changes.push(false),
+                Some(1) => changes.push(true),
+                _ => {
+                    return Err(Error::from_message(format!(
+                        "qemu-img compare failed for {}: {}",
+                        disk.display(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+            }
+        }
+        Ok(changes)
+    }
+
+    /// A successful Installer requests reboot after writing its selected disk.
+    pub fn wait_for_installer_reboot(&mut self) -> Result<(), Error> {
+        let deadline = Instant::now() + INSTALL_WAIT;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|e| Error::from_io("waiting for Installer reboot", e))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::from_message(format!(
+                        "Installer exited with {status}; serial:\n{}",
+                        self.serial()
+                    )))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::from_message(format!(
+                    "Installer did not reboot after approval; serial:\n{}",
+                    self.serial()
+                )));
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
     }
 
     fn boot_disk(disk_path: &Path, extra_nics: u8) -> Result<Self, Error> {

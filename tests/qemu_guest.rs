@@ -8050,6 +8050,11 @@ fn installer_one_disk_without_yes_never_reaches_bootstrap() {
         !after_enter.contains("FWOS Bootstrap console"),
         "without yes, QEMU one-disk Installer never reaches the Bootstrap console; serial:\n{after_enter}"
     );
+    assert_eq!(
+        guest.installer_disk_changes_after_stop().expect("compare Installer disk"),
+        [false],
+        "declining y and Enter must leave every virtual disk byte unchanged"
+    );
 }
 
 #[test]
@@ -8070,6 +8075,11 @@ fn installer_asks_which_disk_when_more_than_one() {
         !serial.contains("FWOS Bootstrap console"),
         "two empty disks, no number entered: still no Bootstrap console; serial:\n{serial}"
     );
+    assert_eq!(
+        guest.installer_disk_changes_after_stop().expect("compare Installer disks"),
+        [false, false],
+        "without selecting a disk, neither virtual disk may change"
+    );
 }
 
 #[test]
@@ -8087,20 +8097,20 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
         "yes must not appear before a valid disk number; serial:\n{serial}"
     );
 
-    let after_bad = installer_serial_cmd(&guest, "nope\r\n", 30, |t| t.contains("Disk number:"));
+    let after_bad = installer_serial_cmd(&guest, "nope\n", 30, |t| t.contains("Disk number:"));
     assert!(
         !after_bad.contains("Type yes to wipe") && !after_bad.contains("FWOS Bootstrap console"),
         "non-numeric input does not select a disk or write; serial:\n{after_bad}"
     );
 
-    let after_range = installer_serial_cmd(&guest, "9\r\n", 30, |t| t.contains("Disk number:"));
+    let after_range = installer_serial_cmd(&guest, "9\n", 30, |t| t.contains("Disk number:"));
     assert!(
         !after_range.contains("Type yes to wipe")
             && !after_range.contains("FWOS Bootstrap console"),
         "out-of-range input does not select a disk or write; serial:\n{after_range}"
     );
 
-    let after_pick = installer_serial_cmd(&guest, "1\r\n", 30, |t| t.contains("Type yes to wipe"));
+    let after_pick = installer_serial_cmd(&guest, "1\n", 30, |t| t.contains("Type yes to wipe"));
     assert!(
         after_pick.contains("Type yes to wipe")
             && after_pick.contains("FWOS Installer: /dev/")
@@ -8115,7 +8125,7 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
     );
 
     guest
-        .serial_write("n\r\n")
+        .serial_write("n\n")
         .expect("decline on the Installer serial must be written");
     let mut after_decline = guest.serial();
     for _ in 0..30 {
@@ -8135,7 +8145,7 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
     );
 
     let after_repick =
-        installer_serial_cmd(&guest, "2\r\n", 30, |t| t.contains("Type yes to wipe"));
+        installer_serial_cmd(&guest, "2\n", 30, |t| t.contains("Type yes to wipe"));
     assert!(
         after_repick.contains("Type yes to wipe") && after_repick.contains("FWOS Installer: /dev/"),
         "after decline the operator can pick again and still waits for typed yes; serial:\n{after_repick}"
@@ -8143,6 +8153,35 @@ fn installer_two_disks_pick_then_yes_decline_returns_to_pick() {
     assert!(
         !after_repick.contains("FWOS Bootstrap console"),
         "a second pick is still not the wipe; serial:\n{after_repick}"
+    );
+    assert_eq!(
+        guest.installer_disk_changes_after_stop().expect("compare Installer disks"),
+        [false, false],
+        "invalid picks and a declined approval must leave both virtual disks unchanged"
+    );
+}
+
+#[test]
+fn installer_two_disks_yes_writes_only_selected_disk() {
+    let _guard = guest_lock();
+    let mut guest = Guest::boot_installer_two_disks()
+        .expect("Installer with two writable disks must start under QEMU");
+    guest
+        .serial_write("1\nyes\n")
+        .expect("select disk 1, then explicitly approve its wipe");
+    guest
+        .wait_for_installer_reboot()
+        .expect("typed yes after selection must complete the install and request reboot");
+    let serial = guest.serial();
+    assert!(
+        serial.contains("FWOS Installer: pick a disk to wipe")
+            && serial.contains("Type yes to wipe /dev/vda"),
+        "the Installer must show separate disk-selection and approval prompts; serial:\n{serial}"
+    );
+    assert_eq!(
+        guest.installer_disk_changes_after_stop().expect("compare Installer disks"),
+        [true, false],
+        "the selected disk must be written and the unselected disk must remain byte-identical"
     );
 }
 
@@ -8186,6 +8225,11 @@ fn installer_approval_lists_existing_partitions() {
     assert!(
         !serial.contains("FWOS Bootstrap console"),
         "without yes, a partitioned disk is not written; serial:\n{serial}"
+    );
+    assert_eq!(
+        guest.installer_disk_changes_after_stop().expect("compare Installer disk"),
+        [false],
+        "the partitioned disk must remain byte-identical before approval"
     );
 }
 
